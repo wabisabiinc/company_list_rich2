@@ -1,0 +1,8 @@
+python-dotenv
+playwright
+google-generativeai
+pytest
+pytest-asyncio
+SQLAlchemy
+beautifulsoup4
+requests
