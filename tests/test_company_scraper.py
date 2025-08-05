@@ -1,124 +1,90 @@
-import re
+# tests/test_company_scraper.py
+
+import pytest
 import urllib.parse
-from typing import List, Dict, Any
-import requests
-from bs4 import BeautifulSoup
-from playwright.async_api import async_playwright, Browser, Page
+from unittest.mock import patch, MagicMock
+from src.company_scraper import CompanyScraper
 
-class CompanyScraper:
-    """
-    DuckDuckGo の非JS版 (html.duckduckgo.com/html) を叩いて
-    企業名＋住所の検索結果リンク上位を取得するクラスです。
-    """
+# テスト用サンプル HTML （DuckDuckGo の非JS版レスポンスを模倣）
+SAMPLE_HTML = """
+<html>
+  <body>
+    <!-- リダイレクトURL（/l/?uddg=...） -->
+    <a class="result__a" href="/l/?uddg=https%3A%2F%2Fexample.com%2Fhome">Example</a>
+    <!-- 除外ドメイン facebook.com -->
+    <a class="result__a" href="https://facebook.com/profile">FB</a>
+    <!-- プロトコルなし //bar.com → https://bar.com -->
+    <a class="result__a" href="//bar.com/page">Bar</a>
+    <!-- 相対パス /relative/path → https://duckduckgo.com/relative/path -->
+    <a class="result__a" href="/relative/path">Rel</a>
+    <!-- 空 href はスキップ -->
+    <a class="result__a" href="">Empty</a>
+    <!-- さらに別ドメイン -->
+    <a class="result__a" href="https://twitter.com/foo">TW</a>
+  </body>
+</html>
+"""
 
-    # 除外したいドメインのリスト
-    EXCLUDE_DOMAINS = [
-        "facebook.com",
-        "twitter.com",
-        "instagram.com",
-        "maps.google.com",
-    ]
+@pytest.fixture
+def scraper():
+    # headless やタイムアウトはテスト意図に合わせればOK
+    return CompanyScraper(headless=True)
 
-    def __init__(self, headless: bool = True):
-        """
-        :param headless: True ならブラウザを表示せずに起動、False ならウィンドウを開く
-        （get_page_info 用）
-        """
-        self.headless = headless
+@pytest.mark.asyncio
+@patch("src.company_scraper.requests.get")
+async def test_search_company_filters_and_resolves(mock_get, scraper):
+    # モックレスポンスのセットアップ
+    mock_response = MagicMock()
+    mock_response.text = SAMPLE_HTML
+    mock_response.raise_for_status.return_value = None
+    mock_get.return_value = mock_response
 
-    async def search_company(
-        self,
-        company_name: str,
-        address: str,
-        num_results: int = 3
-    ) -> List[str]:
-        """
-        DuckDuckGo の非JS版 HTML エンドポイントを呼び出して
-        結果リンクを取得します。
+    # 実行
+    urls = await scraper.search_company("トヨタ自動車株式会社", "愛知県豊田市", num_results=10)
 
-        :param company_name: 企業名（例: "トヨタ自動車株式会社"）
-        :param address:       住所（例: "愛知県豊田市"）
-        :param num_results:   取得する上位リンク数
-        :return: リンクのリスト（除外ドメインをフィルタリング）
-        """
-        query = f"{company_name} {address}"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-        }
-        # 非JS版エンドポイントに GET
-        resp = requests.get(
-            "https://html.duckduckgo.com/html",
-            params={"q": query},
-            headers=headers,
-            timeout=30
-        )
-        resp.raise_for_status()
+    # → リダイレクト URL が正しく展開されている
+    assert "https://example.com/home" in urls
 
-        # HTML をパース
-        soup = BeautifulSoup(resp.text, "html.parser")
-        # result__a クラスのリンクを優先して取得
-        anchors = soup.select("a.result__a")
-        urls: List[str] = []
+    # → facebook.com, twitter.com は除外されている
+    assert not any("facebook.com" in u for u in urls)
+    assert not any("twitter.com"  in u for u in urls)
 
-        for a in anchors:
-            href = a.get("href")
-            if not href:
-                continue
+    # → プロトコルなし URL が https に変換されている
+    assert any(u.startswith("https://bar.com") for u in urls)
 
-            # DuckDuckGo の /l/?uddg=... リダイレクトを展開
-            if "duckduckgo.com/l/" in href and "uddg=" in href:
-                parsed = urllib.parse.urlparse(href)
-                qs = urllib.parse.parse_qs(parsed.query)
-                real = qs.get("uddg", [None])[0]
-                if real:
-                    href = urllib.parse.unquote(real)
+    # → 相対パスが https://duckduckgo.com に貼り直されている
+    assert any(u.startswith("https://duckduckgo.com/relative/path") for u in urls)
 
-            # 相対URLは絶対化
-            if href.startswith("/"):
-                href = urllib.parse.urljoin("https://duckduckgo.com", href)
+    # → 空文字 href は含まれない
+    assert all(u for u in urls)
 
-            # 除外ドメインをフィルタ
-            if any(dom in href for dom in self.EXCLUDE_DOMAINS):
-                continue
+    # → num_results を超えていない
+    assert len(urls) <= 10
 
-            urls.append(href)
-            if len(urls) >= num_results:
-                break
+@pytest.mark.asyncio
+@patch("src.company_scraper.requests.get")
+async def test_search_company_limit_num_results(mock_get, scraper):
+    # 同じ SAMPLE_HTML を返すモックをセット
+    mock_resp = MagicMock()
+    mock_resp.text = SAMPLE_HTML
+    mock_resp.raise_for_status.return_value = None
+    mock_get.return_value = mock_resp
 
-        return urls
+    # num_results を 2 に指定
+    urls = await scraper.search_company("社名", "住所", num_results=2)
 
-    async def get_page_info(self, url: str) -> Dict[str, Any]:
-        """
-        与えられた URL を Playwright で開き、
-        ページ本文テキストとフルページスクリーンショットを取得します。
-        """
-        async with async_playwright() as pw:
-            browser: Browser = await pw.chromium.launch(
-                headless=self.headless,
-                args=["--no-sandbox"]
-            )
-            page: Page = await browser.new_page()
-            await page.goto(url, timeout=30000)
-            text = await page.inner_text("body")
-            screenshot = await page.screenshot(full_page=True)
-            await browser.close()
-            return {"text": text, "screenshot": screenshot}
+    # 返却件数が 2 件のみであること
+    assert len(urls) == 2
 
-    def extract_candidates(self, text: str) -> Dict[str, List[str]]:
-        """
-        ページ本文テキストから電話番号と住所候補を抽出
-        （テスト済みの既存実装と同一です）。
-        """
-        phone_pattern = re.compile(
-            r"(?:\+?81[-\s]?)?(?:0\d{1,4})[-\s]?\d{1,4}[-\s]?\d{4}"
-        )
-        address_pattern = re.compile(
-            r"(〒\d{3}-\d{4}|[一-龥]{2,3}[都道府県].{0,20}[市区町村].{0,20})"
-        )
+@pytest.mark.asyncio
+@patch("src.company_scraper.requests.get")
+async def test_search_company_empty_on_http_error(mock_get, scraper):
+    # HTTP エラーを発生させる
+    mock_resp = MagicMock()
+    mock_resp.raise_for_status.side_effect = Exception("HTTP Error")
+    mock_get.return_value = mock_resp
 
-        phones = phone_pattern.findall(text)
-        addrs  = address_pattern.findall(text)
-        return {
-            "phone_numbers": list(set(phones)),
-            "addresses":     list(set(addrs))
-        }
+    urls = await scraper.search_company("社名", "住所")
+    # エラー発生時は空リスト返却
+    assert urls == []
+
