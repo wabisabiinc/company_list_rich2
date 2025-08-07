@@ -34,4 +34,4 @@ class CsvDataManager:
     def save_company_data(self, company: Dict[str, str]):
         self.writer.writerow(company)
         self.output_file.flush()
-        os.fsync(self.output_file.fileno())  # ← 追加！これで即時反映
+        os.fsync(self.output_file.fileno()) 

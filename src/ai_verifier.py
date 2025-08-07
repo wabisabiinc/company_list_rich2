@@ -17,7 +17,7 @@ generativeai.configure(api_key=api_key)
 
 class AIVerifier:
     """
-    AI検証クラス（画像は辞書で渡す方式に統一！）
+    AI検証クラス（画像は辞書で渡す方式に統一!）
     """
     def __init__(self, model=None):
         self.model = model or generativeai.GenerativeModel("gemini-1.5-pro")
