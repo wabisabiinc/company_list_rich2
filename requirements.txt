@@ -6,3 +6,5 @@ pytest-asyncio
 SQLAlchemy
 beautifulsoup4
 requests
+pandas
+pymongo

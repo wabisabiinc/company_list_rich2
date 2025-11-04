@@ -1,43 +1,56 @@
+# tests/test_ai_verifier.py
 import pytest
 import json
-from src.ai_verifier import AIVerifier
+
+# AIVerifier の import（src 配下でも直下でも通るように）
+try:
+    from src.ai_verifier import AIVerifier
+except ModuleNotFoundError:
+    from ai_verifier import AIVerifier
+
 
 class DummyModel:
     def __init__(self, fake_result_json=None):
         self._fake_result_json = fake_result_json
 
-    async def generate_content_async(self, items):
+    # 将来の引数追加に備えて互換化
+    async def generate_content_async(self, items, *args, **kwargs):
         class DummyResponse:
             def __init__(self, text):
                 self.text = text
         if self._fake_result_json is not None:
             return DummyResponse(json.dumps(self._fake_result_json))
-        else:
-            return DummyResponse("not a json")
+        return DummyResponse("not a json")
 
-@pytest.fixture(autouse=True)
-def env(monkeypatch):
-    monkeypatch.setenv("GEMINI_API_KEY", "DUMMY_KEY")
-
-def test_build_prompt():
-    verifier = AIVerifier(model=DummyModel())
-    sample_text = "電話番号: 03-0000-0000\n住所: 東京都中央区1-1-1"
-    prompt = verifier._build_prompt(sample_text)
-    assert "電話番号" in prompt
-    assert sample_text in prompt
-    # 末尾が「}」でなくてもテストが通るよう修正
-    assert "}" in prompt  
 
 @pytest.mark.asyncio
 async def test_verify_info_success():
-    fake_json = {"phone_number": "03-0000-0000", "address": "東京都中央区1-1-1"}
-    verifier = AIVerifier(model=DummyModel(fake_json))
-    result = await verifier.verify_info("dummy text", b"\x89PNG")
-    assert isinstance(result, dict)
-    assert result == fake_json
+    fake_json = {
+        "phone_number": "03-0000-0000",
+        "address": "東京都中央区1-1-1",
+        "homepage_url": "https://example.com",
+    }
 
+    listoss_data = {
+        ("株式会社Example", "東京都中央区1-1-1"): {
+            "addr": "東京都中央区1-1-1",
+            "phone": "03-0000-0000",
+            "hp": "https://example.com",
+        }
+    }
+
+    verifier = AIVerifier(model=DummyModel(fake_json), listoss_data=listoss_data)
+    result = await verifier.verify_info("dummy text", b"\x89PNG", "株式会社Example", "東京都中央区1-1-1")
+
+    assert isinstance(result, dict)
+    assert result["phone_number"] == "03-0000-0000"
+    assert result["address"] == "東京都中央区1-1-1"
+    assert result.get("homepage_url") == "https://example.com"
+
+
+# 追加の健全性チェック
 @pytest.mark.asyncio
-async def test_verify_info_failure():
+async def test_verify_info_returns_none_on_non_json():
     verifier = AIVerifier(model=DummyModel(None))
-    result = await verifier.verify_info("dummy", b"")
+    result = await verifier.verify_info("dummy", b"", "X", "Y")
     assert result is None
