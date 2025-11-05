@@ -29,6 +29,8 @@ async def test_verify_info_success():
         "phone_number": "03-0000-0000",
         "address": "東京都中央区1-1-1",
         "homepage_url": "https://example.com",
+        "rep_name": "山田太郎",
+        "description": "東京都に本社を置くソフトウェア企業です。",
     }
 
     listoss_data = {
@@ -46,6 +48,8 @@ async def test_verify_info_success():
     assert result["phone_number"] == "03-0000-0000"
     assert result["address"] == "東京都中央区1-1-1"
     assert result.get("homepage_url") == "https://example.com"
+    assert result.get("rep_name") == "山田太郎"
+    assert result.get("description") == "東京都に本社を置くソフトウェア企業です。"
 
 
 # 追加の健全性チェック

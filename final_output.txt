@@ -1,0 +1,1322 @@
+<<<FILE:src/company_scraper.py>>>
+# src/company_scraper.py
+import re, urllib.parse
+import asyncio
+import unicodedata
+from typing import List, Dict, Any, Optional
+from urllib.parse import urlparse, parse_qs, unquote, urljoin
+
+import requests
+from bs4 import BeautifulSoup
+from playwright.async_api import (
+    async_playwright, Browser, BrowserContext, Page,
+    TimeoutError as PlaywrightTimeoutError, Route
+)
+
+
+class CompanyScraper:
+    """
+    DuckDuckGo 非JS(html.duckduckgo.com/html)で検索 → 上位リンク取得
+    ＋ Playwrightで本文/スクショ取得。
+    各ワーカーでブラウザ/コンテキストを使い回して高速化＆安定化。
+    """
+
+    # 除外したいドメイン（口コミ/地図/求人など）
+    EXCLUDE_DOMAINS = [
+        "facebook.com", "twitter.com", "instagram.com", "x.com",
+        "linkedin.com", "youtube.com",
+        "google.com/maps", "maps.google.com", "map.yahoo.co.jp", "mapion.co.jp",
+        "yahoo.co.jp", "itp.ne.jp", "hotpepper.jp", "r.gnavi.co.jp",
+        "tabelog.com", "ekiten.jp", "goo.ne.jp", "recruit.net", "en-gage.net",
+        "townpage.goo.ne.jp", "jp-hp.com",
+        # 集客・旅行・ショッピング系（公式サイトではないケースが多い）
+        "rakuten.co.jp", "rakuten.com", "travelko.com", "jalan.net",
+        "ikyu.com", "rurubu.jp", "booking.com", "expedia.co.jp",
+        "agoda.com", "tripadvisor.jp", "tripadvisor.com", "hotels.com",
+        "travel.yahoo.co.jp", "trivago.jp", "trivago.com",
+        "jalan.jp", "asoview.com", "tabikobo.com",
+    ]
+
+    PRIORITY_PATHS = [
+        "/company", "/about", "/profile", "/corporate", "/overview",
+        "/会社概要", "/お問い合わせ", "/アクセス", "/contact", "/access",
+    ]
+
+    NON_OFFICIAL_HOSTS = {
+        "travel.rakuten.co.jp",
+        "navitime.co.jp",
+        "ja.wikipedia.org",
+        "kensetumap.com",
+        "hotpepper.jp",
+        "tblg.jp",
+        "retty.me",
+        "goguynet.jp",
+        "yahoo.co.jp",
+        "mapion.co.jp",
+        "google.com",
+    }
+
+    NON_OFFICIAL_KEYWORDS = {
+        "recruit", "career", "job", "jobs", "kyujin", "haken", "派遣",
+        "hotel", "travel", "tour", "booking", "reservation", "yoyaku",
+        "mall", "store", "shop", "coupon", "catalog", "price",
+        "seikyu", "delivery", "ranking", "review", "口コミ", "比較",
+    }
+
+    CORP_SUFFIXES = [
+        "株式会社", "（株）", "(株)", "有限会社", "合同会社", "合名会社", "合資会社",
+        "Inc.", "Inc", "Co.", "Co", "Corporation", "Company", "Ltd.", "Ltd",
+        "Holding", "Holdings", "HD", "グループ", "ホールディングス", "本社",
+    ]
+
+    # 優先的に巡回したいURLのキーワード
+    CANDIDATE_PRIORITIES = (
+        "会社概要", "会社情報", "企業情報", "corporate", "about",
+        "お問い合わせ", "問い合わせ", "contact",
+        "アクセス", "access", "本社", "所在地", "沿革",
+    )
+
+    def __init__(self, headless: bool = True):
+        self.headless = headless
+        self._pw = None
+        self.browser: Optional[Browser] = None
+        self.context: Optional[BrowserContext] = None
+
+    # ===== 公式判定ヘルパ =====
+    @classmethod
+    def _normalize_company_name(cls, company_name: str) -> str:
+        if not company_name:
+            return ""
+        norm = unicodedata.normalize("NFKC", company_name)
+        for suffix in cls.CORP_SUFFIXES:
+            norm = norm.replace(suffix, "")
+        norm = re.sub(r"[\s　]+", "", norm)
+        return norm
+
+    @staticmethod
+    def _ascii_tokens(text: str) -> List[str]:
+        return [tok.lower() for tok in re.findall(r"[A-Za-z0-9]{2,}", text or "")]
+
+    @staticmethod
+    def _domain_tokens(url: str) -> List[str]:
+        host = urlparse(url).netloc.lower()
+        host = host.split(":")[0]
+        pieces = re.split(r"[.\-]", host)
+        ignore = {"www", "co", "or", "ne", "go", "gr", "ed", "lg", "jp", "com", "net", "biz", "inc"}
+        return [p for p in pieces if p and p not in ignore]
+
+    def _domain_score(self, company_tokens: List[str], url: str) -> int:
+        host = urlparse(url).netloc.lower()
+        score = 0
+        if re.search(r"\.(co|or|go|ac)\.jp$", host):
+            score += 3
+        elif host.endswith(".jp"):
+            score += 2
+        elif host.endswith(".com") or host.endswith(".net"):
+            score += 1
+
+        domain_tokens = self._domain_tokens(url)
+        for token in company_tokens:
+            if any(token in dt for dt in domain_tokens):
+                score += 4
+        lowered = host + urlparse(url).path.lower()
+        if any(kw in lowered for kw in self.NON_OFFICIAL_KEYWORDS):
+            score -= 3
+        return score
+
+    def is_likely_official_site(self, company_name: str, url: str, snippet: str = "") -> bool:
+        host = urllib.parse.urlparse(url).netloc.lower()
+        host = host.split(":")[0]
+        if any(host == domain or host.endswith(f".{domain}") for domain in self.NON_OFFICIAL_HOSTS):
+            return False
+        if host.endswith(".go.jp"):
+            return False
+        return bool(host)
+
+    # ===== 高速化の肝：ブラウザを起動して使い回す =====
+    async def start(self):
+        if self.browser:
+            return
+        self._pw = await async_playwright().start()
+        self.browser = await self._pw.chromium.launch(
+            headless=self.headless,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",  # /dev/shm不足でのクラッシュ回避
+            ],
+        )
+        self.context = await self.browser.new_context(
+            locale="ja-JP",
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+        )
+        # 軽量化：画像/フォント/メディア/スタイルをブロック
+        await self.context.route("**/*", self._handle_route)
+
+    async def close(self):
+        try:
+            if self.context:
+                await self.context.close()
+        finally:
+            try:
+                if self.browser:
+                    await self.browser.close()
+            finally:
+                if self._pw:
+                    await self._pw.stop()
+        self._pw = None
+        self.browser = None
+        self.context = None
+
+    async def _handle_route(self, route: Route):
+        rtype = route.request.resource_type
+        if rtype in {"image", "media", "font", "stylesheet"}:
+            await route.abort()
+        else:
+            await route.continue_()
+
+    # ===== 検索 =====
+    @staticmethod
+    def _decode_uddg(url: str) -> str:
+        if not url:
+            return url
+        try:
+            parsed = urlparse("https://duckduckgo.com" + url) if url.startswith("/l") else urlparse(url)
+            if parsed.netloc.endswith("duckduckgo.com") and parsed.path.startswith("/l"):
+                qs = parse_qs(parsed.query)
+                if "uddg" in qs and qs["uddg"]:
+                    return unquote(qs["uddg"][0])
+        except Exception:
+            pass
+        return url
+
+    def _prioritize(self, urls: List[str]) -> List[str]:
+        def score(u: str) -> int:
+            s = 0
+            low = u.lower()
+            if any(k in low for k in ("recruit", "採用", "ir", "faq", "support", "news")):
+                s -= 3
+            for k in self.CANDIDATE_PRIORITIES:
+                if k.lower() in low:
+                    s += 2
+            if low.startswith("https://"):
+                s += 1
+            return s
+        return sorted(urls, key=score, reverse=True)
+
+    def _prioritize_paths(self, urls: List[str]) -> List[str]:
+        def score(u: str) -> int:
+            path = urllib.parse.urlparse(u).path.lower()
+            total = 0
+            for idx, marker in enumerate(self.PRIORITY_PATHS):
+                if marker.lower() in path:
+                    total += len(self.PRIORITY_PATHS) - idx
+            return total
+
+        return sorted(urls, key=score, reverse=True)
+
+    @staticmethod
+    def _phone_variants_regex(phone: str) -> re.Pattern:
+        digits = re.sub(r"\D", "", phone or "")
+        if not digits:
+            return re.compile(r"$^")
+        pattern = r"\D*".join(map(re.escape, digits))
+        return re.compile(pattern)
+
+    @staticmethod
+    def _addr_key(addr: str) -> str:
+        if not addr:
+            return ""
+        text = unicodedata.normalize("NFKC", addr)
+        text = re.sub(r"[‐―－ーｰ-]+", "-", text)
+        text = re.sub(r"\s+", "", text)
+        return text.lower()
+
+    async def verify_on_site(
+        self,
+        base_url: str,
+        phone: Optional[str],
+        address: Optional[str],
+        fetch_limit: int = 5,
+    ) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "phone_ok": False,
+            "address_ok": False,
+            "phone_url": None,
+            "address_url": None,
+        }
+        if not base_url:
+            return result
+
+        try:
+            parsed = urllib.parse.urlparse(base_url)
+        except Exception:
+            return result
+
+        if not parsed.scheme or not parsed.netloc:
+            return result
+
+        base_root = f"{parsed.scheme}://{parsed.netloc}"
+        candidates: List[str] = [base_url]
+        for path in self.PRIORITY_PATHS:
+            try:
+                candidate = urllib.parse.urljoin(base_root, path)
+            except Exception:
+                continue
+            candidates.append(candidate)
+
+        seen: set[str] = set()
+        targets: List[str] = []
+        for url in candidates:
+            parsed_candidate = urllib.parse.urlparse(url)
+            if parsed_candidate.netloc != parsed.netloc:
+                continue
+            if url in seen:
+                continue
+            seen.add(url)
+            targets.append(url)
+            if len(targets) >= fetch_limit:
+                break
+
+        phone_pattern = self._phone_variants_regex(phone) if phone else None
+        addr_key = self._addr_key(address) if address else ""
+
+        for target in targets:
+            try:
+                info = await self.get_page_info(target)
+            except Exception:
+                continue
+            text = info.get("text", "") or ""
+            if phone_pattern and not result["phone_ok"]:
+                if phone_pattern.search(text):
+                    result["phone_ok"] = True
+                    result["phone_url"] = target
+            if addr_key and not result["address_ok"]:
+                text_key = self._addr_key(text)
+                if addr_key and addr_key in text_key:
+                    result["address_ok"] = True
+                    result["address_url"] = target
+            if result["phone_ok"] and result["address_ok"]:
+                break
+
+        return result
+
+    async def search_company(self, company_name: str, address: str, num_results: int = 3) -> List[str]:
+        """
+        DuckDuckGoで検索し、候補URLを返す（軽いリトライ＆バックオフ付き）
+        """
+        query = f"{company_name} {address}".strip()
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept-Language": "ja,en-US;q=0.9",
+            "Referer": "https://duckduckgo.com/",
+        }
+
+        # 最大3回リトライ（指数バックオフ）
+        resp_text = ""
+        for attempt in range(3):
+            try:
+                resp = requests.get(
+                    "https://html.duckduckgo.com/html",
+                    params={"q": query, "kl": "jp-jp"},
+                    headers=headers,
+                    timeout=(5, 30),  # 接続5秒 / 応答30秒
+                )
+                # 429/5xx は待ってリトライ
+                if resp.status_code in (429, 500, 502, 503, 504):
+                    await asyncio.sleep(0.8 * (2 ** attempt))
+                    continue
+                resp.raise_for_status()
+                resp_text = resp.text
+                break
+            except Exception:
+                if attempt == 2:
+                    return []
+                await asyncio.sleep(0.8 * (2 ** attempt))
+
+        soup = BeautifulSoup(resp_text, "html.parser")
+        anchors = soup.select("a.result__a")
+        results: List[str] = []
+        for a in anchors:
+            raw = a.get("href")
+            if not raw:
+                continue
+            href = self._decode_uddg(raw)
+            if href.startswith("//"):
+                href = "https:" + href
+            elif href.startswith("/"):
+                href = urljoin("https://duckduckgo.com", href)
+            if any(ex in href for ex in self.EXCLUDE_DOMAINS):
+                continue
+            results.append(href)
+
+        if not results:
+            return []
+        ordered = self._prioritize(results)
+        seen: set[str] = set()
+        deduped: List[str] = []
+        for u in ordered:
+            if u not in seen:
+                seen.add(u)
+                deduped.append(u)
+        deduped = self._prioritize_paths(deduped)
+        return deduped[:num_results]
+
+    # ===== ページ取得（ブラウザ再利用＋軽いリトライ） =====
+    async def get_page_info(self, url: str, timeout: int = 25000) -> Dict[str, Any]:
+        """
+        対象URLの本文テキストとフルページスクショを取得（2回まで再試行）
+        """
+        if not self.context:
+            await self.start()
+
+        for attempt in range(2):
+            page: Page = await self.context.new_page()
+            page.set_default_timeout(timeout)
+            try:
+                await page.goto(url, timeout=timeout, wait_until="domcontentloaded")
+                try:
+                    text = await page.inner_text("body", timeout=5000)
+                except Exception:
+                    try:
+                        await page.wait_for_load_state("load", timeout=timeout)
+                    except Exception:
+                        pass
+                    text = await page.inner_text("body") if await page.locator("body").count() else ""
+                screenshot = await page.screenshot(full_page=True)
+                return {"text": text, "screenshot": screenshot}
+
+            except PlaywrightTimeoutError:
+                # 軽く待ってリトライ
+                await asyncio.sleep(0.7 * (attempt + 1))
+            except Exception:
+                # 予期せぬ例外も1回だけ再試行
+                await asyncio.sleep(0.7 * (attempt + 1))
+            finally:
+                await page.close()
+
+        return {"text": "", "screenshot": b""}
+
+    # ===== 抽出 =====
+    def extract_candidates(self, text: str) -> Dict[str, List[str]]:
+        phone_pattern = re.compile(
+            r"(?:\+?81[-\s]?)?(0\d{1,4})[-\s]?(\d{1,4})[-\s]?(\d{3,4})"
+        )
+        address_pattern = re.compile(
+            r"(〒\d{3}-\d{4}[^。\n]*|[一-龥]{2,3}[都道府県][^。\n]{0,120}[市区町村郡][^。\n]{0,140})"
+        )
+
+        phones: List[str] = []
+        for m in phone_pattern.finditer(text):
+            g1, g2, g3 = m.groups()
+            phones.append(f"{g1}-{g2}-{g3}")
+
+        addrs = address_pattern.findall(text)
+
+        def dedupe(seq: List[str]) -> List[str]:
+            seen = set()
+            out: List[str] = []
+            for x in seq:
+                if x not in seen:
+                    seen.add(x)
+                    out.append(x)
+            return out
+
+        return {"phone_numbers": dedupe(phones), "addresses": dedupe(addrs)}
+
+<<<FILE:src/ai_verifier.py>>>
+import os
+import json
+import logging
+import time
+import re
+import base64
+from typing import Optional, Dict, Any
+
+# ---- .env -------------------------------------------------------
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+def _getenv_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    return (str(v).strip().lower() == "true") if v is not None else default
+
+USE_AI: bool = _getenv_bool("USE_AI", False)
+API_KEY: str = (os.getenv("GEMINI_API_KEY") or "").strip()
+DEFAULT_MODEL: str = (os.getenv("GEMINI_MODEL") or "gemini-2.5-flash-lite").strip()
+
+# ---- deps -------------------------------------------------------
+try:
+    import google.generativeai as generativeai
+    GEN_IMPORT_ERROR = None
+except Exception as e:
+    generativeai = None  # type: ignore
+    GEN_IMPORT_ERROR = e
+
+try:
+    from google.api_core.exceptions import GoogleAPIError  # type: ignore
+except Exception:
+    class GoogleAPIError(Exception):  # fallback
+        pass
+
+AI_ENABLED: bool = USE_AI and bool(API_KEY) and (generativeai is not None)
+if AI_ENABLED:
+    try:
+        generativeai.configure(api_key=API_KEY)  # type: ignore
+    except Exception as e:
+        AI_ENABLED = False
+        GEN_IMPORT_ERROR = e
+
+# ---- logging ----------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+log = logging.getLogger(__name__)
+log.info(f"[ai_verifier] AI_ENABLED={AI_ENABLED}, USE_AI={USE_AI}, KEY_SET={bool(API_KEY)}, GEN_OK={generativeai is not None}")
+
+# ---- utils ------------------------------------------------------
+def _extract_first_json(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    text = re.sub(r"```(?:json)?", "", text, flags=re.IGNORECASE).strip()
+    brace_stack = 0
+    start = -1
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if brace_stack == 0:
+                start = i
+            brace_stack += 1
+        elif ch == "}":
+            brace_stack -= 1
+            if brace_stack == 0 and start != -1:
+                candidate = text[start:i+1]
+                try:
+                    return json.loads(candidate)
+                except Exception:
+                    pass
+    try:
+        return json.loads(text)
+    except Exception:
+        return None
+
+def _normalize_phone(s: Optional[str]) -> Optional[str]:
+    if not s:
+        return None
+    s = re.sub(r"[‐―－ー]+", "-", s)
+    s = re.sub(r"（.*?）", "", s)
+    s = re.sub(r"TEL[:：]\s*", "", s, flags=re.I)
+    m = re.search(r"(0\d{1,4})-?(\d{1,4})-?(\d{3,4})", s)
+    return f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else None
+
+def _normalize_address(addr: Optional[str]) -> Optional[str]:
+    if not addr:
+        return None
+    a = re.sub(r"\s+", " ", addr.strip())
+    # 郵便番号があれば 〒を付けて統一
+    m = re.search(r"(\d{3}-\d{4})\s*(.+)", a)
+    if m:
+        body = m.group(2).strip()
+        return f"〒{m.group(1)} {body}"
+    return a
+
+def _resp_text(resp: Any) -> str:
+    t = getattr(resp, "text", None)
+    if isinstance(t, str) and t.strip():
+        return t
+    try:
+        for cand in getattr(resp, "candidates", []) or []:
+            parts = getattr(getattr(cand, "content", None), "parts", []) or []
+            for p in parts:
+                pt = getattr(p, "text", None)
+                if isinstance(pt, str) and pt.strip():
+                    return pt
+    except Exception:
+        pass
+    return str(resp)
+
+# ---- main -------------------------------------------------------
+class AIVerifier:
+    def __init__(self, model=None, listoss_data: Dict[str, dict] = None, db_path: str = 'data/companies.db'):
+        self.db_path = db_path
+        self.listoss_data = listoss_data if listoss_data is not None else {}
+
+        if model is not None:
+            self.model = model
+        else:
+            if AI_ENABLED:
+                try:
+                    self.model = generativeai.GenerativeModel(DEFAULT_MODEL)  # type: ignore
+                    log.info(f"AIVerifier: Gemini model initialized ({DEFAULT_MODEL}).")
+                except Exception as e:
+                    log.error(f"AIVerifier: Failed to init model: {e}", exc_info=True)
+                    self.model = None
+            else:
+                self.model = None
+                if GEN_IMPORT_ERROR:
+                    log.warning(f"AIVerifier: AI disabled due to import/config error: {GEN_IMPORT_ERROR}")
+
+    def _build_prompt(self, text: str) -> str:
+        snippet = (text or "").strip()
+        if len(snippet) > 6000:
+            snippet = snippet[:6000]
+        return (
+            "あなたは企業サイトから問い合わせ先の電話番号・住所・代表者名・会社の説明文を抽出する専門家です。\n"
+            "スクリーンショット（任意）と本文テキストを根拠に、もっとも信頼できる値を各1件ずつ返してください。\n"
+            "出力は **必ず次のJSONのみ**：\n"
+            "{\n"
+            '  "phone_number": "03-1234-5678" または null,\n'
+            '  "address": "〒123-4567 東京都..." または null,\n'
+            '  "representative": "代表取締役 田中 太郎" または null,\n'
+            '  "description": "会社概要（80字以内）" または null\n'
+            "}\n"
+            "注意:\n"
+            "- 代表電話でない営業直通/採用窓口等は除外。\n"
+            "- 住所は都道府県からの表記を優先し、郵便番号があれば先頭に含めてください（例: 〒123-4567 ...）。\n"
+            "- 代表者名は肩書+氏名が望ましい。\n"
+            "- 説明は冗長な装飾を避け、80字以内に要約してください。\n"
+            "\n"
+            f"# 本文テキスト抜粋\n{snippet}\n"
+        )
+
+    async def verify_info(self, text: str, screenshot: bytes, company_name: str, address: str) -> Optional[Dict[str, Any]]:
+        if not self.model:
+            log.error(f"No model initialized for {company_name} ({address})")
+            return None
+
+        content = [self._build_prompt(text)]
+        if screenshot:
+            try:
+                b64 = base64.b64encode(screenshot).decode("utf-8")
+                content.append({"inline_data": {"mime_type": "image/png", "data": b64}})
+            except Exception:
+                log.warning("Failed to encode screenshot; proceeding text-only.")
+
+        try:
+            t0 = time.time()
+            try:
+                resp = await self.model.generate_content_async(content, safety_settings=None)
+            except TypeError:
+                resp = await self.model.generate_content_async(content)
+            dt = time.time() - t0
+            log.info(f"Gemini API call ok: {company_name} ({address}) in {dt:.2f}s")
+
+            raw = _resp_text(resp)
+            result = _extract_first_json(raw)
+            if not isinstance(result, dict):
+                log.warning(f"JSON parse failed: {company_name} ({address}) / raw[:200]={raw[:200]!r}")
+                return None
+
+            phone = _normalize_phone(result.get("phone_number"))
+            addr = _normalize_address(result.get("address"))
+
+            representative = result.get("representative", result.get("rep_name"))
+            if isinstance(representative, str):
+                representative = representative.strip() or None
+            else:
+                representative = None
+
+            description = result.get("description")
+            if isinstance(description, str):
+                description = re.sub(r"\s+", " ", description.strip()) or None
+                if description and len(description) > 80:
+                    description = description[:80]
+            else:
+                description = None
+
+            out: Dict[str, Any] = {
+                "phone_number": phone,
+                "address": addr,
+                "representative": representative,
+                "description": description,
+                "rep_name": representative,
+            }
+            if "homepage_url" in result:
+                out["homepage_url"] = result.get("homepage_url")
+            return out
+
+        except GoogleAPIError as e:
+            log.error(f"Google API error for {company_name} ({address}): {e}")
+            return None
+        except Exception as e:
+            log.error(f"Failed to verify info for {company_name} ({address}): {e}", exc_info=True)
+            return None
+
+<<<FILE:src/database_manager.py>>>
+# src/database_manager.py
+import csv
+import os
+import sqlite3
+import time
+from typing import Optional, Dict, Any
+
+
+class DatabaseManager:
+    """
+    - 並列安全なジョブ確保: claim_next_company(worker_id)
+    - 互換性: csv_path をオプションでサポート（テスト/デバッグ用）
+    - 安定化:
+        * DB初期化（スキーマ作成/索引作成）時の "database is locked" をリトライで回避
+        * PRAGMA busy_timeout を 60s に設定
+        * WAL + synchronous=NORMAL
+        * 古い running を TTL で自動回収（RUNNING_TTL_MIN, 既定30分）
+    """
+    def __init__(self, db_path: str = "data/companies.db", csv_path: Optional[str] = None):
+        os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+        if csv_path:
+            os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
+
+        # autocommit（isolation_level=None）+ 長めの timeout
+        self.conn = sqlite3.connect(
+            db_path,
+            timeout=60,              # 以前: 30
+            isolation_level=None,    # autocommit
+            check_same_thread=False
+        )
+        self.conn.row_factory = sqlite3.Row
+        self.cur = self.conn.cursor()
+
+        # PRAGMA は接続毎に適用
+        self._configure_pragmas()
+
+        self.csv_path = csv_path
+        self.running_ttl_min = int(os.getenv("RUNNING_TTL_MIN", "30"))
+
+        # ★ 初期化はロック競合が起きやすいので安全にリトライ
+        self._ensure_schema_with_retry()
+
+        # CSV の重複書き出し防止用キャッシュ
+        self._init_csv_state()
+
+    # ---------- PRAGMA ----------
+    def _configure_pragmas(self) -> None:
+        # WAL & 同期緩和（性能） / busy_timeout（ロック待ち）
+        self.conn.execute("PRAGMA journal_mode=WAL;")
+        self.conn.execute("PRAGMA synchronous=NORMAL;")
+        self.conn.execute("PRAGMA busy_timeout=60000;")  # 60秒
+
+    # ---------- 初期化（ロックに強いリトライ付） ----------
+    def _ensure_schema_with_retry(self, max_retry_sec: int = 20) -> None:
+        start = time.time()
+        while True:
+            try:
+                self._ensure_schema()
+                return
+            except sqlite3.OperationalError as e:
+                msg = str(e).lower()
+                if ("locked" in msg or "busy" in msg) and (time.time() - start < max_retry_sec):
+                    time.sleep(1.0)
+                    continue
+                raise
+
+    def _ensure_schema(self) -> None:
+        self.cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS companies (
+                id INTEGER PRIMARY KEY,
+                company_name   TEXT,
+                address        TEXT,
+                employee_count INTEGER,
+                homepage       TEXT,
+                phone          TEXT,
+                found_address  TEXT,
+                status         TEXT DEFAULT 'pending',
+                locked_by      TEXT,
+                locked_at      TEXT,
+                rep_name       TEXT,
+                description    TEXT,
+                ai_used        INTEGER DEFAULT 0,
+                ai_model       TEXT,
+                phone_source   TEXT,
+                address_source TEXT,
+                extract_confidence REAL,
+                last_checked_at TEXT,
+                error_code     TEXT
+            )
+            """
+        )
+
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(companies)")}
+        if "status" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN status TEXT DEFAULT 'pending';")
+        if "locked_by" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN locked_by TEXT;")
+        if "locked_at" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN locked_at TEXT;")
+        if "rep_name" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN rep_name TEXT;")
+        if "description" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN description TEXT;")
+        if "ai_used" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN ai_used INTEGER DEFAULT 0;")
+        if "ai_model" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN ai_model TEXT;")
+        if "phone_source" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN phone_source TEXT;")
+        if "address_source" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN address_source TEXT;")
+        if "extract_confidence" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN extract_confidence REAL;")
+        if "last_checked_at" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN last_checked_at TEXT;")
+        if "error_code" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN error_code TEXT;")
+
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_companies_name_addr ON companies(company_name, address);"
+        )
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_companies_status ON companies(status);")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_companies_emp ON companies(employee_count);")
+
+        self.conn.commit()
+
+    # ---------- CSV 互換 ----------
+    def _init_csv_state(self) -> None:
+        self.csv_header_written = False
+        self._csv_written_ids: set[int] = set()
+        if not self.csv_path:
+            return
+        if os.path.exists(self.csv_path) and os.path.getsize(self.csv_path) > 0:
+            try:
+                with open(self.csv_path, newline="", encoding="utf-8-sig") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        try:
+                            cid = int((row.get("id") or "").strip())
+                            self._csv_written_ids.add(cid)
+                        except Exception:
+                            continue
+                self.csv_header_written = True
+            except FileNotFoundError:
+                self.csv_header_written = False
+                self._csv_written_ids.clear()
+
+    # ---------- 無効データ判定 ----------
+    def _is_valid_company_data(self, data: Dict[str, Any]) -> bool:
+        invalid_keywords = [
+            "https://listoss.com/", "listoss.com",
+            "ftj-g.co.jp/form",
+            "本法人データはリストスが提供しています",
+            "御社のテレアポ代行します",
+            "1件10円!お問い合わせフォーム送信代行。"
+        ]
+        for v in data.values():
+            if isinstance(v, str):
+                low = v.lower()
+                for kw in invalid_keywords:
+                    if kw.lower() in low:
+                        return False
+        return True
+
+    # ---------- 並列安全な1件確保 ----------
+    def claim_next_company(self, worker_id: str) -> Optional[Dict[str, Any]]:
+        """
+        1) 古い running を TTL で pending に戻す
+        2) pending の先頭1件を running にし、locked_by/locked_at を付与
+        3) そのレコードを返す
+        """
+        cur = self.conn.cursor()
+        # IMMEDIATE: 直ちに RESERVED ロック（書込予約）を取り、競合を避ける
+        cur.execute("BEGIN IMMEDIATE;")
+        try:
+            # ★ TTL 回収（locked_at が一定以上古い running を pending に戻す）
+            cur.execute(
+                "UPDATE companies SET status='pending', locked_by=NULL, locked_at=NULL "
+                "WHERE status='running' AND locked_at IS NOT NULL AND "
+                "locked_at < datetime('now', ?)",
+                (f"-{self.running_ttl_min} minutes",),
+            )
+
+            # RETURNING が利用可能な SQLite ならこちらを使用
+            try:
+                row = cur.execute(
+                    """
+                    WITH picked AS (
+                      SELECT id FROM companies
+                       WHERE status='pending'
+                       ORDER BY employee_count DESC, id ASC
+                       LIMIT 1
+                    )
+                    UPDATE companies
+                       SET status='running',
+                           locked_by=?,
+                           locked_at=datetime('now')
+                     WHERE id=(SELECT id FROM picked)
+                    RETURNING id, company_name, address, employee_count, homepage, phone, found_address, status
+                    """,
+                    (worker_id,),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                # 古い SQLite 向けフォールバック（RETURNING 無し）
+                cur.execute(
+                    """
+                    UPDATE companies
+                       SET status='running',
+                           locked_by=?,
+                           locked_at=datetime('now')
+                     WHERE id = (
+                       SELECT id FROM companies
+                        WHERE status='pending'
+                        ORDER BY employee_count DESC, id ASC
+                        LIMIT 1
+                     ) AND status='pending'
+                    """,
+                    (worker_id,),
+                )
+                if cur.rowcount == 0:
+                    self.conn.commit()
+                    return None
+                row = cur.execute(
+                    """
+                    SELECT id, company_name, address, employee_count, homepage, phone, found_address, status
+                      FROM companies
+                     WHERE locked_by=? AND status='running'
+                     ORDER BY locked_at DESC, id DESC
+                     LIMIT 1
+                    """,
+                    (worker_id,),
+                ).fetchone()
+
+            self.conn.commit()
+            return dict(row) if row else None
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    # ---------- 単発互換 ----------
+    def get_next_company(self) -> Optional[Dict[str, Any]]:
+        self.cur.execute(
+            """
+            SELECT * FROM companies
+             WHERE status='pending'
+             ORDER BY employee_count DESC, id ASC
+             LIMIT 1
+            """
+        )
+        row = self.cur.fetchone()
+        return dict(row) if row else None
+
+    # ---------- 書き込み ----------
+    def save_company_data(self, company: Dict[str, Any], status: str = "done") -> None:
+        self.cur.execute(
+            """
+            UPDATE companies
+               SET homepage           = ?,
+                   phone              = ?,
+                   found_address      = ?,
+                   rep_name           = ?,
+                   description        = ?,
+                   ai_used            = ?,
+                   ai_model           = ?,
+                   phone_source       = ?,
+                   address_source     = ?,
+                   extract_confidence = ?,
+                   last_checked_at    = datetime('now'),
+                   status             = ?,
+                   locked_by          = NULL,
+                   locked_at          = NULL,
+                   error_code         = ?
+              WHERE id = ?
+            """,
+            (
+                company.get("homepage", "") or "",
+                company.get("phone", "") or "",
+                company.get("found_address", "") or "",
+                company.get("rep_name", "") or "",
+                company.get("description", "") or "",
+                int(company.get("ai_used", 0) or 0),
+                company.get("ai_model", "") or "",
+                company.get("phone_source", "") or "",
+                company.get("address_source", "") or "",
+                company.get("extract_confidence"),
+                status,
+                company.get("error_code", "") or "",
+                company["id"],
+            ),
+        )
+        self.conn.commit()
+        import logging as _l; _l.info(f"DB_WRITE_OK id={company['id']} status={status}")
+
+        # 任意：CSVミラー（指定時のみ）
+        if not self.csv_path:
+            return
+        cid = int(company["id"])
+        if cid in self._csv_written_ids:
+            return
+
+        fieldnames = ["id", "company_name", "address", "employee_count", "homepage", "phone", "found_address"]
+        write_header = not self.csv_header_written
+
+        with open(self.csv_path, "a", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+                self.csv_header_written = True
+            writer.writerow(
+                {
+                    "id": company.get("id", ""),
+                    "company_name": company.get("company_name", ""),
+                    "address": company.get("address", ""),
+                    "employee_count": company.get("employee_count", ""),
+                    "homepage": company.get("homepage", ""),
+                    "phone": company.get("phone", ""),
+                    "found_address": company.get("found_address", ""),
+                }
+            )
+
+        self._csv_written_ids.add(cid)
+
+    def update_status(self, company_id: int, status: str) -> None:
+        self.cur.execute(
+            "UPDATE companies SET status=?, locked_by=NULL, locked_at=NULL WHERE id=?",
+            (status, company_id),
+        )
+        self.conn.commit()
+
+    def insert_company(self, company_data: Dict[str, Any]) -> None:
+        if not self._is_valid_company_data(company_data):
+            return
+        self.cur.execute(
+            """
+            INSERT INTO companies (company_name, address, employee_count, homepage, phone, found_address)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                company_data["company_name"],
+                company_data["address"],
+                company_data.get("employee_count"),
+                (company_data.get("homepage") or ""),
+                (company_data.get("phone") or "").replace("-", "").replace(" ", ""),
+                company_data.get("found_address", ""),
+            ),
+        )
+        self.conn.commit()
+
+    def close(self) -> None:
+        try:
+            self.cur.close()
+        finally:
+            self.conn.close()
+
+<<<FILE:main.py>>>
+# main.py
+import asyncio
+import os
+import csv
+import logging
+import re
+import random
+from dotenv import load_dotenv
+
+from src.database_manager import DatabaseManager
+from src.company_scraper import CompanyScraper
+from src.ai_verifier import AIVerifier, DEFAULT_MODEL as AI_MODEL_NAME
+
+# --------------------------------------------------
+# ロギング設定
+# --------------------------------------------------
+os.makedirs("logs", exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("logs/app.log", encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+log = logging.getLogger(__name__)
+
+# .env 読み込み
+load_dotenv()
+
+# --------------------------------------------------
+# 実行オプション（.env）
+# --------------------------------------------------
+HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
+USE_AI = os.getenv("USE_AI", "true").lower() == "true"
+WORKER_ID = os.getenv("WORKER_ID", "w1")  # 並列識別子
+
+MAX_ROWS = int(os.getenv("MAX_ROWS", "0"))
+ID_MIN = int(os.getenv("ID_MIN", "0"))
+ID_MAX = int(os.getenv("ID_MAX", "0"))
+AI_COOLDOWN_SEC = float(os.getenv("AI_COOLDOWN_SEC", "0"))
+SLEEP_BETWEEN_SEC = float(os.getenv("SLEEP_BETWEEN_SEC", "0"))
+JITTER_RATIO = float(os.getenv("JITTER_RATIO", "0.30"))
+
+MIRROR_TO_CSV = os.getenv("MIRROR_TO_CSV", "false").lower() == "true"
+OUTPUT_CSV_PATH = os.getenv("OUTPUT_CSV_PATH", "data/output.csv")
+CSV_FIELDNAMES = [
+    "id", "company_name", "address", "employee_count",
+    "homepage", "phone", "found_address", "rep_name", "description"
+]
+
+# --------------------------------------------------
+# 正規化 & 一致判定
+# --------------------------------------------------
+def normalize_phone(s: str | None) -> str | None:
+    if not s:
+        return None
+    s = re.sub(r"[‐―－ー]+", "-", s)
+    m = re.search(r"(0\d{1,4})-?(\d{1,4})-?(\d{3,4})", s)
+    return f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else None
+
+def normalize_address(s: str | None) -> str | None:
+    if not s:
+        return None
+    s = s.strip().replace("　", " ")
+    s = re.sub(r"[‐―－ー]+", "-", s)
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"^〒\s*", "〒", s)
+    m = re.search(r"(\d{3}-\d{4})\s*(.*)", s)
+    if m:
+        body = m.group(2).strip()
+        return f"〒{m.group(1)} {body}"
+    return s if s else None
+
+def addr_compatible(input_addr: str, found_addr: str) -> bool:
+    input_addr = normalize_address(input_addr)
+    found_addr = normalize_address(found_addr)
+    if not input_addr or not found_addr:
+        return False
+    return input_addr[:8] in found_addr or found_addr[:8] in input_addr
+
+# --------------------------------------------------
+# 内部: 次ジョブ取得
+# --------------------------------------------------
+def claim_next(manager: DatabaseManager) -> dict | None:
+    if hasattr(manager, "claim_next_company"):
+        return manager.claim_next_company(WORKER_ID)
+    return manager.get_next_company()
+
+# --------------------------------------------------
+# ユーティリティ：ジッター付きスリープ秒
+# --------------------------------------------------
+def jittered_seconds(base: float, ratio: float) -> float:
+    if base <= 0 or ratio <= 0:
+        return max(0.0, base)
+    low = max(0.0, base * (1.0 - ratio))
+    high = base * (1.0 + ratio)
+    return random.uniform(low, high)
+
+# --------------------------------------------------
+# メイン処理（ワーカー）
+# --------------------------------------------------
+async def process():
+    log.info(
+        "=== Runner started (worker=%s) === HEADLESS=%s USE_AI=%s MAX_ROWS=%s "
+        "ID_MIN=%s ID_MAX=%s AI_COOLDOWN_SEC=%s SLEEP_BETWEEN_SEC=%s JITTER_RATIO=%.2f "
+        "MIRROR_TO_CSV=%s",
+        WORKER_ID, HEADLESS, USE_AI, MAX_ROWS, ID_MIN, ID_MAX,
+        AI_COOLDOWN_SEC, SLEEP_BETWEEN_SEC, JITTER_RATIO, MIRROR_TO_CSV
+    )
+
+    scraper = CompanyScraper(headless=HEADLESS)
+    # CompanyScraper に start()/close() が無い実装でも動くように安全に呼ぶ
+    if hasattr(scraper, "start") and callable(getattr(scraper, "start")):
+        try:
+            await scraper.start()
+        except Exception:
+            log.warning("scraper.start() はスキップ（未実装または失敗）", exc_info=True)
+
+    verifier = AIVerifier() if USE_AI else None
+    manager = DatabaseManager()
+
+    csv_file = None
+    csv_writer = None
+    try:
+        if MIRROR_TO_CSV:
+            os.makedirs(os.path.dirname(OUTPUT_CSV_PATH) or ".", exist_ok=True)
+            file_exists = os.path.exists(OUTPUT_CSV_PATH) and os.path.getsize(OUTPUT_CSV_PATH) > 0
+            csv_file = open(OUTPUT_CSV_PATH, mode="a", newline="", encoding="utf-8")
+            csv_writer = csv.DictWriter(csv_file, fieldnames=CSV_FIELDNAMES)
+            if not file_exists:
+                csv_writer.writeheader()
+                csv_file.flush()
+            log.info("CSV mirror enabled -> %s", OUTPUT_CSV_PATH)
+
+        processed = 0
+
+        while True:
+            if MAX_ROWS and processed >= MAX_ROWS:
+                log.info("MAX_ROWS=%s に到達。", MAX_ROWS)
+                break
+
+            company = claim_next(manager)
+            if not company:
+                log.info("キューが空です。終了。")
+                break
+
+            cid = company.get("id")
+            name = (company.get("company_name") or "").strip()
+            addr = (company.get("address") or "").strip()
+
+            if (ID_MIN and cid < ID_MIN) or (ID_MAX and cid > ID_MAX):
+                log.info("[skip] id=%s はレンジ外 -> skipped (worker=%s)", cid, WORKER_ID)
+                manager.update_status(cid, "skipped")
+                continue
+
+            log.info("[%s] %s の処理開始 (worker=%s)", cid, name, WORKER_ID)
+
+            try:
+                urls = await scraper.search_company(name, addr, num_results=5)
+                homepage = ""
+                info = None
+                phone, found_address = "", ""
+
+                for candidate in urls:
+                    candidate_info = await scraper.get_page_info(candidate)
+                    if scraper.is_likely_official_site(name, candidate, candidate_info.get("text", "") or ""):
+                        homepage = candidate
+                        info = candidate_info
+                        break
+                    log.info("[%s] 非公式と判断: %s", cid, candidate)
+
+                phone = ""
+                found_address = ""
+                phone_source = "none"
+                address_source = "none"
+                ai_used = 0
+                ai_model = ""
+                company.setdefault("rep_name", "")
+                company.setdefault("description", "")
+                company.setdefault("error_code", "")
+                verify_result = {"phone_ok": False, "address_ok": False}
+                confidence = 0.0
+
+                if homepage and info:
+                    cands = scraper.extract_candidates(info.get("text", "") or "")
+                    rule_phone = normalize_phone(cands["phone_numbers"][0]) if cands.get("phone_numbers") else None
+                    rule_address = normalize_address(cands["addresses"][0]) if cands.get("addresses") else None
+
+                    ai_result = None
+                    ai_attempted = False
+                    if USE_AI and verifier is not None:
+                        ai_attempted = True
+                        try:
+                            ai_result = await verifier.verify_info(
+                                info.get("text", "") or "", info.get("screenshot"),
+                                name, addr
+                            )
+                        except Exception:
+                            log.warning("[%s] AI検証失敗 -> ルールベースにフォールバック", cid, exc_info=True)
+                            ai_result = None
+
+                    ai_phone = None
+                    ai_addr = None
+                    if ai_result:
+                        ai_used = 1
+                        ai_model = AI_MODEL_NAME
+                        ai_phone = normalize_phone(ai_result.get("phone_number"))
+                        ai_addr = normalize_address(ai_result.get("address"))
+                        representative = ai_result.get("representative", ai_result.get("rep_name"))
+                        if isinstance(representative, str) and representative.strip():
+                            company["rep_name"] = representative.strip()
+                        description = ai_result.get("description")
+                        if isinstance(description, str) and description.strip():
+                            desc = description.strip()
+                            company["description"] = desc[:80]
+                    else:
+                        if ai_attempted and AI_COOLDOWN_SEC > 0:
+                            await asyncio.sleep(jittered_seconds(AI_COOLDOWN_SEC, JITTER_RATIO))
+
+                    if ai_phone:
+                        phone = ai_phone
+                        phone_source = "ai"
+                    elif rule_phone:
+                        phone = rule_phone
+                        phone_source = "rule"
+                    else:
+                        phone = ""
+                        phone_source = "none"
+
+                    if ai_addr:
+                        found_address = ai_addr
+                        address_source = "ai"
+                    elif rule_address:
+                        found_address = rule_address or ""
+                        address_source = "rule" if rule_address else "none"
+                    else:
+                        found_address = ""
+                        address_source = "none"
+
+                    try:
+                        verify_result = await scraper.verify_on_site(homepage, phone or None, found_address or None)
+                    except Exception:
+                        log.warning("[%s] verify_on_site 失敗", cid, exc_info=True)
+                        verify_result = {"phone_ok": False, "address_ok": False}
+
+                    matches = int(bool(verify_result.get("phone_ok"))) + int(bool(verify_result.get("address_ok")))
+                    if matches == 2:
+                        confidence = 1.0
+                    elif matches == 1:
+                        confidence = 0.8
+                    else:
+                        confidence = 0.4
+                else:
+                    if urls:
+                        log.info("[%s] 公式サイト候補を判別できず -> 未保存", cid)
+                    else:
+                        log.info("[%s] 有効なホームページ候補なし。", cid)
+                    company["rep_name"] = company.get("rep_name", "") or ""
+                    company["description"] = company.get("description", "") or ""
+                    confidence = 0.4
+
+                normalized_found_address = normalize_address(found_address) if found_address else ""
+                company.update({
+                    "homepage": homepage,
+                    "phone": phone or "",
+                    "found_address": normalized_found_address,
+                    "rep_name": company.get("rep_name",""),
+                    "description": company.get("description",""),
+                    "phone_source": phone_source,
+                    "address_source": address_source,
+                    "ai_used": ai_used,
+                    "ai_model": ai_model,
+                    "extract_confidence": confidence,
+                })
+
+                status = "done" if homepage else "error"
+                if status == "done" and found_address and not addr_compatible(addr, found_address):
+                    status = "review"
+                if status == "done" and not verify_result.get("phone_ok") and not verify_result.get("address_ok"):
+                    status = "review"
+
+                company.setdefault("error_code", "")
+
+                manager.save_company_data(company, status=status)
+                log.info("[%s] 保存完了: status=%s (worker=%s)", cid, status, WORKER_ID)
+
+                if csv_writer:
+                    csv_writer.writerow({k: company.get(k, "") for k in CSV_FIELDNAMES})
+                    csv_file.flush()
+
+                processed += 1
+
+            except Exception as e:
+                log.error("[%s] エラー: %s (worker=%s)", cid, e, WORKER_ID, exc_info=True)
+                manager.update_status(cid, "error")
+
+            # 1社ごとのスリープ（±JITTERでレート制限/ドメイン集中回避）
+            if SLEEP_BETWEEN_SEC > 0:
+                await asyncio.sleep(jittered_seconds(SLEEP_BETWEEN_SEC, JITTER_RATIO))
+
+    finally:
+        if csv_file:
+            csv_file.close()
+        if hasattr(scraper, "close") and callable(getattr(scraper, "close")):
+            try:
+                await scraper.close()
+            except Exception:
+                log.warning("scraper.close() はスキップ（未実装または失敗）", exc_info=True)
+        manager.close()
+        log.info("全処理終了 (worker=%s)", WORKER_ID)
+
+if __name__ == "__main__":
+    asyncio.run(process())
+

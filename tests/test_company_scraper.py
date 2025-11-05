@@ -18,6 +18,8 @@ SAMPLE_HTML = """
     <a class="result__a" href="/relative/path">Rel</a>
     <!-- 空 href -->
     <a class="result__a" href="">Empty</a>
+    <!-- 旅行系集客ドメイン（除外対象） -->
+    <a class="result__a" href="https://travel.rakuten.co.jp/hotel/123">Rakuten Travel</a>
     <!-- 除外ドメイン -->
     <a class="result__a" href="https://twitter.com/foo">TW</a>
   </body>
@@ -45,6 +47,7 @@ async def test_search_company_filters_and_resolves(mock_get, scraper):
     # 除外ドメインが含まれない
     assert not any("facebook.com" in u for u in urls)
     assert not any("twitter.com" in u for u in urls)
+    assert not any("rakuten" in u for u in urls)
 
     # プロトコルなし → https
     assert any(u.startswith("https://bar.com") for u in urls)
@@ -76,3 +79,21 @@ async def test_search_company_empty_on_http_error(mock_get, scraper):
 
     urls = await scraper.search_company("社名", "住所")
     assert urls == []
+
+
+def test_is_likely_official_site_true(scraper):
+    text = "会社概要\n株式会社Exampleは・・・"
+    assert scraper.is_likely_official_site(
+        "株式会社Example",
+        "https://www.example.co.jp/about",
+        text,
+    )
+
+
+def test_is_likely_official_site_false(scraper):
+    text = "楽天トラベルで株式会社Exampleの宿泊プラン"
+    assert not scraper.is_likely_official_site(
+        "株式会社Example",
+        "https://travel.rakuten.co.jp/hotel/123",
+        text,
+    )

@@ -65,7 +65,6 @@ class DatabaseManager:
                 raise
 
     def _ensure_schema(self) -> None:
-        # companies テーブル（不足カラムは後で確認・追加）
         self.cur.execute(
             """
             CREATE TABLE IF NOT EXISTS companies (
@@ -78,12 +77,20 @@ class DatabaseManager:
                 found_address  TEXT,
                 status         TEXT DEFAULT 'pending',
                 locked_by      TEXT,
-                locked_at      TEXT
+                locked_at      TEXT,
+                rep_name       TEXT,
+                description    TEXT,
+                ai_used        INTEGER DEFAULT 0,
+                ai_model       TEXT,
+                phone_source   TEXT,
+                address_source TEXT,
+                extract_confidence REAL,
+                last_checked_at TEXT,
+                error_code     TEXT
             )
             """
         )
 
-        # 不足カラムを安全に追加（存在確認してから）
         cols = {r[1] for r in self.conn.execute("PRAGMA table_info(companies)")}
         if "status" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN status TEXT DEFAULT 'pending';")
@@ -91,8 +98,25 @@ class DatabaseManager:
             self.conn.execute("ALTER TABLE companies ADD COLUMN locked_by TEXT;")
         if "locked_at" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN locked_at TEXT;")
+        if "rep_name" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN rep_name TEXT;")
+        if "description" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN description TEXT;")
+        if "ai_used" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN ai_used INTEGER DEFAULT 0;")
+        if "ai_model" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN ai_model TEXT;")
+        if "phone_source" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN phone_source TEXT;")
+        if "address_source" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN address_source TEXT;")
+        if "extract_confidence" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN extract_confidence REAL;")
+        if "last_checked_at" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN last_checked_at TEXT;")
+        if "error_code" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN error_code TEXT;")
 
-        # 索引
         self.conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_companies_name_addr ON companies(company_name, address);"
         )
@@ -229,26 +253,44 @@ class DatabaseManager:
 
     # ---------- 書き込み ----------
     def save_company_data(self, company: Dict[str, Any], status: str = "done") -> None:
-        self.cur.execute(
-            """
-            UPDATE companies
-               SET homepage      = ?,
-                   phone         = ?,
-                   found_address = ?,
-                   status        = ?,
-                   locked_by     = NULL,
-                   locked_at     = NULL
-              WHERE id = ?
-            """,
-            (
-                company.get("homepage", "") or "",
-                company.get("phone", "") or "",
-                company.get("found_address", "") or "",
-                status,
-                company["id"],
-            ),
-        )
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(companies)")}
+        updates: list[str] = []
+        params: list[Any] = []
+
+        def set_value(column: str, value: Any) -> None:
+            if column in cols:
+                updates.append(f"{column} = ?")
+                params.append(value)
+
+        set_value("homepage", company.get("homepage", "") or "")
+        set_value("phone", company.get("phone", "") or "")
+        set_value("found_address", company.get("found_address", "") or "")
+        set_value("rep_name", company.get("rep_name", "") or "")
+        set_value("description", company.get("description", "") or "")
+        set_value("ai_used", int(company.get("ai_used", 0) or 0))
+        set_value("ai_model", company.get("ai_model", "") or "")
+        set_value("phone_source", company.get("phone_source", "") or "")
+        set_value("address_source", company.get("address_source", "") or "")
+        set_value("extract_confidence", company.get("extract_confidence"))
+        set_value("source_url_phone", company.get("source_url_phone", "") or "")
+        set_value("source_url_address", company.get("source_url_address", "") or "")
+        set_value("source_url_rep", company.get("source_url_rep", "") or "")
+        set_value("error_code", company.get("error_code", "") or "")
+
+        if "last_checked_at" in cols:
+            updates.append("last_checked_at = datetime('now')")
+        updates.append("status = ?")
+        params.append(status)
+        if "locked_by" in cols:
+            updates.append("locked_by = NULL")
+        if "locked_at" in cols:
+            updates.append("locked_at = NULL")
+
+        sql = f"UPDATE companies SET {', '.join(updates)} WHERE id = ?"
+        params.append(company["id"])
+        self.cur.execute(sql, params)
         self.conn.commit()
+        import logging as _l; _l.info(f"DB_WRITE_OK id={company['id']} status={status}")
 
         # 任意：CSVミラー（指定時のみ）
         if not self.csv_path:

@@ -1,6 +1,7 @@
 # src/company_scraper.py
-import re
+import re, urllib.parse
 import asyncio
+import unicodedata
 from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse, parse_qs, unquote, urljoin
 
@@ -10,6 +11,19 @@ from playwright.async_api import (
     async_playwright, Browser, BrowserContext, Page,
     TimeoutError as PlaywrightTimeoutError, Route
 )
+
+# 深掘り時に優先して辿るパス（日本語含む）
+PRIORITY_PATHS = [
+    "/company", "/about", "/profile", "/corporate", "/overview",
+    "/contact", "/inquiry", "/access",
+    "/会社概要", "/企業情報", "/企業概要", "/会社情報", "/窓口案内", "/お問い合わせ", "/アクセス"
+]
+PRIO_WORDS = ["会社概要", "企業情報", "お問い合わせ", "アクセス", "連絡先", "窓口"]
+
+PHONE_RE = re.compile(r"(?:TEL|Tel|tel|電話)\s*[:：]?\s*(0\d{1,4})[-‐―－ー]?(\d{1,4})[-‐―－ー]?(\d{3,4})")
+ZIP_RE = re.compile(r"(〒?\s*\d{3})[-‐―－ー]?(\d{4})")
+ADDR_HINT = re.compile(r"(都|道|府|県).+?(市|区|郡|町|村)")
+REP_RE = re.compile(r"(?:代表者|代表取締役|理事長|学長)\s*[:：]?\s*([^\s　<>\|（）\(\)]+)")
 
 
 class CompanyScraper:
@@ -27,6 +41,45 @@ class CompanyScraper:
         "yahoo.co.jp", "itp.ne.jp", "hotpepper.jp", "r.gnavi.co.jp",
         "tabelog.com", "ekiten.jp", "goo.ne.jp", "recruit.net", "en-gage.net",
         "townpage.goo.ne.jp", "jp-hp.com",
+        # 集客・旅行・ショッピング系（公式サイトではないケースが多い）
+        "rakuten.co.jp", "rakuten.com", "travelko.com", "jalan.net",
+        "ikyu.com", "rurubu.jp", "booking.com", "expedia.co.jp",
+        "agoda.com", "tripadvisor.jp", "tripadvisor.com", "hotels.com",
+        "travel.yahoo.co.jp", "trivago.jp", "trivago.com",
+        "jalan.jp", "asoview.com", "tabikobo.com",
+    ]
+
+    PRIORITY_PATHS = [
+        "/company", "/about", "/profile", "/corporate", "/overview",
+        "/contact", "/inquiry", "/access",
+        "/会社概要", "/企業情報", "/企業概要", "/会社情報", "/窓口案内", "/お問い合わせ", "/アクセス",
+    ]
+
+    NON_OFFICIAL_HOSTS = {
+        "travel.rakuten.co.jp",
+        "navitime.co.jp",
+        "ja.wikipedia.org",
+        "kensetumap.com",
+        "hotpepper.jp",
+        "tblg.jp",
+        "retty.me",
+        "goguynet.jp",
+        "yahoo.co.jp",
+        "mapion.co.jp",
+        "google.com",
+    }
+
+    NON_OFFICIAL_KEYWORDS = {
+        "recruit", "career", "job", "jobs", "kyujin", "haken", "派遣",
+        "hotel", "travel", "tour", "booking", "reservation", "yoyaku",
+        "mall", "store", "shop", "coupon", "catalog", "price",
+        "seikyu", "delivery", "ranking", "review", "口コミ", "比較",
+    }
+
+    CORP_SUFFIXES = [
+        "株式会社", "（株）", "(株)", "有限会社", "合同会社", "合名会社", "合資会社",
+        "Inc.", "Inc", "Co.", "Co", "Corporation", "Company", "Ltd.", "Ltd",
+        "Holding", "Holdings", "HD", "グループ", "ホールディングス", "本社",
     ]
 
     # 優先的に巡回したいURLのキーワード
@@ -41,6 +94,57 @@ class CompanyScraper:
         self._pw = None
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
+
+    # ===== 公式判定ヘルパ =====
+    @classmethod
+    def _normalize_company_name(cls, company_name: str) -> str:
+        if not company_name:
+            return ""
+        norm = unicodedata.normalize("NFKC", company_name)
+        for suffix in cls.CORP_SUFFIXES:
+            norm = norm.replace(suffix, "")
+        norm = re.sub(r"[\s　]+", "", norm)
+        return norm
+
+    @staticmethod
+    def _ascii_tokens(text: str) -> List[str]:
+        return [tok.lower() for tok in re.findall(r"[A-Za-z0-9]{2,}", text or "")]
+
+    @staticmethod
+    def _domain_tokens(url: str) -> List[str]:
+        host = urlparse(url).netloc.lower()
+        host = host.split(":")[0]
+        pieces = re.split(r"[.\-]", host)
+        ignore = {"www", "co", "or", "ne", "go", "gr", "ed", "lg", "jp", "com", "net", "biz", "inc"}
+        return [p for p in pieces if p and p not in ignore]
+
+    def _domain_score(self, company_tokens: List[str], url: str) -> int:
+        host = urlparse(url).netloc.lower()
+        score = 0
+        if re.search(r"\.(co|or|go|ac)\.jp$", host):
+            score += 3
+        elif host.endswith(".jp"):
+            score += 2
+        elif host.endswith(".com") or host.endswith(".net"):
+            score += 1
+
+        domain_tokens = self._domain_tokens(url)
+        for token in company_tokens:
+            if any(token in dt for dt in domain_tokens):
+                score += 4
+        lowered = host + urlparse(url).path.lower()
+        if any(kw in lowered for kw in self.NON_OFFICIAL_KEYWORDS):
+            score -= 3
+        return score
+
+    def is_likely_official_site(self, company_name: str, url: str, snippet: str = "") -> bool:
+        host = urllib.parse.urlparse(url).netloc.lower()
+        host = host.split(":")[0]
+        if any(host == domain or host.endswith(f".{domain}") for domain in self.NON_OFFICIAL_HOSTS):
+            return False
+        if host.endswith(".go.jp"):
+            return False
+        return bool(host)
 
     # ===== 高速化の肝：ブラウザを起動して使い回す =====
     async def start(self):
@@ -116,6 +220,103 @@ class CompanyScraper:
             return s
         return sorted(urls, key=score, reverse=True)
 
+    def _prioritize_paths(self, urls: List[str]) -> List[str]:
+        def score(u: str) -> int:
+            path = urllib.parse.urlparse(u).path.lower()
+            total = 0
+            for idx, marker in enumerate(self.PRIORITY_PATHS):
+                if marker.lower() in path:
+                    total += len(self.PRIORITY_PATHS) - idx
+            return total
+
+        return sorted(urls, key=score, reverse=True)
+
+    @staticmethod
+    def _phone_variants_regex(phone: str) -> re.Pattern:
+        digits = re.sub(r"\D", "", phone or "")
+        if not digits:
+            return re.compile(r"$^")
+        pattern = r"\D*".join(map(re.escape, digits))
+        return re.compile(pattern)
+
+    @staticmethod
+    def _addr_key(addr: str) -> str:
+        if not addr:
+            return ""
+        text = unicodedata.normalize("NFKC", addr)
+        text = re.sub(r"[‐―－ーｰ-]+", "-", text)
+        text = re.sub(r"\s+", "", text)
+        return text.lower()
+
+    async def verify_on_site(
+        self,
+        base_url: str,
+        phone: Optional[str],
+        address: Optional[str],
+        fetch_limit: int = 5,
+    ) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "phone_ok": False,
+            "address_ok": False,
+            "phone_url": None,
+            "address_url": None,
+        }
+        if not base_url:
+            return result
+
+        try:
+            parsed = urllib.parse.urlparse(base_url)
+        except Exception:
+            return result
+
+        if not parsed.scheme or not parsed.netloc:
+            return result
+
+        base_root = f"{parsed.scheme}://{parsed.netloc}"
+        candidates: List[str] = [base_url]
+        for path in self.PRIORITY_PATHS:
+            try:
+                candidate = urllib.parse.urljoin(base_root, path)
+            except Exception:
+                continue
+            candidates.append(candidate)
+
+        seen: set[str] = set()
+        targets: List[str] = []
+        for url in candidates:
+            parsed_candidate = urllib.parse.urlparse(url)
+            if parsed_candidate.netloc != parsed.netloc:
+                continue
+            if url in seen:
+                continue
+            seen.add(url)
+            targets.append(url)
+            if len(targets) >= fetch_limit:
+                break
+
+        phone_pattern = self._phone_variants_regex(phone) if phone else None
+        addr_key = self._addr_key(address) if address else ""
+
+        for target in targets:
+            try:
+                info = await self.get_page_info(target)
+            except Exception:
+                continue
+            text = info.get("text", "") or ""
+            if phone_pattern and not result["phone_ok"]:
+                if phone_pattern.search(text):
+                    result["phone_ok"] = True
+                    result["phone_url"] = target
+            if addr_key and not result["address_ok"]:
+                text_key = self._addr_key(text)
+                if addr_key and addr_key in text_key:
+                    result["address_ok"] = True
+                    result["address_url"] = target
+            if result["phone_ok"] and result["address_ok"]:
+                break
+
+        return result
+
     async def search_company(self, company_name: str, address: str, num_results: int = 3) -> List[str]:
         """
         DuckDuckGoで検索し、候補URLを返す（軽いリトライ＆バックオフ付き）
@@ -174,6 +375,7 @@ class CompanyScraper:
             if u not in seen:
                 seen.add(u)
                 deduped.append(u)
+        deduped = self._prioritize_paths(deduped)
         return deduped[:num_results]
 
     # ===== ページ取得（ブラウザ再利用＋軽いリトライ） =====
@@ -197,8 +399,12 @@ class CompanyScraper:
                     except Exception:
                         pass
                     text = await page.inner_text("body") if await page.locator("body").count() else ""
+                try:
+                    html = await page.content()
+                except Exception:
+                    html = ""
                 screenshot = await page.screenshot(full_page=True)
-                return {"text": text, "screenshot": screenshot}
+                return {"url": url, "text": text, "html": html, "screenshot": screenshot}
 
             except PlaywrightTimeoutError:
                 # 軽く待ってリトライ
@@ -209,31 +415,131 @@ class CompanyScraper:
             finally:
                 await page.close()
 
-        return {"text": "", "screenshot": b""}
+        return {"url": url, "text": "", "html": "", "screenshot": b""}
+
+    # ===== 同一ドメイン内を浅く探索 =====
+    def _rank_links(self, base: str, html: str) -> List[str]:
+        hrefs = re.findall(r'href=["\']([^"\']+)["\']', html or "", flags=re.I)
+        base_host = urlparse(base).netloc
+        candidates: List[tuple[int, str]] = []
+        for href in hrefs:
+            url = urljoin(base, href)
+            parsed = urlparse(url)
+            if not parsed.netloc or parsed.netloc != base_host:
+                continue
+            path = parsed.path or "/"
+            score = 0
+            for p in PRIORITY_PATHS:
+                if p in path:
+                    score += 10
+            lowered = url.lower()
+            for word in PRIO_WORDS:
+                if word in lowered:
+                    score += 5
+            if score > 0:
+                candidates.append((score, url))
+
+        candidates.sort(key=lambda x: (-x[0], x[1]))
+        seen: set[str] = set()
+        ordered: List[str] = []
+        for _, url in candidates:
+            if url not in seen:
+                ordered.append(url)
+                seen.add(url)
+            if len(ordered) >= 20:
+                break
+        return ordered
+
+    async def crawl_related(
+        self,
+        homepage: str,
+        need_phone: bool,
+        need_addr: bool,
+        need_rep: bool,
+        max_pages: int = 6,
+        max_hops: int = 2,
+    ) -> Dict[str, Dict[str, Any]]:
+        results: Dict[str, Dict[str, Any]] = {}
+        if not homepage:
+            return results
+
+        visited: set[str] = {homepage}
+        queue: List[tuple[int, str]] = [(0, homepage)]
+        while queue and len(results) < max_pages:
+            hop, url = queue.pop(0)
+            try:
+                info = await self.get_page_info(url)
+            except Exception:
+                continue
+
+            results[url] = {
+                "text": info.get("text", "") or "",
+                "screenshot": info.get("screenshot"),
+                "html": info.get("html", ""),
+            }
+
+            if hop >= max_hops:
+                continue
+
+            missing: List[str] = []
+            if need_phone:
+                missing.append("phone")
+            if need_addr:
+                missing.append("addr")
+            if need_rep:
+                missing.append("rep")
+            if not missing:
+                continue
+
+            html = info.get("html", "") or ""
+            if not html:
+                continue
+            for child in self._rank_links(url, html):
+                if child not in visited:
+                    visited.add(child)
+                    queue.append((hop + 1, child))
+                    if len(queue) + len(results) >= max_pages:
+                        break
+
+        return results
 
     # ===== 抽出 =====
     def extract_candidates(self, text: str) -> Dict[str, List[str]]:
-        phone_pattern = re.compile(
-            r"(?:\+?81[-\s]?)?(0\d{1,4})[-\s]?(\d{1,4})[-\s]?(\d{3,4})"
-        )
-        address_pattern = re.compile(
-            r"(〒\d{3}-\d{4}[^。\n]*|[一-龥]{2,3}[都道府県][^。\n]{0,120}[市区町村郡][^。\n]{0,140})"
-        )
-
         phones: List[str] = []
-        for m in phone_pattern.finditer(text):
-            g1, g2, g3 = m.groups()
-            phones.append(f"{g1}-{g2}-{g3}")
+        addrs: List[str] = []
+        reps: List[str] = []
 
-        addrs = address_pattern.findall(text)
+        for p in PHONE_RE.finditer(text or ""):
+            phones.append(f"{p.group(1)}-{p.group(2)}-{p.group(3)}")
+
+        for zm in ZIP_RE.finditer(text or ""):
+            zip_code = f"〒{zm.group(1).replace('〒', '').strip()}-{zm.group(2)}"
+            cursor = zm.end()
+            snippet = (text or "")[cursor:cursor + 120].replace("\n", " ")
+            if ADDR_HINT.search(snippet):
+                seg = snippet.split(" ")[0].strip()
+                addrs.append(f"{zip_code} {seg}")
+
+        if not addrs:
+            fallback_pattern = re.compile(
+                r"(〒\d{3}-\d{4}[^。\n]*|[一-龥]{2,3}[都道府県][^。\n]{0,120}[市区町村郡][^。\n]{0,140})"
+            )
+            addrs.extend(fallback_pattern.findall(text or ""))
+
+        for rm in REP_RE.finditer(text or ""):
+            reps.append(rm.group(1).strip())
 
         def dedupe(seq: List[str]) -> List[str]:
-            seen = set()
+            seen: set[str] = set()
             out: List[str] = []
-            for x in seq:
-                if x not in seen:
-                    seen.add(x)
-                    out.append(x)
+            for item in seq:
+                if item and item not in seen:
+                    seen.add(item)
+                    out.append(item)
             return out
 
-        return {"phone_numbers": dedupe(phones), "addresses": dedupe(addrs)}
+        return {
+            "phone_numbers": dedupe(phones),
+            "addresses": dedupe(addrs),
+            "rep_names": dedupe(reps),
+        }

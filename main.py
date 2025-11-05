@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 from src.database_manager import DatabaseManager
 from src.company_scraper import CompanyScraper
-from src.ai_verifier import AIVerifier
+from src.ai_verifier import AIVerifier, DEFAULT_MODEL as AI_MODEL_NAME
 
 # --------------------------------------------------
 # ロギング設定
@@ -46,7 +46,7 @@ MIRROR_TO_CSV = os.getenv("MIRROR_TO_CSV", "false").lower() == "true"
 OUTPUT_CSV_PATH = os.getenv("OUTPUT_CSV_PATH", "data/output.csv")
 CSV_FIELDNAMES = [
     "id", "company_name", "address", "employee_count",
-    "homepage", "phone", "found_address"
+    "homepage", "phone", "found_address", "rep_name", "description"
 ]
 
 # --------------------------------------------------
@@ -68,7 +68,8 @@ def normalize_address(s: str | None) -> str | None:
     s = re.sub(r"^〒\s*", "〒", s)
     m = re.search(r"(\d{3}-\d{4})\s*(.*)", s)
     if m:
-        return f"{m.group(1)} {m.group(2)}"
+        body = m.group(2).strip()
+        return f"〒{m.group(1)} {body}"
     return s if s else None
 
 def addr_compatible(input_addr: str, found_addr: str) -> bool:
@@ -156,48 +157,194 @@ async def process():
             log.info("[%s] %s の処理開始 (worker=%s)", cid, name, WORKER_ID)
 
             try:
-                urls = await scraper.search_company(name, addr, num_results=3)
-                homepage = urls[0] if urls else ""
+                urls = await scraper.search_company(name, addr, num_results=5)
+                homepage = ""
+                info = None
                 phone, found_address = "", ""
 
-                if homepage:
-                    info = await scraper.get_page_info(homepage)
+                for candidate in urls:
+                    candidate_info = await scraper.get_page_info(candidate)
+                    if scraper.is_likely_official_site(name, candidate, candidate_info.get("text", "") or ""):
+                        homepage = candidate
+                        info = candidate_info
+                        break
+                    log.info("[%s] 非公式と判断: %s", cid, candidate)
 
+                phone = ""
+                found_address = ""
+                rep_name_val = (company.get("rep_name") or "").strip()
+                description_val = (company.get("description") or "").strip()
+                phone_source = "none"
+                address_source = "none"
+                ai_used = 0
+                ai_model = ""
+                company.setdefault("error_code", "")
+                src_phone = ""
+                src_addr = ""
+                src_rep = ""
+                verify_result = {"phone_ok": False, "address_ok": False}
+                confidence = 0.0
+
+                if homepage and info:
+                    info_url = info.get("url") or homepage
                     cands = scraper.extract_candidates(info.get("text", "") or "")
                     rule_phone = normalize_phone(cands["phone_numbers"][0]) if cands.get("phone_numbers") else None
                     rule_address = normalize_address(cands["addresses"][0]) if cands.get("addresses") else None
+                    rule_rep = (cands.get("rep_names") or [None])[0]
 
                     ai_result = None
+                    ai_attempted = False
                     if USE_AI and verifier is not None:
+                        ai_attempted = True
                         try:
                             ai_result = await verifier.verify_info(
                                 info.get("text", "") or "", info.get("screenshot"),
                                 name, addr
                             )
                         except Exception:
-                            # API障害などは静かにフォールバック
                             log.warning("[%s] AI検証失敗 -> ルールベースにフォールバック", cid, exc_info=True)
                             ai_result = None
 
+                    ai_phone: str | None = None
+                    ai_addr: str | None = None
+                    ai_rep: str | None = None
                     if ai_result:
+                        ai_used = 1
+                        ai_model = AI_MODEL_NAME
                         ai_phone = normalize_phone(ai_result.get("phone_number"))
                         ai_addr = normalize_address(ai_result.get("address"))
-                        phone = ai_phone or rule_phone or ""
-                        found_address = ai_addr or rule_address or ""
+                        ai_rep = ai_result.get("rep_name") or ai_result.get("representative")
+                        if isinstance(ai_rep, str):
+                            ai_rep = ai_rep.strip() or None
+                        description = ai_result.get("description")
+                        if isinstance(description, str) and description.strip():
+                            description_val = description.strip()[:50]
                     else:
-                        # AI未使用/失敗時は軽いクールダウン（429などの揺らぎ対策）
-                        if AI_COOLDOWN_SEC > 0:
+                        if ai_attempted and AI_COOLDOWN_SEC > 0:
                             await asyncio.sleep(jittered_seconds(AI_COOLDOWN_SEC, JITTER_RATIO))
-                        phone = rule_phone or ""
-                        found_address = rule_address or ""
-                else:
-                    log.info("[%s] 有効なホームページなし。", cid)
 
-                company.update({"homepage": homepage, "phone": phone, "found_address": found_address})
+                    if ai_phone:
+                        phone = ai_phone
+                        phone_source = "ai"
+                        src_phone = info_url
+                    elif rule_phone:
+                        phone = rule_phone
+                        phone_source = "rule"
+                        src_phone = info_url
+                    else:
+                        phone = ""
+                        phone_source = "none"
+
+                    if ai_addr:
+                        found_address = ai_addr
+                        address_source = "ai"
+                        src_addr = info_url
+                    elif rule_address:
+                        found_address = rule_address or ""
+                        address_source = "rule" if rule_address else "none"
+                        if rule_address:
+                            src_addr = info_url
+                    else:
+                        found_address = ""
+                        address_source = "none"
+
+                    if ai_rep:
+                        rep_name_val = ai_rep
+                        src_rep = info_url
+                    elif rule_rep:
+                        rep_name_val = rule_rep.strip()
+                        src_rep = info_url
+
+                    # 欠落情報があれば浅く探索して補完
+                    need_phone = not bool(phone)
+                    need_addr = not bool(found_address)
+                    need_rep = not bool(rep_name_val)
+                    if need_phone or need_addr or need_rep:
+                        try:
+                            related = await scraper.crawl_related(
+                                homepage,
+                                need_phone,
+                                need_addr,
+                                need_rep,
+                                max_pages=6,
+                                max_hops=2,
+                            )
+                        except Exception:
+                            related = {}
+                        for url, data in related.items():
+                            text = data.get("text", "") or ""
+                            cc = scraper.extract_candidates(text)
+                            if need_phone and cc.get("phone_numbers"):
+                                cand = normalize_phone(cc["phone_numbers"][0])
+                                if cand:
+                                    phone = cand
+                                    phone_source = "rule"
+                                    src_phone = url
+                                    need_phone = False
+                            if need_addr and cc.get("addresses"):
+                                cand_addr = normalize_address(cc["addresses"][0])
+                                if cand_addr:
+                                    found_address = cand_addr
+                                    address_source = "rule"
+                                    src_addr = url
+                                    need_addr = False
+                            if need_rep and cc.get("rep_names"):
+                                cand_rep = (cc["rep_names"][0] or "").strip()
+                                if cand_rep:
+                                    rep_name_val = cand_rep
+                                    src_rep = url
+                                    need_rep = False
+                            if not (need_phone or need_addr or need_rep):
+                                break
+
+                    try:
+                        verify_result = await scraper.verify_on_site(homepage, phone or None, found_address or None)
+                    except Exception:
+                        log.warning("[%s] verify_on_site 失敗", cid, exc_info=True)
+                        verify_result = {"phone_ok": False, "address_ok": False}
+
+                    matches = int(bool(verify_result.get("phone_ok"))) + int(bool(verify_result.get("address_ok")))
+                    if matches == 2:
+                        confidence = 1.0
+                    elif matches == 1:
+                        confidence = 0.8
+                    else:
+                        confidence = 0.4
+                else:
+                    if urls:
+                        log.info("[%s] 公式サイト候補を判別できず -> 未保存", cid)
+                    else:
+                        log.info("[%s] 有効なホームページ候補なし。", cid)
+                    company["rep_name"] = company.get("rep_name", "") or ""
+                    company["description"] = company.get("description", "") or ""
+                    confidence = 0.4
+
+                normalized_found_address = normalize_address(found_address) if found_address else ""
+                rep_name_val = rep_name_val.strip()
+                description_val = description_val.strip()[:50]
+                company.update({
+                    "homepage": homepage,
+                    "phone": phone or "",
+                    "found_address": normalized_found_address,
+                    "rep_name": rep_name_val,
+                    "description": description_val,
+                    "phone_source": phone_source,
+                    "address_source": address_source,
+                    "ai_used": ai_used,
+                    "ai_model": ai_model,
+                    "extract_confidence": confidence,
+                    "source_url_phone": src_phone,
+                    "source_url_address": src_addr,
+                    "source_url_rep": src_rep,
+                })
 
                 status = "done" if homepage else "error"
                 if status == "done" and found_address and not addr_compatible(addr, found_address):
                     status = "review"
+                if status == "done" and not verify_result.get("phone_ok") and not verify_result.get("address_ok"):
+                    status = "review"
+
+                company.setdefault("error_code", "")
 
                 manager.save_company_data(company, status=status)
                 log.info("[%s] 保存完了: status=%s (worker=%s)", cid, status, WORKER_ID)
