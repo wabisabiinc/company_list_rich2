@@ -88,7 +88,7 @@ def test_is_likely_official_site_true(scraper):
     assert scraper.is_likely_official_site(
         "株式会社Example",
         "https://www.example.co.jp/about",
-        text,
+        {"text": text, "html": f"<title>{text}</title>"},
     )
 
 
@@ -97,7 +97,7 @@ def test_is_likely_official_site_false(scraper):
     assert not scraper.is_likely_official_site(
         "株式会社Example",
         "https://travel.rakuten.co.jp/hotel/123",
-        text,
+        {"text": text},
     )
 
 

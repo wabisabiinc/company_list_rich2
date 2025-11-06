@@ -1,5 +1,5 @@
 # src/company_scraper.py
-import re, urllib.parse
+import re, urllib.parse, json
 import asyncio
 import unicodedata
 from typing import List, Dict, Any, Optional, Iterable
@@ -45,6 +45,18 @@ FISCAL_RE = re.compile(r"(?:決算(?:月|期)|会計年度|会計期)\s*[:：]?\
 LISTING_KEYWORDS = ("非上場", "未上場", "上場予定なし")
 FOUNDED_RE = re.compile(r"(?:設立|創業|創立)\s*[:：]?\s*([0-9０-９]{2,4})年")
 
+TABLE_LABEL_MAP = {
+    "rep_names": ("代表者", "代表取締役", "代表者名", "代表", "代表者氏名", "代表名"),
+    "capitals": ("資本金",),
+    "revenues": ("売上高", "売上", "売上額"),
+    "profits": ("利益", "営業利益", "経常利益", "純利益"),
+    "fiscal_months": ("決算月", "決算期", "決算", "会計期"),
+    "founded_years": ("設立", "創業", "創立", "設立年"),
+    "listing": ("上場区分", "上場", "市場", "上場先", "証券コード"),
+    "phone_numbers": ("電話", "電話番号", "TEL", "Tel"),
+    "addresses": ("所在地", "住所", "本社所在地", "所在地住所", "所在地(本社)"),
+}
+
 
 class CompanyScraper:
     """
@@ -81,6 +93,10 @@ class CompanyScraper:
         "ja.wikipedia.org",
         "kensetumap.com",
         "kaisharesearch.com",
+        "houjin.info",
+        "big-advance.site",
+        "tokubai.co.jp",
+        "itp.ne.jp",
         "hotpepper.jp",
         "tblg.jp",
         "retty.me",
@@ -177,7 +193,23 @@ class CompanyScraper:
         norm = cls._normalize_company_name(company_name)
         tokens = cls._ascii_tokens(norm)
         romaji = cls._romanize(norm)
-        tokens.extend(cls._ascii_tokens(romaji))
+        romaji_ascii = cls._ascii_tokens(romaji)
+        tokens.extend(romaji_ascii)
+
+        compact = re.sub(r"[^A-Za-z0-9]", "", romaji or "").lower()
+        if len(compact) >= 4:
+            tokens.append(compact)
+
+        parts = [p for p in re.split(r"[^A-Za-z0-9]+", (romaji or "").lower()) if len(p) >= 2]
+        for i in range(len(parts)):
+            joined = parts[i]
+            if len(joined) >= 4:
+                tokens.append(joined)
+            for j in range(i + 1, min(len(parts), i + 3)):
+                joined += parts[j]
+                if len(joined) >= 4:
+                    tokens.append(joined)
+
         seen: set[str] = set()
         ordered: List[str] = []
         for tok in tokens:
@@ -205,8 +237,12 @@ class CompanyScraper:
         text = text.strip(" 　:：-‐―－ー")
         titles = (
             "代表取締役社長", "代表取締役副社長", "代表取締役会長", "代表取締役",
-            "代表社員", "代表理事", "理事長", "学長", "園長", "社長",
-            "院長", "所長", "支配人", "店主", "代表者", "代表", "CEO", "COO",
+            "代表社員", "代表理事", "代表理事長", "代表執行役", "代表執行役社長",
+            "代表執行役社長兼CEO", "代表取締役社長兼CEO", "代表取締役社長CEO",
+            "代表取締役社長兼COO", "代表取締役社長兼社長執行役員",
+            "代表者", "代表", "代表主宰", "代表校長",
+            "理事長", "学長", "園長", "校長", "院長", "所長", "館長",
+            "支配人", "店主", "社長", "総支配人", "CEO", "COO", "CFO", "代表取締役副会長",
         )
         for t in titles:
             if text.startswith(t):
@@ -318,7 +354,32 @@ class CompanyScraper:
                 await asyncio.sleep(0.8 * (2 ** attempt))
         return ""
 
-    def is_likely_official_site(self, company_name: str, url: str, snippet: str = "") -> bool:
+    def _page_hints(self, page: Optional[Dict[str, Any]]) -> tuple[str, str]:
+        if isinstance(page, dict):
+            return str(page.get("text") or ""), str(page.get("html") or "")
+        return str(page or ""), ""
+
+    @staticmethod
+    def _meta_strings(html: str) -> str:
+        if not html:
+            return ""
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+        except Exception:
+            return ""
+        hints: List[str] = []
+        title = soup.title.string if soup.title and soup.title.string else ""
+        if title:
+            hints.append(title)
+        for attr in ("description", "keywords", "og:site_name", "og:title"):
+            node = soup.find("meta", attrs={"name": attr}) or soup.find("meta", attrs={"property": attr})
+            if node:
+                content = node.get("content")
+                if content:
+                    hints.append(content)
+        return " \n".join(hints)
+
+    def is_likely_official_site(self, company_name: str, url: str, page_info: Optional[Dict[str, Any]] = None) -> bool:
         try:
             parsed = urllib.parse.urlparse(url)
         except Exception:
@@ -330,7 +391,6 @@ class CompanyScraper:
         if any(host == domain or host.endswith(f".{domain}") for domain in self.NON_OFFICIAL_HOSTS):
             return False
         if host.endswith(".go.jp"):
-            # 行政機関は企業公式サイトとして扱わない
             return False
 
         score = 0
@@ -349,8 +409,17 @@ class CompanyScraper:
             if token and token in host:
                 score += 2
 
-        lowered = (snippet or "").lower()
-        if "公式" in snippet or "official" in lowered:
+        text_snippet, html = self._page_hints(page_info)
+        meta_snippet = self._meta_strings(html)
+        combined = f"{text_snippet}\n{meta_snippet}".strip()
+        lowered = combined.lower()
+
+        norm_name = self._normalize_company_name(company_name)
+        if norm_name and norm_name in combined:
+            score += 4
+        elif norm_name and len(norm_name) >= 4 and any(part in combined for part in (norm_name[:4], norm_name[-4:])):
+            score += 2
+        if "公式" in combined or "official" in lowered:
             score += 2
         if any(kw in lowered for kw in self.NON_OFFICIAL_SNIPPET_KEYWORDS):
             score -= 3
@@ -712,7 +781,7 @@ class CompanyScraper:
         return results
 
     # ===== 抽出 =====
-    def extract_candidates(self, text: str) -> Dict[str, List[str]]:
+    def extract_candidates(self, text: str, html: Optional[str] = None) -> Dict[str, List[str]]:
         phones: List[str] = []
         addrs: List[str] = []
         reps: List[str] = []
@@ -737,6 +806,140 @@ class CompanyScraper:
                 reps.append(cleaned)
 
         listings: List[str] = []
+        capitals: List[str] = []
+        revenues: List[str] = []
+        profits: List[str] = []
+        fiscal_months: List[str] = []
+        founded_years: List[str] = []
+
+        if html:
+            try:
+                soup = BeautifulSoup(html, "html.parser")
+            except Exception:
+                soup = None
+            if soup:
+                pair_values: List[tuple[str, str]] = []
+
+                for table in soup.find_all("table"):
+                    for row in table.find_all("tr"):
+                        cells = row.find_all(["th", "td"])
+                        if len(cells) < 2:
+                            continue
+                        label = cells[0].get_text(separator=" ", strip=True)
+                        value = cells[1].get_text(separator=" ", strip=True)
+                        if label and value:
+                            pair_values.append((label, value))
+
+                for dl in soup.find_all("dl"):
+                    dts = dl.find_all("dt")
+                    dds = dl.find_all("dd")
+                    for dt, dd in zip(dts, dds):
+                        label = dt.get_text(separator=" ", strip=True)
+                        value = dd.get_text(separator=" ", strip=True)
+                        if label and value:
+                            pair_values.append((label, value))
+
+                for label, value in pair_values:
+                    norm_label = label.replace("：", ":").strip()
+                    norm_value = value.strip()
+                    if not norm_value:
+                        continue
+                    for field, keywords in TABLE_LABEL_MAP.items():
+                        if any(keyword in norm_label for keyword in keywords):
+                            if field == "rep_names":
+                                cleaned = self.clean_rep_name(norm_value)
+                                if cleaned:
+                                    reps.append(cleaned)
+                            elif field == "phone_numbers":
+                                for p in PHONE_RE.finditer(norm_value):
+                                    phones.append(f"{p.group(1)}-{p.group(2)}-{p.group(3)}")
+                            elif field == "addresses":
+                                addrs.append(norm_value)
+                            elif field == "listing":
+                                listings.append(norm_value)
+                            elif field == "capitals":
+                                capitals.append(norm_value)
+                            elif field == "revenues":
+                                revenues.append(norm_value)
+                            elif field == "profits":
+                                profits.append(norm_value)
+                            elif field == "fiscal_months":
+                                fiscal_months.append(norm_value)
+                            elif field == "founded_years":
+                                norm = unicodedata.normalize("NFKC", norm_value)
+                                m = re.search(r"(\d{4})", norm)
+                                if m:
+                                    founded_years.append(m.group(1))
+                                else:
+                                    founded_years.append(norm_value)
+                            break
+
+                def walk_ld(entity: Any) -> None:
+                    if isinstance(entity, dict):
+                        types = entity.get("@type") or entity.get("type")
+                        type_list = []
+                        if isinstance(types, str):
+                            type_list = [types.lower()]
+                        elif isinstance(types, list):
+                            type_list = [str(t).lower() for t in types]
+                        is_org = any(t in {
+                            "organization", "localbusiness", "corporation", "educationalorganization",
+                            "ngo", "governmentoffice", "medicalorganization", "hotel", "lodgingbusiness",
+                        } for t in type_list)
+                        if is_org:
+                            tel = entity.get("telephone")
+                            if isinstance(tel, str):
+                                for p in PHONE_RE.finditer(tel):
+                                    phones.append(f"{p.group(1)}-{p.group(2)}-{p.group(3)}")
+                            addr = entity.get("address")
+                            if isinstance(addr, dict):
+                                parts = [addr.get(k, "") for k in ("postalCode", "addressRegion", "addressLocality", "streetAddress")]
+                                joined = " ".join([p for p in parts if p])
+                                if joined:
+                                    addrs.append(joined)
+                            founder = entity.get("founder")
+                            founders = entity.get("founders")
+                            founder_vals: List[str] = []
+                            if isinstance(founder, str):
+                                founder_vals.append(founder)
+                            elif isinstance(founder, dict):
+                                name = founder.get("name")
+                                if isinstance(name, str):
+                                    founder_vals.append(name)
+                            if isinstance(founders, list):
+                                for f in founders:
+                                    if isinstance(f, str):
+                                        founder_vals.append(f)
+                                    elif isinstance(f, dict):
+                                        name = f.get("name")
+                                        if isinstance(name, str):
+                                            founder_vals.append(name)
+                            for name in founder_vals:
+                                cleaned = self.clean_rep_name(name)
+                                if cleaned:
+                                    reps.append(cleaned)
+
+                            founding_date = entity.get("foundingDate") or entity.get("foundingYear")
+                            if isinstance(founding_date, str):
+                                m = re.search(r"(\d{4})", founding_date)
+                                if m:
+                                    founded_years.append(m.group(1))
+                        for v in entity.values():
+                            walk_ld(v)
+                    elif isinstance(entity, list):
+                        for item in entity:
+                            walk_ld(item)
+
+                for script in soup.find_all("script"):
+                    t = script.get("type", "") or ""
+                    if "ld+json" not in t:
+                        continue
+                    try:
+                        data = json.loads(script.string or "")
+                    except Exception:
+                        continue
+                    walk_ld(data)
+
         for lm in LISTING_RE.finditer(text or ""):
             val = lm.group(1).strip()
             val = re.split(r"[、。\s/|]", val)[0]
@@ -749,11 +952,10 @@ class CompanyScraper:
                     listings.append(term)
                     break
 
-        capitals = [m.group(1).strip() for m in CAPITAL_RE.finditer(text or "")]
-        revenues = [m.group(1).strip() for m in REVENUE_RE.finditer(text or "")]
-        profits = [m.group(1).strip() for m in PROFIT_RE.finditer(text or "")]
-        fiscal_months = [m.group(1).strip() for m in FISCAL_RE.finditer(text or "")]
-        founded_years: List[str] = []
+        capitals.extend(m.group(1).strip() for m in CAPITAL_RE.finditer(text or ""))
+        revenues.extend(m.group(1).strip() for m in REVENUE_RE.finditer(text or ""))
+        profits.extend(m.group(1).strip() for m in PROFIT_RE.finditer(text or ""))
+        fiscal_months.extend(m.group(1).strip() for m in FISCAL_RE.finditer(text or ""))
         for fm in FOUNDED_RE.finditer(text or ""):
             val = fm.group(1).strip()
             val = unicodedata.normalize("NFKC", val)

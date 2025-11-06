@@ -167,8 +167,9 @@ async def process():
                 for candidate in urls:
                     candidate_info = await scraper.get_page_info(candidate)
                     candidate_text = candidate_info.get("text", "") or ""
-                    extracted = scraper.extract_candidates(candidate_text)
-                    if scraper.is_likely_official_site(name, candidate, candidate_text):
+                    candidate_html = candidate_info.get("html") or ""
+                    extracted = scraper.extract_candidates(candidate_text, candidate_html)
+                    if scraper.is_likely_official_site(name, candidate, candidate_info):
                         homepage = candidate
                         info = candidate_info
                         primary_cands = extracted
@@ -313,7 +314,8 @@ async def process():
                             related = {}
                         for url, data in related.items():
                             text = data.get("text", "") or ""
-                            cc = scraper.extract_candidates(text)
+                            html_content = data.get("html", "") or ""
+                            cc = scraper.extract_candidates(text, html_content)
                             if need_phone and cc.get("phone_numbers"):
                                 cand = normalize_phone(cc["phone_numbers"][0])
                                 if cand:
