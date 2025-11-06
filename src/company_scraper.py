@@ -4,6 +4,7 @@ import asyncio
 import unicodedata
 from typing import List, Dict, Any, Optional, Iterable
 from urllib.parse import urlparse, parse_qs, unquote, urljoin
+from difflib import SequenceMatcher
 
 import requests
 from bs4 import BeautifulSoup
@@ -104,10 +105,16 @@ class CompanyScraper:
         "mapion.co.jp",
         "google.com",
         "tsukumado.com",
+        "note.com",
+        "note.jp",
+        "note.mu",
     }
 
     SUSPECT_HOSTS = {
         "big-advance.site",
+        "ameblo.jp",
+        "blog.jp",
+        "ja-jp.facebook.com",
     }
 
     NON_OFFICIAL_KEYWORDS = {
@@ -410,6 +417,8 @@ class CompanyScraper:
         score = 0
         if any(host == domain or host.endswith(f".{domain}") for domain in self.SUSPECT_HOSTS):
             score -= 4
+        if host.startswith("www."):
+            score += 1
         if host.endswith(('.co.jp', '.or.jp', '.ac.jp', '.ed.jp', '.lg.jp', '.gr.jp')):
             score += 4
         elif host.endswith('.jp'):
@@ -450,16 +459,14 @@ class CompanyScraper:
         if any(kw in host for kw in self.NON_OFFICIAL_KEYWORDS):
             score -= 3
 
-        expected_key = self._addr_key(expected_address or "")
-        if expected_key:
+        if expected_address:
             candidate_addrs: List[str] = []
             if extracted and extracted.get("addresses"):
                 candidate_addrs.extend(extracted.get("addresses") or [])
             if not candidate_addrs and text_snippet:
                 candidate_addrs.extend(ADDR_FALLBACK_RE.findall(text_snippet))
             for cand in candidate_addrs:
-                cand_key = self._addr_key(cand)
-                if cand_key and (expected_key in cand_key or cand_key in expected_key):
+                if self._address_matches(expected_address, cand):
                     score += 5
                     break
 
@@ -642,6 +649,35 @@ class CompanyScraper:
         text = re.sub(r"[‐―－ーｰ-]+", "-", text)
         text = re.sub(r"\s+", "", text)
         return text.lower()
+
+    @staticmethod
+    def _address_matches(expected: str, candidate: str) -> bool:
+        if not expected or not candidate:
+            return False
+
+        def norm(s: str) -> str:
+            return CompanyScraper._addr_key(s)
+
+        exp = norm(expected)
+        cand = norm(candidate)
+        if not exp or not cand:
+            return False
+        if exp in cand or cand in exp:
+            return True
+
+        digits_exp = re.sub(r"\D", "", exp)
+        digits_cand = re.sub(r"\D", "", cand)
+        if len(digits_exp) >= 7 and digits_exp[:7] in digits_cand:
+            tail_exp = digits_exp[-4:] if len(digits_exp) >= 4 else ""
+            if tail_exp and tail_exp in digits_cand:
+                return True
+        if len(digits_cand) >= 7 and digits_cand[:7] in digits_exp:
+            tail_cand = digits_cand[-4:] if len(digits_cand) >= 4 else ""
+            if tail_cand and tail_cand in digits_exp:
+                return True
+
+        ratio = SequenceMatcher(None, exp, cand).ratio()
+        return ratio >= 0.55
 
     async def verify_on_site(
         self,

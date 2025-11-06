@@ -176,3 +176,26 @@ def test_is_likely_official_site_suspect_host_without_address(scraper):
         "https://www.big-advance.site/c/158/1300",
         {"text": text},
     )
+
+
+def test_is_likely_official_site_partial_address(scraper):
+    text = "アクセス\n〒409-2524 山梨県南巨摩郡身延町身延3678 甘養亭製菓店"
+    extracted = {
+        "addresses": ["〒409-2524 山梨県南巨摩郡身延町身延3678"],
+    }
+    assert scraper.is_likely_official_site(
+        "甘養亭製菓店",
+        "https://www.kanyoutei.com/",
+        {"text": text},
+        "〒409-2524 上町3678",
+        extracted,
+    )
+
+
+def test_is_likely_official_site_excludes_note(scraper):
+    text = "[公式] 甘養亭製菓店の最新情報"
+    assert not scraper.is_likely_official_site(
+        "甘養亭製菓店",
+        "https://note.com/company_official/n/abc",
+        {"text": text},
+    )
