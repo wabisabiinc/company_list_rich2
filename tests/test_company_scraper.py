@@ -39,6 +39,8 @@ async def test_search_company_filters_and_resolves(mock_get, scraper):
     mock_get.return_value = mock_response
 
     urls = await scraper.search_company("トヨタ自動車株式会社", "愛知県豊田市", num_results=10)
+    first_query = mock_get.call_args_list[0].kwargs["params"]["q"]
+    assert first_query.endswith("公式サイト")
 
     # /l/?uddg= が正しく剥がれている（相対/絶対）
     assert "https://example.com/home" in urls
@@ -95,5 +97,14 @@ def test_is_likely_official_site_false(scraper):
     assert not scraper.is_likely_official_site(
         "株式会社Example",
         "https://travel.rakuten.co.jp/hotel/123",
+        text,
+    )
+
+
+def test_is_likely_official_site_romaji(scraper):
+    text = "会社概要とお問い合わせ"
+    assert scraper.is_likely_official_site(
+        "株式会社創明社",
+        "https://someisha.co.jp",
         text,
     )

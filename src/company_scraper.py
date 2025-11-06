@@ -2,7 +2,7 @@
 import re, urllib.parse
 import asyncio
 import unicodedata
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Iterable
 from urllib.parse import urlparse, parse_qs, unquote, urljoin
 
 import requests
@@ -11,6 +11,16 @@ from playwright.async_api import (
     async_playwright, Browser, BrowserContext, Page,
     TimeoutError as PlaywrightTimeoutError, Route
 )
+
+try:
+    from pykakasi import kakasi as _kakasi_constructor
+except Exception:
+    _kakasi_constructor = None
+
+try:
+    from unidecode import unidecode as _unidecode
+except Exception:
+    _unidecode = None
 
 # 深掘り時に優先して辿るパス（日本語含む）
 PRIORITY_PATHS = [
@@ -23,7 +33,17 @@ PRIO_WORDS = ["会社概要", "企業情報", "お問い合わせ", "アクセ�
 PHONE_RE = re.compile(r"(?:TEL|Tel|tel|電話)\s*[:：]?\s*(0\d{1,4})[-‐―－ー]?(\d{1,4})[-‐―－ー]?(\d{3,4})")
 ZIP_RE = re.compile(r"(〒?\s*\d{3})[-‐―－ー]?(\d{4})")
 ADDR_HINT = re.compile(r"(都|道|府|県).+?(市|区|郡|町|村)")
+ADDR_FALLBACK_RE = re.compile(
+    r"(〒\d{3}-\d{4}[^。\n]*|[一-龥]{2,3}[都道府県][^。\n]{0,120}[市区町村郡][^。\n]{0,140})"
+)
 REP_RE = re.compile(r"(?:代表者|代表取締役|理事長|学長)\s*[:：]?\s*([^\s　<>\|（）\(\)]+)")
+LISTING_RE = re.compile(r"(?:上場(?:区分|市場|先)?|株式上場)\s*[:：]?\s*([^\s、。\n]+)")
+CAPITAL_RE = re.compile(r"資本金\s*[:：]?\s*([0-9０-９,.]+(?:億|万|千)?円)")
+REVENUE_RE = re.compile(r"(?:売上高|売上)\s*[:：]?\s*([0-9０-９,.]+(?:億|万|千)?円(?:以上|程度|規模)?)")
+PROFIT_RE = re.compile(r"(?:営業利益|経常利益)\s*[:：]?\s*([0-9０-９,.]+(?:億|万|千)?円)")
+FISCAL_RE = re.compile(r"(?:決算(?:月|期)|会計年度|会計期)\s*[:：]?\s*([0-9０-９]{1,2}月(?:末)?|[0-9０-９]{1,2}月期)")
+LISTING_KEYWORDS = ("非上場", "未上場", "上場予定なし")
+FOUNDED_RE = re.compile(r"(?:設立|創業|創立)\s*[:：]?\s*([0-9０-９]{2,4})年")
 
 
 class CompanyScraper:
@@ -60,6 +80,7 @@ class CompanyScraper:
         "navitime.co.jp",
         "ja.wikipedia.org",
         "kensetumap.com",
+        "kaisharesearch.com",
         "hotpepper.jp",
         "tblg.jp",
         "retty.me",
@@ -76,6 +97,12 @@ class CompanyScraper:
         "seikyu", "delivery", "ranking", "review", "口コミ", "比較",
     }
 
+    NON_OFFICIAL_SNIPPET_KEYWORDS = (
+        "口コミ", "求人", "求人情報", "転職", "派遣", "予約", "地図", "アクセスマップ",
+        "リストス", "上場区分", "企業情報サイト", "まとめ", "一覧", "ランキング", "プラン",
+        "sales promotion", "booking", "reservation", "hotel", "travel", "camp",
+    )
+
     CORP_SUFFIXES = [
         "株式会社", "（株）", "(株)", "有限会社", "合同会社", "合名会社", "合資会社",
         "Inc.", "Inc", "Co.", "Co", "Corporation", "Company", "Ltd.", "Ltd",
@@ -88,6 +115,8 @@ class CompanyScraper:
         "お問い合わせ", "問い合わせ", "contact",
         "アクセス", "access", "本社", "所在地", "沿革",
     )
+
+    _romaji_converter = None  # lazy pykakasi converter
 
     def __init__(self, headless: bool = True):
         self.headless = headless
@@ -106,9 +135,100 @@ class CompanyScraper:
         norm = re.sub(r"[\s　]+", "", norm)
         return norm
 
+    @classmethod
+    def _romanize(cls, text: str) -> str:
+        if not text:
+            return ""
+        if _kakasi_constructor:
+            try:
+                if cls._romaji_converter is None:
+                    cls._romaji_converter = _kakasi_constructor()
+                converter = cls._romaji_converter
+                if hasattr(converter, "convert"):
+                    parts = converter.convert(text)
+                    converted = "".join(
+                        item.get("hepburn") or item.get("kana") or item.get("hira") or ""
+                        for item in parts
+                    )
+                    if converted:
+                        return converted
+                elif hasattr(converter, "getConverter"):
+                    legacy = converter.getConverter()
+                    converted = legacy.do(text)
+                    if converted:
+                        return converted
+                elif callable(converter):
+                    converted = str(converter(text))
+                    if converted:
+                        return converted
+            except Exception:
+                cls._romaji_converter = None
+        if _unidecode:
+            try:
+                converted = _unidecode(text)
+                if converted:
+                    return converted
+            except Exception:
+                pass
+        return ""
+
+    @classmethod
+    def _company_tokens(cls, company_name: str) -> List[str]:
+        norm = cls._normalize_company_name(company_name)
+        tokens = cls._ascii_tokens(norm)
+        romaji = cls._romanize(norm)
+        tokens.extend(cls._ascii_tokens(romaji))
+        seen: set[str] = set()
+        ordered: List[str] = []
+        for tok in tokens:
+            if not tok or tok in seen:
+                continue
+            seen.add(tok)
+            ordered.append(tok)
+        return ordered
+
     @staticmethod
     def _ascii_tokens(text: str) -> List[str]:
         return [tok.lower() for tok in re.findall(r"[A-Za-z0-9]{2,}", text or "")]
+
+    @staticmethod
+    def clean_rep_name(raw: Optional[str]) -> Optional[str]:
+        if not raw:
+            return None
+        text = str(raw).strip()
+        if not text:
+            return None
+        # remove parentheses content
+        text = re.sub(r"[（(][^）)]*[）)]", "", text)
+        # keep only segment before punctuation/newline
+        text = re.split(r"[、。\n/|｜,;；]", text)[0]
+        text = text.strip(" 　:：-‐―－ー")
+        titles = (
+            "代表取締役社長", "代表取締役副社長", "代表取締役会長", "代表取締役",
+            "代表社員", "代表理事", "理事長", "学長", "園長", "社長",
+            "院長", "所長", "支配人", "店主", "代表者", "代表", "CEO", "COO",
+        )
+        for t in titles:
+            if text.startswith(t):
+                text = text[len(t):]
+                break
+        text = text.strip(" 　")
+        if text.endswith(("氏", "様")):
+            text = text[:-1]
+        text = re.sub(r"\s+", " ", text)
+        text = text.strip()
+        if not text:
+            return None
+        if len(text) < 2 or len(text) > 20:
+            return None
+        if any(word in text for word in ("株式会社", "有限会社", "合名会社", "合資会社", "合同会社")):
+            return None
+        for stop in ("創業", "創立", "創設", "メッセージ", "ご挨拶", "からの", "決裁", "沿革", "代表挨拶"):
+            if stop in text:
+                return None
+        if not re.search(r"[一-龥ぁ-んァ-ン]", text):
+            return None
+        return text
 
     @staticmethod
     def _domain_tokens(url: str) -> List[str]:
@@ -132,19 +252,112 @@ class CompanyScraper:
         for token in company_tokens:
             if any(token in dt for dt in domain_tokens):
                 score += 4
+            if token and token in host:
+                score += 3
         lowered = host + urlparse(url).path.lower()
         if any(kw in lowered for kw in self.NON_OFFICIAL_KEYWORDS):
             score -= 3
         return score
 
+    def _path_priority_value(self, url: str) -> int:
+        try:
+            path = urllib.parse.urlparse(url).path.lower()
+        except Exception:
+            return 0
+        score = 0
+        for idx, marker in enumerate(self.PRIORITY_PATHS):
+            if marker.lower() in path:
+                score += max(6 - idx, 1)
+        return score
+
+    def _is_excluded(self, url: str) -> bool:
+        lowered = url.lower()
+        return any(ex in lowered for ex in self.EXCLUDE_DOMAINS)
+
+    def _clean_candidate_url(self, raw: str) -> Optional[str]:
+        if not raw:
+            return None
+        href = self._decode_uddg(raw)
+        if href.startswith("//"):
+            href = "https:" + href
+        elif href.startswith("/"):
+            href = urljoin("https://duckduckgo.com", href)
+        return href
+
+    def _extract_search_urls(self, html: str) -> Iterable[str]:
+        soup = BeautifulSoup(html, "html.parser")
+        anchors = soup.select("a.result__a")
+        for a in anchors:
+            cleaned = self._clean_candidate_url(a.get("href"))
+            if not cleaned or self._is_excluded(cleaned):
+                continue
+            yield cleaned
+
+    async def _fetch_duckduckgo(self, query: str) -> str:
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept-Language": "ja,en-US;q=0.9",
+            "Referer": "https://duckduckgo.com/",
+        }
+        for attempt in range(3):
+            try:
+                resp = requests.get(
+                    "https://html.duckduckgo.com/html",
+                    params={"q": query, "kl": "jp-jp"},
+                    headers=headers,
+                    timeout=(5, 30),
+                )
+                if resp.status_code in (429, 500, 502, 503, 504):
+                    await asyncio.sleep(0.8 * (2 ** attempt))
+                    continue
+                resp.raise_for_status()
+                return resp.text
+            except Exception:
+                if attempt == 2:
+                    return ""
+                await asyncio.sleep(0.8 * (2 ** attempt))
+        return ""
+
     def is_likely_official_site(self, company_name: str, url: str, snippet: str = "") -> bool:
-        host = urllib.parse.urlparse(url).netloc.lower()
-        host = host.split(":")[0]
+        try:
+            parsed = urllib.parse.urlparse(url)
+        except Exception:
+            return False
+        host = (parsed.netloc or "").lower().split(":")[0]
+        if not host:
+            return False
+
         if any(host == domain or host.endswith(f".{domain}") for domain in self.NON_OFFICIAL_HOSTS):
             return False
         if host.endswith(".go.jp"):
+            # 行政機関は企業公式サイトとして扱わない
             return False
-        return bool(host)
+
+        score = 0
+        if host.endswith(('.co.jp', '.or.jp', '.ac.jp', '.ed.jp', '.lg.jp', '.gr.jp')):
+            score += 4
+        elif host.endswith('.jp'):
+            score += 2
+        elif host.endswith('.com') or host.endswith('.net'):
+            score += 1
+
+        company_tokens = self._company_tokens(company_name)
+        domain_tokens = self._domain_tokens(url)
+        for token in company_tokens:
+            if any(token in dt for dt in domain_tokens):
+                score += 3
+            if token and token in host:
+                score += 2
+
+        lowered = (snippet or "").lower()
+        if "公式" in snippet or "official" in lowered:
+            score += 2
+        if any(kw in lowered for kw in self.NON_OFFICIAL_SNIPPET_KEYWORDS):
+            score -= 3
+        if any(kw in host for kw in self.NON_OFFICIAL_KEYWORDS):
+            score -= 3
+
+        return score >= 2
 
     # ===== 高速化の肝：ブラウザを起動して使い回す =====
     async def start(self):
@@ -319,64 +532,59 @@ class CompanyScraper:
 
     async def search_company(self, company_name: str, address: str, num_results: int = 3) -> List[str]:
         """
-        DuckDuckGoで検索し、候補URLを返す（軽いリトライ＆バックオフ付き）
+        DuckDuckGoで検索し、候補URLを返す（「公式サイト」クエリを優先）。
         """
-        query = f"{company_name} {address}".strip()
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Accept-Language": "ja,en-US;q=0.9",
-            "Referer": "https://duckduckgo.com/",
-        }
-
-        # 最大3回リトライ（指数バックオフ）
-        resp_text = ""
-        for attempt in range(3):
-            try:
-                resp = requests.get(
-                    "https://html.duckduckgo.com/html",
-                    params={"q": query, "kl": "jp-jp"},
-                    headers=headers,
-                    timeout=(5, 30),  # 接続5秒 / 応答30秒
-                )
-                # 429/5xx は待ってリトライ
-                if resp.status_code in (429, 500, 502, 503, 504):
-                    await asyncio.sleep(0.8 * (2 ** attempt))
-                    continue
-                resp.raise_for_status()
-                resp_text = resp.text
-                break
-            except Exception:
-                if attempt == 2:
-                    return []
-                await asyncio.sleep(0.8 * (2 ** attempt))
-
-        soup = BeautifulSoup(resp_text, "html.parser")
-        anchors = soup.select("a.result__a")
-        results: List[str] = []
-        for a in anchors:
-            raw = a.get("href")
-            if not raw:
-                continue
-            href = self._decode_uddg(raw)
-            if href.startswith("//"):
-                href = "https:" + href
-            elif href.startswith("/"):
-                href = urljoin("https://duckduckgo.com", href)
-            if any(ex in href for ex in self.EXCLUDE_DOMAINS):
-                continue
-            results.append(href)
-
-        if not results:
+        base_name = (company_name or "").strip()
+        base_address = (address or "").strip()
+        queries: List[str] = []
+        if base_name:
+            queries.append(f"{base_name} 公式サイト")
+        if base_name and base_address:
+            q_addr = f"{base_name} {base_address}".strip()
+            if q_addr and q_addr not in queries:
+                queries.append(q_addr)
+        if base_name and base_name not in queries:
+            queries.append(base_name)
+        if not queries:
             return []
-        ordered = self._prioritize(results)
+
+        candidates: List[Dict[str, Any]] = []
         seen: set[str] = set()
-        deduped: List[str] = []
-        for u in ordered:
-            if u not in seen:
-                seen.add(u)
-                deduped.append(u)
-        deduped = self._prioritize_paths(deduped)
-        return deduped[:num_results]
+        max_candidates = max(num_results * 3, 12)
+
+        for q_idx, query in enumerate(queries):
+            html = await self._fetch_duckduckgo(query)
+            if not html:
+                continue
+            for rank, url in enumerate(self._extract_search_urls(html)):
+                if url in seen:
+                    continue
+                seen.add(url)
+                candidates.append({"url": url, "query_idx": q_idx, "rank": rank})
+                if len(candidates) >= max_candidates:
+                    break
+            if len(candidates) >= num_results:
+                break
+
+        if not candidates:
+            return []
+
+        company_tokens = self._company_tokens(company_name)
+        scored: List[tuple[int, int, int, str]] = []
+        for item in candidates:
+            url = item["url"]
+            score = self._domain_score(company_tokens, url)
+            score += max(0, 6 - item["rank"])
+            if item["query_idx"] == 0:
+                score += 3
+            score += self._path_priority_value(url)
+            scored.append((score, item["query_idx"], item["rank"], url))
+
+        scored.sort(key=lambda x: (-x[0], x[1], x[2], x[3]))
+        ordered: List[str] = []
+        for _, _, _, url in scored:
+            ordered.append(url)
+        return ordered[:num_results]
 
     # ===== ページ取得（ブラウザ再利用＋軽いリトライ） =====
     async def get_page_info(self, url: str, timeout: int = 25000) -> Dict[str, Any]:
@@ -521,13 +729,39 @@ class CompanyScraper:
                 addrs.append(f"{zip_code} {seg}")
 
         if not addrs:
-            fallback_pattern = re.compile(
-                r"(〒\d{3}-\d{4}[^。\n]*|[一-龥]{2,3}[都道府県][^。\n]{0,120}[市区町村郡][^。\n]{0,140})"
-            )
-            addrs.extend(fallback_pattern.findall(text or ""))
+            addrs.extend(ADDR_FALLBACK_RE.findall(text or ""))
 
         for rm in REP_RE.finditer(text or ""):
-            reps.append(rm.group(1).strip())
+            cleaned = self.clean_rep_name(rm.group(1))
+            if cleaned:
+                reps.append(cleaned)
+
+        listings: List[str] = []
+        for lm in LISTING_RE.finditer(text or ""):
+            val = lm.group(1).strip()
+            val = re.split(r"[、。\s/|]", val)[0]
+            if val:
+                listings.append(val)
+        if not listings:
+            lowered = (text or "").lower()
+            for term in LISTING_KEYWORDS:
+                if term in text or term.lower() in lowered:
+                    listings.append(term)
+                    break
+
+        capitals = [m.group(1).strip() for m in CAPITAL_RE.finditer(text or "")]
+        revenues = [m.group(1).strip() for m in REVENUE_RE.finditer(text or "")]
+        profits = [m.group(1).strip() for m in PROFIT_RE.finditer(text or "")]
+        fiscal_months = [m.group(1).strip() for m in FISCAL_RE.finditer(text or "")]
+        founded_years: List[str] = []
+        for fm in FOUNDED_RE.finditer(text or ""):
+            val = fm.group(1).strip()
+            val = unicodedata.normalize("NFKC", val)
+            if len(val) == 2 and val.isdigit():
+                # Heisei/Showa not handled; skip ambiguous short years
+                continue
+            if val.isdigit():
+                founded_years.append(val)
 
         def dedupe(seq: List[str]) -> List[str]:
             seen: set[str] = set()
@@ -542,4 +776,10 @@ class CompanyScraper:
             "phone_numbers": dedupe(phones),
             "addresses": dedupe(addrs),
             "rep_names": dedupe(reps),
+            "listings": dedupe(listings),
+            "capitals": dedupe(capitals),
+            "revenues": dedupe(revenues),
+            "profits": dedupe(profits),
+            "fiscal_months": dedupe(fiscal_months),
+            "founded_years": dedupe(founded_years),
         }

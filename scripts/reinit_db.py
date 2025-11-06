@@ -23,7 +23,13 @@ CREATE TABLE IF NOT EXISTS companies (
     locked_by      TEXT,
     locked_at      TEXT,
     rep_name       TEXT,
-    description    TEXT
+    description    TEXT,
+    listing        TEXT,
+    revenue        TEXT,
+    profit         TEXT,
+    capital        TEXT,
+    fiscal_month   TEXT,
+    founded_year   TEXT
 );
 """
 INDEX_SQL = [
@@ -42,6 +48,12 @@ ALIASES = {
     "homepage": {"homepage","url","URL","ホームページ","サイト","公式サイト","出典URL"},
     "phone": {"phone","電話番号","TEL","tel"},
     "found_address": {"found_address"},
+    "listing": {"上場区分","上場","市場"},
+    "revenue": {"売上","売上高"},
+    "profit": {"利益","営業利益","経常利益"},
+    "capital": {"資本金"},
+    "fiscal_month": {"決算","決算月","会計期"},
+    "founded_year": {"設立","創業","創立"},
 }
 NOISE_KEYWORDS = ("リストスが提供しています", "お問い合わせフォーム送信代行", "ftj-g.co.jp", "listoss.com")
 
@@ -164,7 +176,7 @@ def row_from_csv(r: Dict[str, Any]) -> Dict[str, Any] | None:
         "company_name": company_name,
         "address": address,
         "employee_count": _to_int(_pick(r, "employee_count")),
-        "homepage": (str(_pick(r, "homepage") or "").strip()),
+        "homepage": "",
         "phone": (str(_pick(r, "phone") or "").strip()),
         "found_address": (str(_pick(r, "found_address") or "").strip()),
         "status": "pending",
@@ -172,6 +184,12 @@ def row_from_csv(r: Dict[str, Any]) -> Dict[str, Any] | None:
         "locked_at": None,
         "rep_name": None,
         "description": None,
+        "listing": (str(_pick(r, "listing") or "").strip()),
+        "revenue": (str(_pick(r, "revenue") or "").strip()),
+        "profit": (str(_pick(r, "profit") or "").strip()),
+        "capital": (str(_pick(r, "capital") or "").strip()),
+        "fiscal_month": (str(_pick(r, "fiscal_month") or "").strip()),
+        "founded_year": (str(_pick(r, "founded_year") or "").strip()),
     }
 
 def iter_csv_rows(args) -> Iterable[Dict[str, Any]]:
@@ -213,7 +231,8 @@ def iter_csv_rows(args) -> Iterable[Dict[str, Any]]:
 def bulk_insert(conn: sqlite3.Connection, rows: Iterable[Dict[str, Any]], chunk: int = 5000) -> Tuple[int,int]:
     cur = conn.cursor()
     cols = ("company_name","address","employee_count","homepage","phone","found_address",
-            "status","locked_by","locked_at","rep_name","description")
+            "status","locked_by","locked_at","rep_name","description",
+            "listing","revenue","profit","capital","fiscal_month","founded_year")
     sql = f"INSERT OR IGNORE INTO companies ({','.join(cols)}) VALUES ({','.join(['?']*len(cols))})"
 
     buf: list[Dict[str, Any]] = []

@@ -46,7 +46,8 @@ MIRROR_TO_CSV = os.getenv("MIRROR_TO_CSV", "false").lower() == "true"
 OUTPUT_CSV_PATH = os.getenv("OUTPUT_CSV_PATH", "data/output.csv")
 CSV_FIELDNAMES = [
     "id", "company_name", "address", "employee_count",
-    "homepage", "phone", "found_address", "rep_name", "description"
+    "homepage", "phone", "found_address", "rep_name", "description",
+    "listing", "revenue", "profit", "capital", "fiscal_month", "founded_year"
 ]
 
 # --------------------------------------------------
@@ -160,25 +161,42 @@ async def process():
                 urls = await scraper.search_company(name, addr, num_results=5)
                 homepage = ""
                 info = None
-                phone, found_address = "", ""
+                primary_cands: dict[str, list[str]] = {}
+                fallback_cands: list[dict[str, list[str]]] = []
 
                 for candidate in urls:
                     candidate_info = await scraper.get_page_info(candidate)
-                    if scraper.is_likely_official_site(name, candidate, candidate_info.get("text", "") or ""):
+                    candidate_text = candidate_info.get("text", "") or ""
+                    extracted = scraper.extract_candidates(candidate_text)
+                    if scraper.is_likely_official_site(name, candidate, candidate_text):
                         homepage = candidate
                         info = candidate_info
+                        primary_cands = extracted
                         break
+                    fallback_cands.append(extracted)
                     log.info("[%s] 非公式と判断: %s", cid, candidate)
 
                 phone = ""
                 found_address = ""
-                rep_name_val = (company.get("rep_name") or "").strip()
+                rep_name_val = scraper.clean_rep_name(company.get("rep_name")) or ""
                 description_val = (company.get("description") or "").strip()
+                listing_val = (company.get("listing") or "").strip()
+                revenue_val = (company.get("revenue") or "").strip()
+                profit_val = (company.get("profit") or "").strip()
+                capital_val = (company.get("capital") or "").strip()
+                fiscal_val = (company.get("fiscal_month") or "").strip()
+                founded_val = (company.get("founded_year") or "").strip()
                 phone_source = "none"
                 address_source = "none"
                 ai_used = 0
                 ai_model = ""
                 company.setdefault("error_code", "")
+                company.setdefault("listing", listing_val)
+                company.setdefault("revenue", revenue_val)
+                company.setdefault("profit", profit_val)
+                company.setdefault("capital", capital_val)
+                company.setdefault("fiscal_month", fiscal_val)
+                company.setdefault("founded_year", founded_val)
                 src_phone = ""
                 src_addr = ""
                 src_rep = ""
@@ -187,10 +205,33 @@ async def process():
 
                 if homepage and info:
                     info_url = info.get("url") or homepage
-                    cands = scraper.extract_candidates(info.get("text", "") or "")
-                    rule_phone = normalize_phone(cands["phone_numbers"][0]) if cands.get("phone_numbers") else None
-                    rule_address = normalize_address(cands["addresses"][0]) if cands.get("addresses") else None
-                    rule_rep = (cands.get("rep_names") or [None])[0]
+                    cands = primary_cands or {}
+                    phones = cands.get("phone_numbers") or []
+                    addrs = cands.get("addresses") or []
+                    reps = cands.get("rep_names") or []
+                    listings = cands.get("listings") or []
+                    capitals = cands.get("capitals") or []
+                    revenues = cands.get("revenues") or []
+                    profits = cands.get("profits") or []
+                    fiscals = cands.get("fiscal_months") or []
+                    founded_years = cands.get("founded_years") or []
+
+                    rule_phone = normalize_phone(phones[0]) if phones else None
+                    rule_address = normalize_address(addrs[0]) if addrs else None
+                    rule_rep = reps[0] if reps else None
+                    rule_rep = scraper.clean_rep_name(rule_rep) if rule_rep else None
+                    if listings and not listing_val:
+                        listing_val = listings[0].strip()
+                    if capitals and not capital_val:
+                        capital_val = capitals[0].strip()
+                    if revenues and not revenue_val:
+                        revenue_val = revenues[0].strip()
+                    if profits and not profit_val:
+                        profit_val = profits[0].strip()
+                    if fiscals and not fiscal_val:
+                        fiscal_val = fiscals[0].strip()
+                    if founded_years and not founded_val:
+                        founded_val = founded_years[0].strip()
 
                     ai_result = None
                     ai_attempted = False
@@ -214,8 +255,7 @@ async def process():
                         ai_phone = normalize_phone(ai_result.get("phone_number"))
                         ai_addr = normalize_address(ai_result.get("address"))
                         ai_rep = ai_result.get("rep_name") or ai_result.get("representative")
-                        if isinstance(ai_rep, str):
-                            ai_rep = ai_rep.strip() or None
+                        ai_rep = scraper.clean_rep_name(ai_rep) if ai_rep else None
                         description = ai_result.get("description")
                         if isinstance(description, str) and description.strip():
                             description_val = description.strip()[:50]
@@ -252,7 +292,7 @@ async def process():
                         rep_name_val = ai_rep
                         src_rep = info_url
                     elif rule_rep:
-                        rep_name_val = rule_rep.strip()
+                        rep_name_val = rule_rep
                         src_rep = info_url
 
                     # 欠落情報があれば浅く探索して補完
@@ -289,11 +329,24 @@ async def process():
                                     src_addr = url
                                     need_addr = False
                             if need_rep and cc.get("rep_names"):
-                                cand_rep = (cc["rep_names"][0] or "").strip()
+                                cand_rep = cc["rep_names"][0]
+                                cand_rep = scraper.clean_rep_name(cand_rep) if cand_rep else None
                                 if cand_rep:
                                     rep_name_val = cand_rep
                                     src_rep = url
                                     need_rep = False
+                            if not listing_val and cc.get("listings"):
+                                listing_val = (cc["listings"][0] or "").strip()
+                            if not capital_val and cc.get("capitals"):
+                                capital_val = (cc["capitals"][0] or "").strip()
+                            if not revenue_val and cc.get("revenues"):
+                                revenue_val = (cc["revenues"][0] or "").strip()
+                            if not profit_val and cc.get("profits"):
+                                profit_val = (cc["profits"][0] or "").strip()
+                            if not fiscal_val and cc.get("fiscal_months"):
+                                fiscal_val = (cc["fiscal_months"][0] or "").strip()
+                            if not founded_val and cc.get("founded_years"):
+                                founded_val = (cc["founded_years"][0] or "").strip()
                             if not (need_phone or need_addr or need_rep):
                                 break
 
@@ -319,15 +372,71 @@ async def process():
                     company["description"] = company.get("description", "") or ""
                     confidence = 0.4
 
+                # 公式サイトから取得できなかった指標は検索結果の非公式ページから補完
+                if not listing_val:
+                    for data in fallback_cands:
+                        values = data.get("listings") or []
+                        if values:
+                            listing_val = (values[0] or "").strip()
+                            if listing_val:
+                                break
+                if not capital_val:
+                    for data in fallback_cands:
+                        values = data.get("capitals") or []
+                        if values:
+                            capital_val = (values[0] or "").strip()
+                            if capital_val:
+                                break
+                if not revenue_val:
+                    for data in fallback_cands:
+                        values = data.get("revenues") or []
+                        if values:
+                            revenue_val = (values[0] or "").strip()
+                            if revenue_val:
+                                break
+                if not profit_val:
+                    for data in fallback_cands:
+                        values = data.get("profits") or []
+                        if values:
+                            profit_val = (values[0] or "").strip()
+                            if profit_val:
+                                break
+                if not fiscal_val:
+                    for data in fallback_cands:
+                        values = data.get("fiscal_months") or []
+                        if values:
+                            fiscal_val = (values[0] or "").strip()
+                            if fiscal_val:
+                                break
+                if not founded_val:
+                    for data in fallback_cands:
+                        values = data.get("founded_years") or []
+                        if values:
+                            founded_val = (values[0] or "").strip()
+                            if founded_val:
+                                break
+
                 normalized_found_address = normalize_address(found_address) if found_address else ""
-                rep_name_val = rep_name_val.strip()
+                rep_name_val = scraper.clean_rep_name(rep_name_val) or ""
                 description_val = description_val.strip()[:50]
+                listing_val = listing_val.strip()
+                capital_val = capital_val.strip()
+                revenue_val = revenue_val.strip()
+                profit_val = profit_val.strip()
+                fiscal_val = fiscal_val.strip()
+                founded_val = founded_val.strip()
                 company.update({
                     "homepage": homepage,
                     "phone": phone or "",
                     "found_address": normalized_found_address,
                     "rep_name": rep_name_val,
                     "description": description_val,
+                    "listing": listing_val,
+                    "revenue": revenue_val,
+                    "profit": profit_val,
+                    "capital": capital_val,
+                    "fiscal_month": fiscal_val,
+                    "founded_year": founded_val,
                     "phone_source": phone_source,
                     "address_source": address_source,
                     "ai_used": ai_used,

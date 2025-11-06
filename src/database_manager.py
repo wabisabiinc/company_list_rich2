@@ -80,6 +80,12 @@ class DatabaseManager:
                 locked_at      TEXT,
                 rep_name       TEXT,
                 description    TEXT,
+                listing        TEXT,
+                revenue        TEXT,
+                profit         TEXT,
+                capital        TEXT,
+                fiscal_month   TEXT,
+                founded_year   TEXT,
                 ai_used        INTEGER DEFAULT 0,
                 ai_model       TEXT,
                 phone_source   TEXT,
@@ -102,6 +108,18 @@ class DatabaseManager:
             self.conn.execute("ALTER TABLE companies ADD COLUMN rep_name TEXT;")
         if "description" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN description TEXT;")
+        if "listing" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN listing TEXT;")
+        if "revenue" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN revenue TEXT;")
+        if "profit" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN profit TEXT;")
+        if "capital" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN capital TEXT;")
+        if "fiscal_month" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN fiscal_month TEXT;")
+        if "founded_year" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN founded_year TEXT;")
         if "ai_used" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN ai_used INTEGER DEFAULT 0;")
         if "ai_model" not in cols:
@@ -276,6 +294,12 @@ class DatabaseManager:
         set_value("source_url_address", company.get("source_url_address", "") or "")
         set_value("source_url_rep", company.get("source_url_rep", "") or "")
         set_value("error_code", company.get("error_code", "") or "")
+        set_value("listing", company.get("listing", "") or "")
+        set_value("revenue", company.get("revenue", "") or "")
+        set_value("profit", company.get("profit", "") or "")
+        set_value("capital", company.get("capital", "") or "")
+        set_value("fiscal_month", company.get("fiscal_month", "") or "")
+        set_value("founded_year", company.get("founded_year", "") or "")
 
         if "last_checked_at" in cols:
             updates.append("last_checked_at = datetime('now')")
