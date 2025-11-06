@@ -782,6 +782,10 @@ class CompanyScraper:
             try:
                 await page.goto(url, timeout=timeout, wait_until="domcontentloaded")
                 try:
+                    await page.wait_for_load_state("networkidle", timeout=timeout)
+                except Exception:
+                    pass
+                try:
                     text = await page.inner_text("body", timeout=5000)
                 except Exception:
                     try:
@@ -789,6 +793,12 @@ class CompanyScraper:
                     except Exception:
                         pass
                     text = await page.inner_text("body") if await page.locator("body").count() else ""
+                if text and len(text.strip()) < 40:
+                    try:
+                        await page.wait_for_timeout(1200)
+                        text = await page.inner_text("body")
+                    except Exception:
+                        pass
                 try:
                     html = await page.content()
                 except Exception:
