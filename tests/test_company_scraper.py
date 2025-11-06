@@ -140,6 +140,22 @@ def test_normalize_homepage_url_canonical(scraper):
     assert normalized == "https://corp.example.co.jp/company/overview"
 
 
+def test_normalize_homepage_url_canonical_root_keeps_path(scraper):
+    html = """
+    <html>
+      <head>
+        <link rel="canonical" href="https://www.example.co.jp/" />
+      </head>
+      <body>会社概要</body>
+    </html>
+    """
+    normalized = scraper.normalize_homepage_url(
+        "https://www.example.co.jp/c/158/1300",
+        {"html": html},
+    )
+    assert normalized == "https://www.example.co.jp/c/158/1300"
+
+
 def test_clean_rep_name_removes_union_title(scraper):
     assert scraper.clean_rep_name("組合長　田中太郎") == "田中太郎"
     assert scraper.clean_rep_name("代表理事組合長 田中太郎") == "田中太郎"

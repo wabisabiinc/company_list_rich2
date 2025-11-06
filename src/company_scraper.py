@@ -512,7 +512,10 @@ class CompanyScraper:
                         resolved = urllib.parse.urljoin(url, href)
                         resolved_parsed = urllib.parse.urlparse(resolved)
                         if resolved_parsed.netloc and resolved_parsed.netloc == parsed.netloc:
-                            normalized = resolved_parsed._replace(query="", fragment="")
+                            normalized_path = normalized.path or "/"
+                            resolved_path = resolved_parsed.path or "/"
+                            if not (normalized_path != "/" and resolved_path == "/"):
+                                normalized = resolved_parsed._replace(query="", fragment="")
                     except Exception:
                         pass
 
