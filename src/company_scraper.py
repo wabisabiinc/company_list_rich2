@@ -87,14 +87,13 @@ class CompanyScraper:
         "/会社概要", "/企業情報", "/企業概要", "/会社情報", "/窓口案内", "/お問い合わせ", "/アクセス",
     ]
 
-    NON_OFFICIAL_HOSTS = {
+    HARD_EXCLUDE_HOSTS = {
         "travel.rakuten.co.jp",
         "navitime.co.jp",
         "ja.wikipedia.org",
         "kensetumap.com",
         "kaisharesearch.com",
         "houjin.info",
-        "big-advance.site",
         "tokubai.co.jp",
         "itp.ne.jp",
         "hotpepper.jp",
@@ -104,6 +103,11 @@ class CompanyScraper:
         "yahoo.co.jp",
         "mapion.co.jp",
         "google.com",
+        "tsukumado.com",
+    }
+
+    SUSPECT_HOSTS = {
+        "big-advance.site",
     }
 
     NON_OFFICIAL_KEYWORDS = {
@@ -241,12 +245,17 @@ class CompanyScraper:
             "代表執行役社長兼CEO", "代表取締役社長兼CEO", "代表取締役社長CEO",
             "代表取締役社長兼COO", "代表取締役社長兼社長執行役員",
             "代表者", "代表", "代表主宰", "代表校長",
-            "理事長", "学長", "園長", "校長", "院長", "所長", "館長",
+            "理事長", "学長", "園長", "校長", "院長", "所長", "館長", "組合長",
             "支配人", "店主", "社長", "総支配人", "CEO", "COO", "CFO", "代表取締役副会長",
         )
-        for t in titles:
-            if text.startswith(t):
-                text = text[len(t):]
+        while True:
+            removed = False
+            for t in titles:
+                if text.startswith(t):
+                    text = text[len(t):]
+                    removed = True
+                    break
+            if not removed:
                 break
         text = text.strip(" 　")
         if text.endswith(("氏", "様")):
@@ -379,7 +388,14 @@ class CompanyScraper:
                     hints.append(content)
         return " \n".join(hints)
 
-    def is_likely_official_site(self, company_name: str, url: str, page_info: Optional[Dict[str, Any]] = None) -> bool:
+    def is_likely_official_site(
+        self,
+        company_name: str,
+        url: str,
+        page_info: Optional[Dict[str, Any]] = None,
+        expected_address: Optional[str] = None,
+        extracted: Optional[Dict[str, List[str]]] = None,
+    ) -> bool:
         try:
             parsed = urllib.parse.urlparse(url)
         except Exception:
@@ -388,12 +404,12 @@ class CompanyScraper:
         if not host:
             return False
 
-        if any(host == domain or host.endswith(f".{domain}") for domain in self.NON_OFFICIAL_HOSTS):
-            return False
-        if host.endswith(".go.jp"):
+        if any(host == domain or host.endswith(f".{domain}") for domain in self.HARD_EXCLUDE_HOSTS):
             return False
 
         score = 0
+        if any(host == domain or host.endswith(f".{domain}") for domain in self.SUSPECT_HOSTS):
+            score -= 4
         if host.endswith(('.co.jp', '.or.jp', '.ac.jp', '.ed.jp', '.lg.jp', '.gr.jp')):
             score += 4
         elif host.endswith('.jp'):
@@ -402,6 +418,14 @@ class CompanyScraper:
             score += 1
 
         company_tokens = self._company_tokens(company_name)
+        domain_match_score = self._domain_score(company_tokens, url)
+        if domain_match_score >= 6:
+            score += 3
+        elif domain_match_score >= 4:
+            score += 2
+        elif domain_match_score >= 2:
+            score += 1
+
         domain_tokens = self._domain_tokens(url)
         for token in company_tokens:
             if any(token in dt for dt in domain_tokens):
@@ -422,11 +446,100 @@ class CompanyScraper:
         if "公式" in combined or "official" in lowered:
             score += 2
         if any(kw in lowered for kw in self.NON_OFFICIAL_SNIPPET_KEYWORDS):
-            score -= 3
+            score -= 2
         if any(kw in host for kw in self.NON_OFFICIAL_KEYWORDS):
             score -= 3
 
+        expected_key = self._addr_key(expected_address or "")
+        if expected_key:
+            candidate_addrs: List[str] = []
+            if extracted and extracted.get("addresses"):
+                candidate_addrs.extend(extracted.get("addresses") or [])
+            if not candidate_addrs and text_snippet:
+                candidate_addrs.extend(ADDR_FALLBACK_RE.findall(text_snippet))
+            for cand in candidate_addrs:
+                cand_key = self._addr_key(cand)
+                if cand_key and (expected_key in cand_key or cand_key in expected_key):
+                    score += 5
+                    break
+
         return score >= 2
+
+    @staticmethod
+    def normalize_homepage_url(url: str, page_info: Optional[Dict[str, Any]] = None) -> str:
+        """
+        公式と判断したURLをホームページ向けに正規化する。
+        - rel=canonical / og:url があれば優先
+        - 問い合わせ／会員ページ等であればドメインルートに寄せる
+        - クエリ／フラグメント／index.* を除去
+        """
+        if not url:
+            return url
+        try:
+            parsed = urllib.parse.urlparse(url)
+        except Exception:
+            return url
+        if not parsed.scheme or not parsed.netloc:
+            return url
+
+        base_root = f"{parsed.scheme}://{parsed.netloc}/"
+        normalized = parsed._replace(query="", fragment="")
+
+        html = ""
+        if isinstance(page_info, dict):
+            html = page_info.get("html") or ""
+        if html:
+            try:
+                soup = BeautifulSoup(html, "html.parser")
+            except Exception:
+                soup = None
+            if soup:
+                canonical = soup.find("link", rel=lambda v: v and "canonical" in v.lower())
+                if canonical and canonical.get("href"):
+                    href = canonical.get("href")
+                else:
+                    og_url = soup.find("meta", attrs={"property": "og:url"}) or soup.find("meta", attrs={"name": "og:url"})
+                    href = og_url.get("content") if og_url else None
+                if href:
+                    try:
+                        resolved = urllib.parse.urljoin(url, href)
+                        resolved_parsed = urllib.parse.urlparse(resolved)
+                        if resolved_parsed.netloc and resolved_parsed.netloc == parsed.netloc:
+                            normalized = resolved_parsed._replace(query="", fragment="")
+                    except Exception:
+                        pass
+
+        # index.* → root
+        if normalized.path.lower().endswith(("/index.html", "/index.htm", "/index.php", "/index.asp")):
+            normalized = normalized._replace(path="/")
+
+        segments = [seg.lower() for seg in normalized.path.strip("/").split("/") if seg]
+        suspect_segments = {
+            "contact", "inquiry", "toiawase", "otoiawase", "mailform", "mail", "form",
+            "entry", "apply", "application", "register", "registration", "signup",
+            "login", "member", "members", "mypage", "reserve", "reservation", "yoyaku",
+            "cart", "shop_cart", "order", "questionnaire"
+        }
+        standalone_segments = {"top", "home"}
+
+        if not segments:
+            final = normalized._replace(path="/")
+        elif segments[0] in suspect_segments or any(seg in suspect_segments for seg in segments):
+            final = normalized._replace(path="/")
+        elif len(segments) == 1 and segments[0] in standalone_segments:
+            final = normalized._replace(path="/")
+        else:
+            final = normalized
+
+        final_path = final.path or "/"
+        if not final_path.endswith("/"):
+            if final_path == "/":
+                final = final._replace(path="/")
+            else:
+                # remove trailing slash for non-root
+                final = final._replace(path=final_path.rstrip("/"))
+
+        return urllib.parse.urlunparse(final) or base_root
 
     # ===== 高速化の肝：ブラウザを起動して使い回す =====
     async def start(self):

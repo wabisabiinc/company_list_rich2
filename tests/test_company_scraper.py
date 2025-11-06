@@ -108,3 +108,71 @@ def test_is_likely_official_site_romaji(scraper):
         "https://someisha.co.jp",
         text,
     )
+
+
+def test_normalize_homepage_url_contact(scraper):
+    html = """
+    <html>
+      <head><title>お問い合わせ</title></head>
+      <body>問い合わせフォームです。</body>
+    </html>
+    """
+    normalized = scraper.normalize_homepage_url(
+        "https://www.example.co.jp/contact/index.html",
+        {"html": html},
+    )
+    assert normalized == "https://www.example.co.jp/"
+
+
+def test_normalize_homepage_url_canonical(scraper):
+    html = """
+    <html>
+      <head>
+        <link rel="canonical" href="https://corp.example.co.jp/company/overview" />
+      </head>
+      <body>会社概要</body>
+    </html>
+    """
+    normalized = scraper.normalize_homepage_url(
+        "https://corp.example.co.jp/company/overview?ref=ddg",
+        {"html": html},
+    )
+    assert normalized == "https://corp.example.co.jp/company/overview"
+
+
+def test_clean_rep_name_removes_union_title(scraper):
+    assert scraper.clean_rep_name("組合長　田中太郎") == "田中太郎"
+    assert scraper.clean_rep_name("代表理事組合長 田中太郎") == "田中太郎"
+    assert scraper.clean_rep_name("組合長") is None
+
+
+def test_is_likely_official_site_excludes_known_aggregator(scraper):
+    text = "観陽亭のご案内"
+    assert not scraper.is_likely_official_site(
+        "株式会社観陽亭",
+        "https://tsukumado.com/member/51/",
+        {"text": text},
+    )
+
+
+def test_is_likely_official_site_suspect_host_with_address(scraper):
+    text = "〒409-2937 山梨県南巨摩郡身延町身延一色1350 株式会社創明社の公式サイトです。"
+    extracted = {
+        "addresses": ["〒409-2937 山梨県南巨摩郡身延町身延一色1350"],
+    }
+    assert scraper.is_likely_official_site(
+        "株式会社創明社",
+        "https://www.big-advance.site/c/158/1300",
+        {"text": text},
+        "〒409-2937 山梨県南巨摩郡身延町身延一色1350",
+        extracted,
+    )
+
+
+def test_is_likely_official_site_suspect_host_without_address(scraper):
+    text = "株式会社創明社の紹介ページです。"
+    assert not scraper.is_likely_official_site(
+        "株式会社創明社",
+        "https://www.big-advance.site/c/158/1300",
+        {"text": text},
+    )

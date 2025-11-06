@@ -169,8 +169,8 @@ async def process():
                     candidate_text = candidate_info.get("text", "") or ""
                     candidate_html = candidate_info.get("html") or ""
                     extracted = scraper.extract_candidates(candidate_text, candidate_html)
-                    if scraper.is_likely_official_site(name, candidate, candidate_info):
-                        homepage = candidate
+                    if scraper.is_likely_official_site(name, candidate, candidate_info, addr, extracted):
+                        homepage = scraper.normalize_homepage_url(candidate, candidate_info)
                         info = candidate_info
                         primary_cands = extracted
                         break
