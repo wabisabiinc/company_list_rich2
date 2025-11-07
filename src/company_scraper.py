@@ -26,10 +26,62 @@ except Exception:
 # 深掘り時に優先して辿るパス（日本語含む）
 PRIORITY_PATHS = [
     "/company", "/about", "/profile", "/corporate", "/overview",
-    "/contact", "/inquiry", "/access",
-    "/会社概要", "/企業情報", "/企業概要", "/会社情報", "/窓口案内", "/お問い合わせ", "/アクセス"
+    "/contact", "/inquiry", "/access", "/info", "/information",
+    "/gaiyou", "/gaiyo", "/gaiyou.html",
+    "/会社概要", "/企業情報", "/企業概要", "/会社情報", "/会社案内", "/法人案内", "/法人概要",
+    "/団体概要", "/施設案内", "/施設情報", "/法人情報", "/事業案内", "/事業紹介",
+    "/窓口案内", "/お問い合わせ", "/アクセス", "/沿革", "/組織図"
 ]
-PRIO_WORDS = ["会社概要", "企業情報", "お問い合わせ", "アクセス", "連絡先", "窓口"]
+PRIO_WORDS = [
+    "会社概要", "企業情報", "企業概要", "法人案内", "法人概要", "会社案内",
+    "団体概要", "施設案内", "法人情報", "事業案内", "事業紹介", "組織図",
+    "代表者", "代表挨拶", "沿革", "お問い合わせ", "アクセス", "連絡先", "窓口"
+]
+ANCHOR_PRIORITY_WORDS = [
+    "会社概要", "企業情報", "法人案内", "法人概要", "会社案内", "団体概要",
+    "施設案内", "施設情報", "法人情報", "事業案内", "事業紹介", "会社紹介",
+    "法人紹介", "組織図", "組織紹介", "沿革", "代表者", "代表挨拶",
+    "理事長", "院長", "園長", "校長", "about", "corporate", "profile",
+    "overview", "information", "ご案内"
+]
+PRIORITY_SECTION_KEYWORDS = (
+    "contact", "contacts", "inquiry", "support", "contact-us",
+    "会社概要", "会社案内", "法人案内", "法人概要", "企業情報", "企業概要",
+    "団体概要", "施設案内", "園紹介", "学校案内", "沿革", "会社情報",
+    "corporate", "about", "profile", "overview", "information", "access",
+    "お問い合わせ", "連絡先", "アクセス", "窓口"
+)
+PRIORITY_CONTACT_KEYWORDS = (
+    "contact", "お問い合わせ", "連絡先", "tel", "電話", "アクセス", "窓口"
+)
+REP_NAME_EXACT_BLOCKLIST = {
+    "ブログ", "blog", "Blog", "BLOG",
+    "ニュース", "News", "news",
+    "お知らせ", "採用", "求人", "Recruit", "recruit",
+    "アクセス", "Access", "access",
+    "お問い合わせ", "Contact", "contact",
+    "Info", "info", "Information", "information",
+    "法人案内", "法人概要", "会社案内", "会社概要",
+    "法人情報", "企業情報", "事業案内", "事業紹介",
+    "サイトマップ", "Sitemap", "sitemap",
+    "交通案内", "アクセスマップ",
+    "施設案内", "施設情報",
+    "イベント", "トピックス", "Topics", "topics",
+    "スタッフ紹介", "スタッフ",
+    "メニュー", "Menu", "menu",
+    "トップページ", "Home", "home", "ホーム",
+    "沿革", "法人紹介", "会社紹介"
+}
+REP_NAME_SUBSTR_BLOCKLIST = (
+    "ブログ", "news", "お知らせ", "採用", "求人", "recruit",
+    "アクセス", "contact", "法人案内", "法人概要", "会社案内", "会社概要",
+    "法人情報", "企業情報", "事業案内", "事業紹介",
+    "サイトマップ", "sitemap", "交通案内", "アクセスマップ",
+    "施設案内", "施設情報", "イベント", "トピックス",
+    "スタッフ紹介", "スタッフ", "メニュー", "menu",
+    "トップページ", "home", "沿革", "法人紹介", "会社紹介"
+)
+REP_NAME_EXACT_BLOCKLIST_LOWER = {s.lower() for s in REP_NAME_EXACT_BLOCKLIST}
 
 PHONE_RE = re.compile(r"(?:TEL|Tel|tel|電話)\s*[:：]?\s*(0\d{1,4})[-‐―－ー]?(\d{1,4})[-‐―－ー]?(\d{3,4})")
 ZIP_RE = re.compile(r"(〒?\s*\d{3})[-‐―－ー]?(\d{4})")
@@ -84,8 +136,11 @@ class CompanyScraper:
 
     PRIORITY_PATHS = [
         "/company", "/about", "/profile", "/corporate", "/overview",
-        "/contact", "/inquiry", "/access",
-        "/会社概要", "/企業情報", "/企業概要", "/会社情報", "/窓口案内", "/お問い合わせ", "/アクセス",
+        "/contact", "/inquiry", "/access", "/info", "/information",
+        "/gaiyou", "/gaiyo", "/gaiyou.html",
+        "/会社概要", "/企業情報", "/企業概要", "/会社情報", "/会社案内", "/法人案内", "/法人概要",
+        "/団体概要", "/施設案内", "/施設情報", "/法人情報", "/事業案内", "/事業紹介",
+        "/窓口案内", "/お問い合わせ", "/アクセス", "/沿革", "/組織図",
     ]
 
     HARD_EXCLUDE_HOSTS = {
@@ -277,6 +332,12 @@ class CompanyScraper:
             return None
         for stop in ("創業", "創立", "創設", "メッセージ", "ご挨拶", "からの", "決裁", "沿革", "代表挨拶"):
             if stop in text:
+                return None
+        lower_text = text.lower()
+        if text in REP_NAME_EXACT_BLOCKLIST or lower_text in REP_NAME_EXACT_BLOCKLIST_LOWER:
+            return None
+        for stop_word in REP_NAME_SUBSTR_BLOCKLIST:
+            if stop_word in text or stop_word in lower_text:
                 return None
         if not re.search(r"[一-龥ぁ-んァ-ン]", text):
             return None
@@ -858,36 +919,157 @@ class CompanyScraper:
 
     # ===== 同一ドメイン内を浅く探索 =====
     def _rank_links(self, base: str, html: str) -> List[str]:
-        hrefs = re.findall(r'href=["\']([^"\']+)["\']', html or "", flags=re.I)
         base_host = urlparse(base).netloc
-        candidates: List[tuple[int, str]] = []
-        for href in hrefs:
+        candidates: List[tuple[int, int, int, str]] = []
+        fallback_links: List[str] = []
+        seen_links: set[str] = set()
+
+        try:
+            soup = BeautifulSoup(html or "", "html.parser")
+            anchors = soup.find_all("a", href=True)
+        except Exception:
+            anchors = []
+
+        raw_links: List[tuple[str, str]] = []
+        if anchors:
+            for anchor in anchors:
+                href = anchor.get("href")
+                if not href:
+                    continue
+                text = anchor.get_text(separator=" ", strip=True) or ""
+                title = anchor.get("title") or ""
+                anchor_text = text or title
+                raw_links.append((href, anchor_text))
+        else:
+            for href in re.findall(r'href=["\']([^"\']+)["\']', html or "", flags=re.I):
+                raw_links.append((href, ""))
+
+        for href, anchor_text in raw_links:
             url = urljoin(base, href)
             parsed = urlparse(url)
             if not parsed.netloc or parsed.netloc != base_host:
                 continue
-            path = parsed.path or "/"
-            score = 0
-            for p in PRIORITY_PATHS:
-                if p in path:
-                    score += 10
-            lowered = url.lower()
-            for word in PRIO_WORDS:
-                if word in lowered:
-                    score += 5
-            if score > 0:
-                candidates.append((score, url))
 
-        candidates.sort(key=lambda x: (-x[0], x[1]))
-        seen: set[str] = set()
+            normalized_url = url.lower()
+            path = parsed.path or "/"
+            path_lower = path.lower()
+            anchor_text = anchor_text.strip()
+            anchor_lower = anchor_text.lower()
+
+            score = 0
+
+            for kw in PRIORITY_PATHS:
+                kw_lower = kw.lower()
+                if kw in path or kw_lower in path_lower:
+                    score += 12
+
+            for word in PRIO_WORDS:
+                word_lower = word.lower()
+                if word in normalized_url or word_lower in normalized_url:
+                    score += 6
+
+            for word in ANCHOR_PRIORITY_WORDS:
+                word_lower = word.lower()
+                if word and (word in anchor_text or word_lower in anchor_lower):
+                    score += 8
+
+            if score > 0:
+                path_depth = max(parsed.path.count("/"), 1)
+                text_len = max(len(anchor_text), 1)
+                candidates.append((score, path_depth, text_len, url))
+            else:
+                if url not in seen_links and len(fallback_links) < 8:
+                    fallback_links.append(url)
+                    seen_links.add(url)
+
+        if not candidates:
+            return fallback_links
+
+        candidates.sort(key=lambda x: (-x[0], x[1], -x[2], x[3]))
         ordered: List[str] = []
-        for _, url in candidates:
+        seen: set[str] = set()
+        for _, _, _, url in candidates:
             if url not in seen:
                 ordered.append(url)
                 seen.add(url)
             if len(ordered) >= 20:
                 break
         return ordered
+
+    def _find_priority_links(self, base: str, html: str, max_links: int = 4) -> List[str]:
+        if not html:
+            return []
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+        except Exception:
+            return []
+        base_host = urlparse(base).netloc
+        scored: List[tuple[int, int, int, str]] = []
+        seen: set[str] = set()
+
+        for anchor in soup.find_all("a", href=True):
+            href = anchor.get("href")
+            if not href:
+                continue
+            url = urljoin(base, href)
+            parsed = urlparse(url)
+            if not parsed.netloc or parsed.netloc != base_host:
+                continue
+            token = " ".join([
+                anchor.get_text(separator=" ", strip=True) or "",
+                anchor.get("title") or "",
+                href or "",
+            ]).lower()
+            score = 0
+            for kw in PRIORITY_SECTION_KEYWORDS:
+                if kw in token:
+                    score += 6
+            for kw in PRIORITY_CONTACT_KEYWORDS:
+                if kw in token:
+                    score += 4
+            if not score:
+                continue
+            for path_kw in PRIORITY_PATHS:
+                if path_kw.lower() in (parsed.path or "").lower():
+                    score += 2
+                    break
+            depth = parsed.path.count("/")
+            text_len = len(anchor.get_text(strip=True) or "")
+            if url not in seen:
+                scored.append((score, depth, -text_len, url))
+                seen.add(url)
+
+        scored.sort(key=lambda x: (-x[0], x[1], x[2], x[3]))
+        return [url for _, _, _, url in scored[:max_links]]
+
+    async def fetch_priority_documents(
+        self,
+        base_url: str,
+        base_html: Optional[str] = None,
+        max_links: int = 4,
+    ) -> Dict[str, Dict[str, Any]]:
+        docs: Dict[str, Dict[str, Any]] = {}
+        if not base_url:
+            return docs
+        html = base_html or ""
+        initial_info: Optional[Dict[str, Any]] = None
+        if not html:
+            try:
+                initial_info = await self.get_page_info(base_url)
+                html = initial_info.get("html", "")
+            except Exception:
+                html = ""
+        links = self._find_priority_links(base_url, html, max_links=max_links)
+        for link in links:
+            try:
+                info = await self.get_page_info(link)
+            except Exception:
+                continue
+            docs[link] = {
+                "text": info.get("text", "") or "",
+                "html": info.get("html", "") or "",
+            }
+        return docs
 
     async def crawl_related(
         self,
@@ -954,10 +1136,20 @@ class CompanyScraper:
         for zm in ZIP_RE.finditer(text or ""):
             zip_code = f"〒{zm.group(1).replace('〒', '').strip()}-{zm.group(2)}"
             cursor = zm.end()
-            snippet = (text or "")[cursor:cursor + 120].replace("\n", " ")
+            snippet = (text or "")[cursor:cursor + 200]
+            snippet = snippet.replace("\n", " ").replace("\r", " ").replace("\u3000", " ")
             if ADDR_HINT.search(snippet):
-                seg = snippet.split(" ")[0].strip()
-                addrs.append(f"{zip_code} {seg}")
+                cleaned = re.split(r"[。．、,，;；｜|/]", snippet, maxsplit=1)[0]
+                cleaned = re.sub(r"\s+", " ", cleaned)
+                parts = [
+                    part.strip(" ：:・-‐―－ー〜~()（）[]{}<>")
+                    for part in re.split(r"[ \t]+", cleaned)
+                    if part.strip(" ：:・-‐―－ー〜~()（）[]{}<>")
+                ]
+                if parts:
+                    seg = " ".join(parts[:8]).strip()
+                    if seg:
+                        addrs.append(f"{zip_code} {seg}")
 
         if not addrs:
             addrs.extend(ADDR_FALLBACK_RE.findall(text or ""))

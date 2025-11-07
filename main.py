@@ -5,6 +5,7 @@ import csv
 import logging
 import re
 import random
+from difflib import SequenceMatcher
 from dotenv import load_dotenv
 
 from src.database_manager import DatabaseManager
@@ -50,6 +51,9 @@ CSV_FIELDNAMES = [
     "listing", "revenue", "profit", "capital", "fiscal_month", "founded_year"
 ]
 
+ZIP_CODE_RE = re.compile(r"(\d{3}-\d{4})")
+KANJI_TOKEN_RE = re.compile(r"[一-龥]{2,}")
+
 # --------------------------------------------------
 # 正規化 & 一致判定
 # --------------------------------------------------
@@ -79,6 +83,47 @@ def addr_compatible(input_addr: str, found_addr: str) -> bool:
     if not input_addr or not found_addr:
         return False
     return input_addr[:8] in found_addr or found_addr[:8] in input_addr
+
+def pick_best_address(expected_addr: str | None, candidates: list[str]) -> str | None:
+    normalized_candidates = []
+    for cand in candidates:
+        norm = normalize_address(cand)
+        if norm:
+            normalized_candidates.append(norm)
+    if not normalized_candidates:
+        return None
+    if not expected_addr:
+        return normalized_candidates[0]
+
+    expected_norm = normalize_address(expected_addr)
+    if not expected_norm:
+        return normalized_candidates[0]
+
+    expected_key = CompanyScraper._addr_key(expected_norm)
+    expected_zip_match = ZIP_CODE_RE.search(expected_norm)
+    expected_zip = expected_zip_match.group(1) if expected_zip_match else ""
+    expected_tokens = KANJI_TOKEN_RE.findall(expected_norm)
+
+    best = normalized_candidates[0]
+    best_score = float("-inf")
+    for cand in normalized_candidates:
+        key = CompanyScraper._addr_key(cand)
+        score = 0.0
+        cand_zip_match = ZIP_CODE_RE.search(cand)
+        if expected_zip and cand_zip_match and cand_zip_match.group(1) == expected_zip:
+            score += 8
+        elif not expected_zip and cand_zip_match:
+            score += 1
+        if expected_key and key:
+            score += SequenceMatcher(None, expected_key, key).ratio() * 6
+        for token in expected_tokens:
+            if token and token in cand:
+                score += min(len(token), 4)
+                break
+        if score > best_score:
+            best_score = score
+            best = cand
+    return best
 
 # --------------------------------------------------
 # 内部: 次ジョブ取得
@@ -218,9 +263,15 @@ async def process():
                     founded_years = cands.get("founded_years") or []
 
                     rule_phone = normalize_phone(phones[0]) if phones else None
-                    rule_address = normalize_address(addrs[0]) if addrs else None
+                    rule_address = pick_best_address(addr, addrs) if addrs else None
                     rule_rep = reps[0] if reps else None
                     rule_rep = scraper.clean_rep_name(rule_rep) if rule_rep else None
+                    if rule_phone and not src_phone:
+                        src_phone = info_url
+                    if rule_address and not src_addr:
+                        src_addr = info_url
+                    if rule_rep and not src_rep:
+                        src_rep = info_url
                     if listings and not listing_val:
                         listing_val = listings[0].strip()
                     if capitals and not capital_val:
@@ -233,6 +284,43 @@ async def process():
                         fiscal_val = fiscals[0].strip()
                     if founded_years and not founded_val:
                         founded_val = founded_years[0].strip()
+
+                    try:
+                        priority_docs = await scraper.fetch_priority_documents(
+                            homepage, info.get("html", ""), max_links=4
+                        )
+                    except Exception:
+                        priority_docs = {}
+
+                    for url, pdata in priority_docs.items():
+                        cc = scraper.extract_candidates(pdata.get("text", ""), pdata.get("html", ""))
+                        if not rule_phone and cc.get("phone_numbers"):
+                            cand = normalize_phone(cc["phone_numbers"][0])
+                            if cand:
+                                rule_phone = cand
+                                src_phone = url
+                        if not rule_address and cc.get("addresses"):
+                            cand_addr = pick_best_address(addr, cc["addresses"])
+                            if cand_addr:
+                                rule_address = cand_addr
+                                src_addr = url
+                        if not rule_rep and cc.get("rep_names"):
+                            cand_rep = scraper.clean_rep_name(cc["rep_names"][0])
+                            if cand_rep:
+                                rule_rep = cand_rep
+                                src_rep = url
+                        if not listing_val and cc.get("listings"):
+                            listing_val = (cc["listings"][0] or "").strip()
+                        if not capital_val and cc.get("capitals"):
+                            capital_val = (cc["capitals"][0] or "").strip()
+                        if not revenue_val and cc.get("revenues"):
+                            revenue_val = (cc["revenues"][0] or "").strip()
+                        if not profit_val and cc.get("profits"):
+                            profit_val = (cc["profits"][0] or "").strip()
+                        if not fiscal_val and cc.get("fiscal_months"):
+                            fiscal_val = (cc["fiscal_months"][0] or "").strip()
+                        if not founded_val and cc.get("founded_years"):
+                            founded_val = (cc["founded_years"][0] or "").strip()
 
                     ai_result = None
                     ai_attempted = False
@@ -271,7 +359,8 @@ async def process():
                     elif rule_phone:
                         phone = rule_phone
                         phone_source = "rule"
-                        src_phone = info_url
+                        if not src_phone:
+                            src_phone = info_url
                     else:
                         phone = ""
                         phone_source = "none"
@@ -283,7 +372,7 @@ async def process():
                     elif rule_address:
                         found_address = rule_address or ""
                         address_source = "rule" if rule_address else "none"
-                        if rule_address:
+                        if rule_address and not src_addr:
                             src_addr = info_url
                     else:
                         found_address = ""
@@ -294,7 +383,8 @@ async def process():
                         src_rep = info_url
                     elif rule_rep:
                         rep_name_val = rule_rep
-                        src_rep = info_url
+                        if not src_rep:
+                            src_rep = info_url
 
                     # 欠落情報があれば浅く探索して補完
                     need_phone = not bool(phone)
@@ -324,7 +414,7 @@ async def process():
                                     src_phone = url
                                     need_phone = False
                             if need_addr and cc.get("addresses"):
-                                cand_addr = normalize_address(cc["addresses"][0])
+                                cand_addr = pick_best_address(addr, cc["addresses"])
                                 if cand_addr:
                                     found_address = cand_addr
                                     address_source = "rule"
