@@ -58,3 +58,13 @@ async def test_verify_info_returns_none_on_non_json():
     verifier = AIVerifier(model=DummyModel(None))
     result = await verifier.verify_info("dummy", b"", "X", "Y")
     assert result is None
+
+
+def test_normalize_amount_formats_and_converts():
+    from src.ai_verifier import _normalize_amount
+
+    assert _normalize_amount("30,449,952千円") == "30,449,952,000円"
+    assert _normalize_amount("1,000万円") == "10,000,000円"
+    assert _normalize_amount("6億6,700万円") == "667,000,000円"
+    assert _normalize_amount("▲3百万円") == "▲3,000,000円"
+    assert _normalize_amount("401,000千円") == "401,000,000円"

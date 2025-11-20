@@ -24,7 +24,11 @@ def _insert_company_rows(dbm: DatabaseManager):
 def db_manager(tmp_path: Path):
     db_path = str(tmp_path / "test.db")
     csv_path = str(tmp_path / "out.csv")
-    dbm = DatabaseManager(db_path=db_path, csv_path=csv_path)
+    dbm = DatabaseManager(
+        db_path=db_path,
+        csv_path=csv_path,
+        claim_order="employee_desc_id_asc",  # テストでは従業員数降順で固定
+    )
     yield dbm
     dbm.close()  # テスト後に接続をクローズ
 
@@ -96,4 +100,3 @@ def test_save_company_data_updates_row_and_writes_csv(db_manager: DatabaseManage
     with open(csv_path, newline="", encoding="utf-8-sig") as f:
         reader = list(csv.DictReader(f))
         assert len(reader) == 1  # CSVには再度書き込まれないことを確認
-

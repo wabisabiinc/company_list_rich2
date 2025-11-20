@@ -16,7 +16,7 @@ class DatabaseManager:
         * WAL + synchronous=NORMAL
         * 古い running を TTL で自動回収（RUNNING_TTL_MIN, 既定30分）
     """
-    def __init__(self, db_path: str = "data/companies.db", csv_path: Optional[str] = None):
+    def __init__(self, db_path: str = "data/companies.db", csv_path: Optional[str] = None, claim_order: Optional[str] = None):
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
         if csv_path:
             os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
@@ -36,12 +36,49 @@ class DatabaseManager:
 
         self.csv_path = csv_path
         self.running_ttl_min = int(os.getenv("RUNNING_TTL_MIN", "30"))
+        # 優先度: 引数 > 環境変数 > デフォルト
+        self.claim_order = (claim_order or os.getenv("CLAIM_ORDER") or "employee_desc_id_asc").lower()
+        self._claim_order_clause = self._build_claim_order_clause()
+        self.wal_checkpoint_interval = max(0, int(os.getenv("WAL_CHECKPOINT_INTERVAL", "200")))
+        self._writes_since_checkpoint = 0
 
         # ★ 初期化はロック競合が起きやすいので安全にリトライ
         self._ensure_schema_with_retry()
 
         # CSV の重複書き出し防止用キャッシュ
         self._init_csv_state()
+
+    def _build_claim_order_clause(self) -> str:
+        """
+        取得順序を環境変数CLAIM_ORDERで切り替える。
+        - employee_desc_id_asc (default)
+        - id_asc
+        - id_desc
+        - random
+        """
+        mapping = {
+            "employee_desc_id_asc": "ORDER BY COALESCE(employee_count, 0) DESC, id ASC",
+            "id_asc": "ORDER BY id ASC",
+            "id_desc": "ORDER BY id DESC",
+            "random": "ORDER BY RANDOM()",
+        }
+        return mapping.get(self.claim_order, mapping["employee_desc_id_asc"])
+
+    def _commit_with_checkpoint(self) -> None:
+        self.conn.commit()
+        self._maybe_checkpoint()
+
+    def _maybe_checkpoint(self) -> None:
+        if self.wal_checkpoint_interval <= 0:
+            return
+        self._writes_since_checkpoint += 1
+        if self._writes_since_checkpoint >= self.wal_checkpoint_interval:
+            try:
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            except sqlite3.DatabaseError:
+                pass
+            else:
+                self._writes_since_checkpoint = 0
 
     # ---------- PRAGMA ----------
     def _configure_pragmas(self) -> None:
@@ -134,14 +171,38 @@ class DatabaseManager:
             self.conn.execute("ALTER TABLE companies ADD COLUMN last_checked_at TEXT;")
         if "error_code" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN error_code TEXT;")
+        if "hubspot_id" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN hubspot_id TEXT;")
+        if "corporate_number" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN corporate_number TEXT;")
+        if "corporate_number_norm" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN corporate_number_norm TEXT;")
+        if "source_csv" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN source_csv TEXT;")
+        if "reference_homepage" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN reference_homepage TEXT;")
+        if "reference_phone" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN reference_phone TEXT;")
+        if "reference_address" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN reference_address TEXT;")
+        if "accuracy_homepage" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN accuracy_homepage TEXT;")
+        if "accuracy_phone" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN accuracy_phone TEXT;")
+        if "accuracy_address" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN accuracy_address TEXT;")
 
         self.conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_companies_name_addr ON companies(company_name, address);"
         )
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_companies_status ON companies(status);")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_companies_emp ON companies(employee_count);")
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_companies_corporate_number_norm ON companies(corporate_number_norm);"
+        )
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_companies_hubspot_id ON companies(hubspot_id);")
 
-        self.conn.commit()
+        self._commit_with_checkpoint()
 
     # ---------- CSV 互換 ----------
     def _init_csv_state(self) -> None:
@@ -203,11 +264,11 @@ class DatabaseManager:
             # RETURNING が利用可能な SQLite ならこちらを使用
             try:
                 row = cur.execute(
-                    """
+                    f"""
                     WITH picked AS (
                       SELECT id FROM companies
                        WHERE status='pending'
-                       ORDER BY employee_count DESC, id ASC
+                       {self._claim_order_clause}
                        LIMIT 1
                     )
                     UPDATE companies
@@ -215,7 +276,7 @@ class DatabaseManager:
                            locked_by=?,
                            locked_at=datetime('now')
                      WHERE id=(SELECT id FROM picked)
-                    RETURNING id, company_name, address, employee_count, homepage, phone, found_address, status
+                    RETURNING id, company_name, address, employee_count, homepage, phone, found_address, status, corporate_number, corporate_number_norm
                     """,
                     (worker_id,),
                 ).fetchone()
@@ -230,18 +291,18 @@ class DatabaseManager:
                      WHERE id = (
                        SELECT id FROM companies
                         WHERE status='pending'
-                        ORDER BY employee_count DESC, id ASC
+                        {self._claim_order_clause}
                         LIMIT 1
                      ) AND status='pending'
                     """,
                     (worker_id,),
                 )
                 if cur.rowcount == 0:
-                    self.conn.commit()
+                    self._commit_with_checkpoint()
                     return None
                 row = cur.execute(
                     """
-                    SELECT id, company_name, address, employee_count, homepage, phone, found_address, status
+                    SELECT id, company_name, address, employee_count, homepage, phone, found_address, status, corporate_number, corporate_number_norm
                       FROM companies
                      WHERE locked_by=? AND status='running'
                      ORDER BY locked_at DESC, id DESC
@@ -250,7 +311,7 @@ class DatabaseManager:
                     (worker_id,),
                 ).fetchone()
 
-            self.conn.commit()
+            self._commit_with_checkpoint()
             return dict(row) if row else None
         except Exception:
             self.conn.rollback()
@@ -259,10 +320,10 @@ class DatabaseManager:
     # ---------- 単発互換 ----------
     def get_next_company(self) -> Optional[Dict[str, Any]]:
         self.cur.execute(
-            """
+            f"""
             SELECT * FROM companies
              WHERE status='pending'
-             ORDER BY employee_count DESC, id ASC
+             {self._claim_order_clause}
              LIMIT 1
             """
         )
@@ -300,6 +361,12 @@ class DatabaseManager:
         set_value("capital", company.get("capital", "") or "")
         set_value("fiscal_month", company.get("fiscal_month", "") or "")
         set_value("founded_year", company.get("founded_year", "") or "")
+        set_value("reference_homepage", company.get("reference_homepage", "") or "")
+        set_value("reference_phone", company.get("reference_phone", "") or "")
+        set_value("reference_address", company.get("reference_address", "") or "")
+        set_value("accuracy_homepage", company.get("accuracy_homepage", "") or "")
+        set_value("accuracy_phone", company.get("accuracy_phone", "") or "")
+        set_value("accuracy_address", company.get("accuracy_address", "") or "")
 
         if "last_checked_at" in cols:
             updates.append("last_checked_at = datetime('now')")
@@ -313,7 +380,7 @@ class DatabaseManager:
         sql = f"UPDATE companies SET {', '.join(updates)} WHERE id = ?"
         params.append(company["id"])
         self.cur.execute(sql, params)
-        self.conn.commit()
+        self._commit_with_checkpoint()
         import logging as _l; _l.info(f"DB_WRITE_OK id={company['id']} status={status}")
 
         # 任意：CSVミラー（指定時のみ）
@@ -350,7 +417,17 @@ class DatabaseManager:
             "UPDATE companies SET status=?, locked_by=NULL, locked_at=NULL WHERE id=?",
             (status, company_id),
         )
-        self.conn.commit()
+        self._commit_with_checkpoint()
+
+    def mark_error(self, company_id: int, error_code: str = "") -> None:
+        """
+        status を error に更新するヘルパー（既存呼び出し互換のため任意利用）。
+        """
+        self.cur.execute(
+            "UPDATE companies SET status='error', error_code=?, locked_by=NULL, locked_at=NULL WHERE id=?",
+            (error_code, company_id),
+        )
+        self._commit_with_checkpoint()
 
     def insert_company(self, company_data: Dict[str, Any]) -> None:
         if not self._is_valid_company_data(company_data):
@@ -369,10 +446,15 @@ class DatabaseManager:
                 company_data.get("found_address", ""),
             ),
         )
-        self.conn.commit()
+        self._commit_with_checkpoint()
 
     def close(self) -> None:
         try:
+            if self.wal_checkpoint_interval > 0:
+                try:
+                    self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                except sqlite3.DatabaseError:
+                    pass
             self.cur.close()
         finally:
             self.conn.close()

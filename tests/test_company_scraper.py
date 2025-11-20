@@ -1,5 +1,5 @@
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 from src.company_scraper import CompanyScraper
 
 # 絶対/相対の /l/?uddg=..., 相対パス, 除外ドメインを含むサンプル
@@ -25,6 +25,15 @@ SAMPLE_HTML = """
   </body>
 </html>
 """
+BING_HTML = """
+<html>
+  <body>
+    <li class="b_algo">
+      <h2><a href="https://example-bing.com/info">Example Bing</a></h2>
+    </li>
+  </body>
+</html>
+"""
 
 @pytest.fixture
 def scraper():
@@ -40,7 +49,7 @@ async def test_search_company_filters_and_resolves(mock_get, scraper):
 
     urls = await scraper.search_company("トヨタ自動車株式会社", "愛知県豊田市", num_results=10)
     first_query = mock_get.call_args_list[0].kwargs["params"]["q"]
-    assert first_query.endswith("公式サイト")
+    assert "会社" in first_query
 
     # /l/?uddg= が正しく剥がれている（相対/絶対）
     assert "https://example.com/home" in urls
@@ -81,6 +90,20 @@ async def test_search_company_empty_on_http_error(mock_get, scraper):
 
     urls = await scraper.search_company("社名", "住所")
     assert urls == []
+
+
+@pytest.mark.asyncio
+async def test_search_company_fallbacks_to_bing(scraper):
+    async def fake_ddg(*args, **kwargs):
+        return ""
+
+    async def fake_bing(*args, **kwargs):
+        return BING_HTML
+
+    with patch.object(scraper, "_fetch_duckduckgo", side_effect=fake_ddg), \
+            patch.object(scraper, "_fetch_bing", side_effect=fake_bing):
+        urls = await scraper.search_company("社名", "住所", num_results=1)
+        assert urls and urls[0].startswith("https://example-bing.com")
 
 
 def test_is_likely_official_site_true(scraper):
@@ -162,6 +185,46 @@ def test_clean_rep_name_removes_union_title(scraper):
     assert scraper.clean_rep_name("組合長") is None
 
 
+def test_clean_rep_name_handles_chairman_title(scraper):
+    assert scraper.clean_rep_name("会長 佐藤太郎") == "佐藤太郎"
+    assert scraper.clean_rep_name("会長") is None
+
+
+def test_extract_candidates_keeps_full_rep_name(scraper):
+    text = "会社概要\n代表取締役会長　飯野　靖司\n所在地 東京都千代田区"
+    cands = scraper.extract_candidates(text)
+    assert "飯野靖司" in cands["rep_names"]
+
+
+def test_extract_candidates_finance_inline_variations(scraper):
+    text = "事業概要 売上高 12億円 営業利益 ▲3百万円 年商 15億"
+    cands = scraper.extract_candidates(text)
+    assert "12億円" in cands["revenues"]
+    assert "▲3百万円" in cands["profits"]
+    assert any("15億" in rev for rev in cands["revenues"])
+
+
+def test_extract_candidates_finance_loss_keywords(scraper):
+    text = "財務データ 営業収入 120億円 営業損益 △3億円 純損失 5億円 は赤字2億円"
+    cands = scraper.extract_candidates(text)
+    assert "120億円" in cands["revenues"]
+    assert any("△3億円" in p for p in cands["profits"])
+    assert any("5億円" in p for p in cands["profits"])
+    assert any("2億円" in p for p in cands["profits"])
+
+
+def test_founded_year_jp_era(scraper):
+    text = "創立 昭和53年3月20日"
+    cands = scraper.extract_candidates(text)
+    assert "1978" in cands["founded_years"]
+
+
+def test_founded_year_english_era_letter(scraper):
+    text = "設立 H2年4月1日"
+    cands = scraper.extract_candidates(text)
+    assert "1990" in cands["founded_years"]
+
+
 def test_is_likely_official_site_excludes_known_aggregator(scraper):
     text = "観陽亭のご案内"
     assert not scraper.is_likely_official_site(
@@ -215,3 +278,28 @@ def test_is_likely_official_site_excludes_note(scraper):
         "https://note.com/company_official/n/abc",
         {"text": text},
     )
+
+
+def test_is_likely_official_site_allows_google_sites(scraper):
+    text = "会社概要\n建築資材専門商社 大田機材株式会社 〒113-0033 東京都文京区本郷3-35"
+    extracted = {"addresses": ["〒113-0033 東京都文京区本郷3-35"]}
+    assert scraper.is_likely_official_site(
+        "大田機材株式会社",
+        "https://sites.google.com/view/otakizai-n/",
+        {"text": text},
+        "〒113-0033 東京都文京区本郷3-35",
+        extracted,
+    )
+
+
+def test_extract_candidates_phone_with_parentheses(scraper):
+    text = "基本情報\nTEL（0834）21-3641\nFAX（0834）32-3494"
+    cands = scraper.extract_candidates(text)
+    assert "0834-21-3641" in cands["phone_numbers"]
+
+
+def test_extract_candidates_securities_code(scraper):
+    text = "会社概要 証券コード：1234 東証プライム（9101）"
+    cands = scraper.extract_candidates(text)
+    assert any("1234" in l for l in cands["listings"])
+    assert any("9101" in l for l in cands["listings"])

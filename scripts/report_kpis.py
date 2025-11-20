@@ -1,8 +1,14 @@
 # scripts/report_kpis.py
-import argparse, csv, sqlite3, re, io, sys
+import argparse, sqlite3, re, sys
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Tuple, Optional, List
+from typing import Optional, List
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from scripts.import_csv_to_db import load_hubspot_data
 
 LOG_PATH = Path("logs/app.log")
 
@@ -32,65 +38,6 @@ def normalize_url(u: Optional[str]) -> Optional[str]:
     if not u:
         return None
     return u.rstrip("/")
-
-# -------------------------------
-# Listoss CSV 読み込み（柔軟ヘッダ対応）
-# -------------------------------
-def _open_text(path: str) -> str:
-    p = Path(path)
-    for enc in ("utf-8", "cp932"):
-        try:
-            return p.read_text(encoding=enc)
-        except UnicodeDecodeError:
-            continue
-    return p.read_bytes().decode("utf-8", errors="ignore")
-
-def _slice_from_header(text: str, header_token_ja: str, header_token_en: str = "company_name") -> str:
-    lines = text.splitlines()
-    for i, line in enumerate(lines[:200]):
-        if header_token_ja in line or header_token_en in line:
-            return "\n".join(lines[i:])
-    return text
-
-def load_listoss(paths: List[str]) -> Dict[Tuple[str, str], dict]:
-    """
-    日本語ヘッダ（会社名/都道府県/市区町村/住所/電話番号/出典URL）を自動認識。
-    住所は 県+市区町村+住所 を連結して正規化。
-    """
-    out: Dict[Tuple[str, str], dict] = {}
-    for path in paths:
-        raw = _open_text(path)
-        trimmed = _slice_from_header(raw, "会社名")
-        f = io.StringIO(trimmed)
-        reader = csv.DictReader(f)
-
-        def pick(row: dict, *keys):
-            for k in keys:
-                if k in row:
-                    return row[k]
-            for k in row:
-                if any(x in k for x in keys):
-                    return row[k]
-            return None
-
-        for row in reader:
-            name = (pick(row, "会社名", "company_name") or "").strip()
-            if not name or name == "会社名":
-                continue
-
-            pref = (pick(row, "都道府県") or "").strip()
-            city = (pick(row, "市区町村") or "").strip()
-            addr = (pick(row, "住所", "address") or "").strip()
-            phone = pick(row, "電話番号", "phone", "tel")
-            hp = pick(row, "出典URL", "homepage", "url", "website")
-
-            full_addr = normalize_address(" ".join(x for x in [pref, city, addr] if x))
-            norm_phone = normalize_phone(phone)
-            hp = normalize_url(hp)
-
-            key = (name, full_addr or "")
-            out[key] = {"addr": full_addr, "phone": norm_phone, "hp": hp}
-    return out
 
 # -------------------------------
 # ログから直近N時間の保存件数
@@ -142,7 +89,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="data/companies.db")
     ap.add_argument("--hours", type=int, default=1, help="直近N時間の処理件数（ログ）")
-    ap.add_argument("--listoss", nargs="*", default=[], help="Listoss CSV（複数可）")
+    ap.add_argument("--hubspot", nargs="*", default=[], help="HubSpot CSV（複数可）")
     ap.add_argument("--done-value", default="done", help="完了を表すstatusの値（既定: done）")
     args = ap.parse_args()
 
@@ -204,8 +151,8 @@ def main():
     else:
         print("HP取得率: 対応列が見つかりません（homepage/homepage_url/hp 等）")
 
-    if args.listoss:
-        gt = load_listoss(args.listoss)
+    if args.hubspot:
+        gt = load_hubspot_data(args.hubspot)
         addr_match = phone_match = hp_match = 0
         addr_total = phone_total = hp_total = 0
 
@@ -219,38 +166,45 @@ def main():
             phone = row[idx] if col_phone else None; idx += 1 if col_phone else 0
             hp = row[idx] if col_homepage else None
 
-            key = ((name or "").strip(), normalize_address(in_addr))
-            truth = gt.get(key)
+            name_key = (name or "").strip()
+            addr_key = normalize_address(in_addr) or ""
+            truth = gt.get((name_key, addr_key))
+            if not truth and found_addr:
+                truth = gt.get((name_key, normalize_address(found_addr) or ""))
             if not truth:
                 continue
 
-            if truth.get("addr") and found_addr:
+            truth_addr = normalize_address(truth.get("addr"))
+            if truth_addr and found_addr:
                 addr_total += 1
-                if normalize_address(found_addr) == truth["addr"]:
+                if normalize_address(found_addr) == truth_addr:
                     addr_match += 1
 
-            if truth.get("phone") and phone:
+            truth_phone = normalize_phone(truth.get("phone"))
+            if truth_phone and phone:
                 phone_total += 1
-                if normalize_phone(phone) == truth["phone"]:
+                if normalize_phone(phone) == truth_phone:
                     phone_match += 1
 
-            if truth.get("hp") and hp:
+            truth_hp = normalize_url(truth.get("hp"))
+            if truth_hp and hp:
                 hp_total += 1
-                if normalize_url(hp) == truth["hp"]:
+                if normalize_url(hp) == truth_hp:
                     hp_match += 1
 
+        print("--- HubSpot Ground Truth (住所/電話/HP) ---")
         if addr_total:
-            print(f"Listoss一致率（住所）: {addr_match}/{addr_total} = {addr_match/addr_total*100:.1f}%")
+            print(f"一致率（住所）: {addr_match}/{addr_total} = {addr_match/addr_total*100:.1f}%")
         else:
-            print("Listoss一致率（住所）: -")
+            print("一致率（住所）: -")
         if phone_total:
-            print(f"Listoss一致率（電話）: {phone_match}/{phone_total} = {phone_match/phone_total*100:.1f}%")
+            print(f"一致率（電話）: {phone_match}/{phone_total} = {phone_match/phone_total*100:.1f}%")
         else:
-            print("Listoss一致率（電話）: -")
+            print("一致率（電話）: -")
         if hp_total:
-            print(f"Listoss一致率（HP）: {hp_match}/{hp_total} = {hp_match/hp_total*100:.1f}%")
+            print(f"一致率（HP）: {hp_match}/{hp_total} = {hp_match/hp_total*100:.1f}%")
         else:
-            print("Listoss一致率（HP）: -")
+            print("一致率（HP）: -")
 
     conn.close()
 

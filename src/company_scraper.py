@@ -1,5 +1,5 @@
 # src/company_scraper.py
-import re, urllib.parse, json
+import re, urllib.parse, json, os
 import asyncio
 import unicodedata
 from typing import List, Dict, Any, Optional, Iterable
@@ -27,10 +27,11 @@ except Exception:
 PRIORITY_PATHS = [
     "/company", "/about", "/profile", "/corporate", "/overview",
     "/contact", "/inquiry", "/access", "/info", "/information",
+    "/ir", "/investor", "/investor-relations", "/financial", "/disclosure",
     "/gaiyou", "/gaiyo", "/gaiyou.html",
     "/会社概要", "/企業情報", "/企業概要", "/会社情報", "/会社案内", "/法人案内", "/法人概要",
     "/団体概要", "/施設案内", "/施設情報", "/法人情報", "/事業案内", "/事業紹介",
-    "/窓口案内", "/お問い合わせ", "/アクセス", "/沿革", "/組織図"
+    "/窓口案内", "/お問い合わせ", "/アクセス", "/沿革", "/組織図", "/決算", "/ディスクロージャー",
 ]
 PRIO_WORDS = [
     "会社概要", "企業情報", "企業概要", "法人案内", "法人概要", "会社案内",
@@ -49,11 +50,22 @@ PRIORITY_SECTION_KEYWORDS = (
     "会社概要", "会社案内", "法人案内", "法人概要", "企業情報", "企業概要",
     "団体概要", "施設案内", "園紹介", "学校案内", "沿革", "会社情報",
     "corporate", "about", "profile", "overview", "information", "access",
-    "お問い合わせ", "連絡先", "アクセス", "窓口"
+    "お問い合わせ", "連絡先", "アクセス", "窓口",
+    "決算", "ir", "investor", "ディスクロージャー", "financial"
 )
 PRIORITY_CONTACT_KEYWORDS = (
-    "contact", "お問い合わせ", "連絡先", "tel", "電話", "アクセス", "窓口"
+    "contact", "お問い合わせ", "連絡先", "tel", "電話", "アクセス", "窓口", "ir", "investor"
 )
+PREFECTURE_NAMES = [
+    "北海道", "青森県", "岩手県", "宮城県", "秋田県", "山形県", "福島県",
+    "茨城県", "栃木県", "群馬県", "埼玉県", "千葉県", "東京都", "神奈川県",
+    "新潟県", "富山県", "石川県", "福井県", "山梨県", "長野県",
+    "岐阜県", "静岡県", "愛知県", "三重県",
+    "滋賀県", "京都府", "大阪府", "兵庫県", "奈良県", "和歌山県",
+    "鳥取県", "島根県", "岡山県", "広島県", "山口県",
+    "徳島県", "香川県", "愛媛県", "高知県",
+    "福岡県", "佐賀県", "長崎県", "熊本県", "大分県", "宮崎県", "鹿児島県", "沖縄県",
+]
 REP_NAME_EXACT_BLOCKLIST = {
     "ブログ", "blog", "Blog", "BLOG",
     "ニュース", "News", "news",
@@ -79,36 +91,73 @@ REP_NAME_SUBSTR_BLOCKLIST = (
     "サイトマップ", "sitemap", "交通案内", "アクセスマップ",
     "施設案内", "施設情報", "イベント", "トピックス",
     "スタッフ紹介", "スタッフ", "メニュー", "menu",
-    "トップページ", "home", "沿革", "法人紹介", "会社紹介"
+    "トップページ", "home", "沿革", "法人紹介", "会社紹介",
+    "に関する", "について", "保管", "業務", "役員", "役割", "委員会",
+    "学校", "学園", "大学", "保育園", "こども園", "組合", "協会",
+    "センター", "法人", "こと", "公印", "いただき", "役", "組織"
 )
 REP_NAME_EXACT_BLOCKLIST_LOWER = {s.lower() for s in REP_NAME_EXACT_BLOCKLIST}
+NAME_CHUNK_RE = re.compile(r"[一-龥]{1,3}(?:[・･\s]{0,1}[一-龥]{1,3})+")
 
-PHONE_RE = re.compile(r"(?:TEL|Tel|tel|電話)\s*[:：]?\s*(0\d{1,4})[-‐―－ー]?(\d{1,4})[-‐―－ー]?(\d{3,4})")
+PHONE_RE = re.compile(
+    r"(?:TEL|Tel|tel|電話)\s*[:：]?\s*"
+    r"[\(（]?(0\d{1,4})[\)）]?\s*"
+    r"[-‐―－ー–—.\s]*"
+    r"(\d{1,4})\s*"
+    r"[-‐―－ー–—.\s]*"
+    r"(\d{3,4})"
+)
 ZIP_RE = re.compile(r"(〒?\s*\d{3})[-‐―－ー]?(\d{4})")
 ADDR_HINT = re.compile(r"(都|道|府|県).+?(市|区|郡|町|村)")
 ADDR_FALLBACK_RE = re.compile(
     r"(〒\d{3}-\d{4}[^。\n]*|[一-龥]{2,3}[都道府県][^。\n]{0,120}[市区町村郡][^。\n]{0,140})"
 )
-REP_RE = re.compile(r"(?:代表者|代表取締役|理事長|学長)\s*[:：]?\s*([^\s　<>\|（）\(\)]+)")
-LISTING_RE = re.compile(r"(?:上場(?:区分|市場|先)?|株式上場)\s*[:：]?\s*([^\s、。\n]+)")
+REP_RE = re.compile(
+    r"(?:代表者|代表取締役|理事長|学長|会長|社長)"
+    r"\s*[:：]?\s*([^\n\r<>\|（）\(\)]{1,40})"
+)
+LISTING_RE = re.compile(r"(?:上場(?:区分|市場|先)?|株式上場|未上場|非上場|未公開|非公開)\s*[:：]?\s*([^\s、。\n]+)")
 CAPITAL_RE = re.compile(r"資本金\s*[:：]?\s*([0-9０-９,.]+(?:億|万|千)?円)")
-REVENUE_RE = re.compile(r"(?:売上高|売上)\s*[:：]?\s*([0-9０-９,.]+(?:億|万|千)?円(?:以上|程度|規模)?)")
-PROFIT_RE = re.compile(r"(?:営業利益|経常利益)\s*[:：]?\s*([0-9０-９,.]+(?:億|万|千)?円)")
-FISCAL_RE = re.compile(r"(?:決算(?:月|期)|会計年度|会計期)\s*[:：]?\s*([0-9０-９]{1,2}月(?:末)?|[0-9０-９]{1,2}月期)")
-LISTING_KEYWORDS = ("非上場", "未上場", "上場予定なし")
-FOUNDED_RE = re.compile(r"(?:設立|創業|創立)\s*[:：]?\s*([0-9０-９]{2,4})年")
+REVENUE_RE = re.compile(
+    r"(?:売上高|売上|売上収益|売上額|営業収益|営業収入|事業収益|年商|売上総額|売上金額)"
+    r"\s*[:：]?\s*"
+    r"([△▲-]?\s*[0-9０-９,.]+(?:兆|億|万|千)?(?:円|百万円|千円)?)"
+)
+PROFIT_RE = re.compile(
+    r"(?:営業利益|経常利益|純利益|当期純利益|営業損益|経常損益|税引後利益|純損益|損益|損失|赤字)"
+    r"\s*[:：]?\s*"
+    r"([△▲-]?\s*[0-9０-９,.]+(?:兆|億|万|千)?(?:円|百万円|千円)?)"
+)
+FISCAL_RE = re.compile(r"(?:決算(?:月|期|日)?|会計年度|会計期)\s*[:：]?\s*([0-9０-９]{1,2}月(?:末)?|[0-9０-９]{1,2}月期)")
+LISTING_KEYWORDS = ("非上場", "未上場", "未公開", "非公開", "上場予定なし")
+FOUNDED_RE = re.compile(
+    r"(?:設立|創業|創立)\s*[:：]?\s*"
+    r"((?:明治|大正|昭和|平成|令和|M|T|S|H|R)?\s*[0-9０-９元]{1,4})"
+    r"年"
+)
 
 TABLE_LABEL_MAP = {
-    "rep_names": ("代表者", "代表取締役", "代表者名", "代表", "代表者氏名", "代表名"),
-    "capitals": ("資本金",),
-    "revenues": ("売上高", "売上", "売上額"),
-    "profits": ("利益", "営業利益", "経常利益", "純利益"),
-    "fiscal_months": ("決算月", "決算期", "決算", "会計期"),
-    "founded_years": ("設立", "創業", "創立", "設立年"),
-    "listing": ("上場区分", "上場", "市場", "上場先", "証券コード"),
+    "rep_names": ("代表者", "代表取締役", "代表者名", "代表", "代表者氏名", "代表名", "会長", "社長", "理事長"),
+    "capitals": ("資本金", "出資金"),
+    "revenues": (
+        "売上高", "売上", "売上額", "売上収益", "収益", "営業収益", "営業収入", "事業収益", "年商", "売上総額", "売上金額"
+    ),
+    "profits": (
+        "利益", "営業利益", "経常利益", "純利益", "当期純利益", "営業損益", "経常損益", "税引後利益", "純損益", "損益", "損失", "赤字"
+    ),
+    "fiscal_months": ("決算月", "決算期", "決算日", "決算", "会計期", "会計年度"),
+    "founded_years": ("設立", "創業", "創立", "設立年", "創立年"),
+    "listing": ("上場区分", "上場", "市場", "上場先", "証券コード", "非上場", "未上場", "コード番号"),
     "phone_numbers": ("電話", "電話番号", "TEL", "Tel"),
     "addresses": ("所在地", "住所", "本社所在地", "所在地住所", "所在地(本社)"),
 }
+SECURITIES_CODE_RE = re.compile(
+    r"(?:証券コード|証券ｺｰﾄﾞ|証券番号|コード番号)\s*[:：]?\s*([0-9]{4})"
+)
+MARKET_CODE_RE = re.compile(
+    r"(?:東証(?:プライム|スタンダード|グロース)?|TSE|JASDAQ|マザーズ)[^0-9]{0,6}?([0-9]{4})",
+    re.IGNORECASE,
+)
 
 
 class CompanyScraper:
@@ -126,12 +175,17 @@ class CompanyScraper:
         "yahoo.co.jp", "itp.ne.jp", "hotpepper.jp", "r.gnavi.co.jp",
         "tabelog.com", "ekiten.jp", "goo.ne.jp", "recruit.net", "en-gage.net",
         "townpage.goo.ne.jp", "jp-hp.com",
+        "buffett-code.com",
         # 集客・旅行・ショッピング系（公式サイトではないケースが多い）
         "rakuten.co.jp", "rakuten.com", "travelko.com", "jalan.net",
         "ikyu.com", "rurubu.jp", "booking.com", "expedia.co.jp",
         "agoda.com", "tripadvisor.jp", "tripadvisor.com", "hotels.com",
         "travel.yahoo.co.jp", "trivago.jp", "trivago.com",
         "jalan.jp", "asoview.com", "tabikobo.com",
+        # 求人・転職系（公式サイトではないケースが多い）
+        "mynavi.jp", "tenshoku.mynavi.jp", "rikunabi.jp", "indeed.com", "doda.jp",
+        "en-japan.com", "type.jp", "careerconnection.jp", "find-job.net",
+        "jobstreet.jp",
     ]
 
     PRIORITY_PATHS = [
@@ -163,6 +217,7 @@ class CompanyScraper:
         "note.com",
         "note.jp",
         "note.mu",
+        "buffett-code.com",
     }
 
     SUSPECT_HOSTS = {
@@ -200,11 +255,27 @@ class CompanyScraper:
 
     _romaji_converter = None  # lazy pykakasi converter
 
-    def __init__(self, headless: bool = True):
+    def __init__(self, headless: bool = True, search_engines: Optional[List[str]] = None):
         self.headless = headless
         self._pw = None
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
+        env_engines = os.getenv("SEARCH_ENGINES")
+        if search_engines:
+            engines = search_engines
+        elif env_engines:
+            engines = [e.strip().lower() for e in env_engines.split(",") if e.strip()]
+        else:
+            engines = ["duckduckgo", "bing"]
+        # duckduckgo を優先しつつ、名前解決やブロック時は bing にフォールバック
+        self.search_engines = []
+        seen_engine: set[str] = set()
+        for eng in engines:
+            if eng in ("duckduckgo", "bing") and eng not in seen_engine:
+                self.search_engines.append(eng)
+                seen_engine.add(eng)
+        if not self.search_engines:
+            self.search_engines = ["duckduckgo"]
 
     # ===== 公式判定ヘルパ =====
     @classmethod
@@ -290,6 +361,56 @@ class CompanyScraper:
         return [tok.lower() for tok in re.findall(r"[A-Za-z0-9]{2,}", text or "")]
 
     @staticmethod
+    def _extract_name_chunk(text: str) -> Optional[str]:
+        matches = NAME_CHUNK_RE.findall(text or "")
+        cleaned: List[str] = []
+        for m in matches:
+            candidate = re.sub(r"\s+", "", m.strip())
+            if any(stop in candidate for stop in ("法人", "学校", "協会", "委員会", "役員", "学校長")):
+                continue
+            if 2 <= len(candidate) <= 6:
+                cleaned.append(candidate)
+        if cleaned:
+            return cleaned[-1]
+        return None
+
+    @staticmethod
+    def _convert_jp_era_to_year(text: str) -> Optional[str]:
+        norm = unicodedata.normalize("NFKC", text or "").strip()
+        if not norm:
+            return None
+        era_map = {
+            "明治": 1868, "M": 1868, "m": 1868,
+            "大正": 1912, "T": 1912, "t": 1912,
+            "昭和": 1926, "S": 1926, "s": 1926,
+            "平成": 1989, "H": 1989, "h": 1989,
+            "令和": 2019, "R": 2019, "r": 2019,
+        }
+        m = re.search(r"(明治|大正|昭和|平成|令和|[MTSHRmtsr])\s*([0-9０-９]+|元)", norm)
+        if not m:
+            return None
+        era = m.group(1)
+        year_str = m.group(2)
+        base = era_map.get(era)
+        if base is None:
+            return None
+        year_num = 1 if year_str == "元" else int(unicodedata.normalize("NFKC", year_str))
+        if year_num <= 0 or year_num > 300:
+            return None
+        return str(base + year_num - 1)
+
+    @staticmethod
+    def _parse_founded_year(value: str) -> Optional[str]:
+        norm = unicodedata.normalize("NFKC", value or "")
+        era_year = CompanyScraper._convert_jp_era_to_year(norm)
+        if era_year:
+            return era_year
+        m4 = re.search(r"([12]\d{3})\s*年?", norm)
+        if m4:
+            return m4.group(1)
+        return None
+
+    @staticmethod
     def clean_rep_name(raw: Optional[str]) -> Optional[str]:
         if not raw:
             return None
@@ -308,7 +429,7 @@ class CompanyScraper:
             "代表取締役社長兼COO", "代表取締役社長兼社長執行役員",
             "代表者", "代表", "代表主宰", "代表校長",
             "理事長", "学長", "園長", "校長", "院長", "所長", "館長", "組合長",
-            "支配人", "店主", "社長", "総支配人", "CEO", "COO", "CFO", "代表取締役副会長",
+            "支配人", "店主", "会長", "社長", "総支配人", "CEO", "COO", "CFO", "代表取締役副会長",
         )
         while True:
             removed = False
@@ -322,6 +443,8 @@ class CompanyScraper:
         text = text.strip(" 　")
         if text.endswith(("氏", "様")):
             text = text[:-1]
+        text = re.sub(r"(と申します|といたします|になります|させていただきます|いたします|いたしました)$", "", text)
+        text = re.sub(r"^(の|当社|当園|当組合|当法人|弊社|弊園|弊組合|私|わたくし)", "", text)
         text = re.sub(r"\s+", " ", text)
         text = text.strip()
         if not text:
@@ -330,7 +453,10 @@ class CompanyScraper:
             return None
         if any(word in text for word in ("株式会社", "有限会社", "合名会社", "合資会社", "合同会社")):
             return None
-        for stop in ("創業", "創立", "創設", "メッセージ", "ご挨拶", "からの", "決裁", "沿革", "代表挨拶"):
+        for stop in ("創業", "創立", "創設", "メッセージ", "ご挨拶", "からの", "決裁", "沿革", "代表挨拶", "お問い合わせ"):
+            if stop in text:
+                return None
+        for stop in ("就任", "あいさつ", "ごあいさつ", "挨拶", "あいさつ文", "就任のご挨拶"):
             if stop in text:
                 return None
         lower_text = text.lower()
@@ -339,6 +465,20 @@ class CompanyScraper:
         for stop_word in REP_NAME_SUBSTR_BLOCKLIST:
             if stop_word in text or stop_word in lower_text:
                 return None
+        if text in PREFECTURE_NAMES:
+            return None
+        if not re.fullmatch(r"[A-Za-z\u00C0-\u024F\u3040-\u30FF\u3400-\u9FFF\s'’・･\-ー]+", text):
+            return None
+        tokens = [tok for tok in re.split(r"\s+", text) if tok]
+        if len(tokens) > 4:
+            return None
+        if any(len(tok) > 10 for tok in tokens if re.search(r"[一-龥]", tok)):
+            return None
+        if re.search(r"(こと|する|される|ます|でした|いたします|いただき)", text):
+            return None
+        chunk = CompanyScraper._extract_name_chunk(text)
+        if chunk:
+            text = chunk
         if not re.search(r"[一-龥ぁ-んァ-ン]", text):
             return None
         return text
@@ -367,6 +507,15 @@ class CompanyScraper:
                 score += 4
             if token and token in host:
                 score += 3
+            else:
+                for dt in domain_tokens:
+                    try:
+                        ratio = SequenceMatcher(None, token, dt).ratio()
+                    except Exception:
+                        ratio = 0
+                    if ratio >= 0.8:
+                        score += 2
+                        break
         lowered = host + urlparse(url).path.lower()
         if any(kw in lowered for kw in self.NON_OFFICIAL_KEYWORDS):
             score -= 3
@@ -406,6 +555,20 @@ class CompanyScraper:
                 continue
             yield cleaned
 
+    def _extract_bing_urls(self, html: str) -> Iterable[str]:
+        soup = BeautifulSoup(html, "html.parser")
+        for block in soup.select("li.b_algo h2 a"):
+            href = block.get("href")
+            if not href:
+                continue
+            if href.startswith("//"):
+                href = "https:" + href
+            elif href.startswith("/"):
+                href = urllib.parse.urljoin("https://www.bing.com", href)
+            if not href or self._is_excluded(href):
+                continue
+            yield href
+
     async def _fetch_duckduckgo(self, query: str) -> str:
         headers = {
             "User-Agent": "Mozilla/5.0",
@@ -417,6 +580,32 @@ class CompanyScraper:
                 resp = requests.get(
                     "https://html.duckduckgo.com/html",
                     params={"q": query, "kl": "jp-jp"},
+                    headers=headers,
+                    timeout=(5, 30),
+                )
+                if resp.status_code in (429, 500, 502, 503, 504):
+                    await asyncio.sleep(0.8 * (2 ** attempt))
+                    continue
+                resp.raise_for_status()
+                return resp.text
+            except Exception:
+                if attempt == 2:
+                    return ""
+                await asyncio.sleep(0.8 * (2 ** attempt))
+        return ""
+
+    async def _fetch_bing(self, query: str) -> str:
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept-Language": "ja,en-US;q=0.9",
+            "Referer": "https://www.bing.com/",
+        }
+        params = {"q": query, "setlang": "ja", "mkt": "ja-JP"}
+        for attempt in range(3):
+            try:
+                resp = requests.get(
+                    "https://www.bing.com/search",
+                    params=params,
                     headers=headers,
                     timeout=(5, 30),
                 )
@@ -471,8 +660,8 @@ class CompanyScraper:
         host = (parsed.netloc or "").lower().split(":")[0]
         if not host:
             return False
-
-        if any(host == domain or host.endswith(f".{domain}") for domain in self.HARD_EXCLUDE_HOSTS):
+        is_google_sites = host == "sites.google.com"
+        if not is_google_sites and any(host == domain or host.endswith(f".{domain}") for domain in self.HARD_EXCLUDE_HOSTS):
             return False
 
         score = 0
@@ -503,6 +692,13 @@ class CompanyScraper:
             if token and token in host:
                 score += 2
 
+        path_lower = (parsed.path or "").lower()
+        if host.endswith("google.com") and "sites" in path_lower:
+            if any(token in path_lower for token in company_tokens):
+                score += 5
+            if host == "sites.google.com":
+                score += 2
+
         text_snippet, html = self._page_hints(page_info)
         meta_snippet = self._meta_strings(html)
         combined = f"{text_snippet}\n{meta_snippet}".strip()
@@ -531,7 +727,11 @@ class CompanyScraper:
                     score += 5
                     break
 
-        return score >= 2
+        name_present = bool(norm_name and norm_name in combined) or any(tok in host for tok in company_tokens)
+        strong_domain = domain_match_score >= 4
+        if not (name_present or strong_domain):
+            return False
+        return score >= 4
 
     @staticmethod
     def normalize_homepage_url(url: str, page_info: Optional[Dict[str, Any]] = None) -> str:
@@ -715,6 +915,15 @@ class CompanyScraper:
         return text.lower()
 
     @staticmethod
+    def _extract_prefecture(address: str | None) -> str:
+        if not address:
+            return ""
+        for pref in PREFECTURE_NAMES:
+            if pref in address:
+                return pref
+        return ""
+
+    @staticmethod
     def _address_matches(expected: str, candidate: str) -> bool:
         if not expected or not candidate:
             return False
@@ -818,13 +1027,21 @@ class CompanyScraper:
         """
         base_name = (company_name or "").strip()
         base_address = (address or "").strip()
+        prefecture = self._extract_prefecture(base_address)
         queries: List[str] = []
         if base_name:
+            # 公式検索前に会社名+都道府県+「会社」で絞り込む
+            base_query = f"{base_name} {prefecture} 会社".strip() if prefecture else f"{base_name} 会社"
+            queries.append(base_query)
             queries.append(f"{base_name} 公式サイト")
         if base_name and base_address:
             q_addr = f"{base_name} {base_address}".strip()
             if q_addr and q_addr not in queries:
                 queries.append(q_addr)
+        if base_name and prefecture:
+            pref_query = f"{base_name} {prefecture}".strip()
+            if pref_query and pref_query not in queries:
+                queries.append(pref_query)
         if base_name and base_name not in queries:
             queries.append(base_name)
         if not queries:
@@ -835,17 +1052,27 @@ class CompanyScraper:
         max_candidates = max(num_results * 3, 12)
 
         for q_idx, query in enumerate(queries):
-            html = await self._fetch_duckduckgo(query)
-            if not html:
-                continue
-            for rank, url in enumerate(self._extract_search_urls(html)):
-                if url in seen:
+            provider_hit = False
+            for provider in self.search_engines:
+                if provider == "bing":
+                    html = await self._fetch_bing(query)
+                    extractor = self._extract_bing_urls
+                else:
+                    html = await self._fetch_duckduckgo(query)
+                    extractor = self._extract_search_urls
+                if not html:
                     continue
-                seen.add(url)
-                candidates.append({"url": url, "query_idx": q_idx, "rank": rank})
+                provider_hit = True
+                for rank, url in enumerate(extractor(html)):
+                    if url in seen:
+                        continue
+                    seen.add(url)
+                    candidates.append({"url": url, "query_idx": q_idx, "rank": rank, "provider": provider})
+                    if len(candidates) >= max_candidates:
+                        break
                 if len(candidates) >= max_candidates:
                     break
-            if len(candidates) >= num_results:
+            if provider_hit and len(candidates) >= num_results:
                 break
 
         if not candidates:
@@ -859,6 +1086,8 @@ class CompanyScraper:
             score += max(0, 6 - item["rank"])
             if item["query_idx"] == 0:
                 score += 3
+            if item.get("provider") == "bing":
+                score -= 1  # DDG結果を僅かに優先
             score += self._path_priority_value(url)
             scored.append((score, item["query_idx"], item["rank"], url))
 
@@ -1079,9 +1308,22 @@ class CompanyScraper:
         need_rep: bool,
         max_pages: int = 6,
         max_hops: int = 2,
+        *,
+        need_listing: bool = False,
+        need_capital: bool = False,
+        need_revenue: bool = False,
+        need_profit: bool = False,
+        need_fiscal: bool = False,
+        need_founded: bool = False,
+        need_description: bool = False,
     ) -> Dict[str, Dict[str, Any]]:
         results: Dict[str, Dict[str, Any]] = {}
         if not homepage:
+            return results
+        if not (
+            need_phone or need_addr or need_rep or need_listing or need_capital
+            or need_revenue or need_profit or need_fiscal or need_founded or need_description
+        ):
             return results
 
         visited: set[str] = {homepage}
@@ -1109,6 +1351,12 @@ class CompanyScraper:
                 missing.append("addr")
             if need_rep:
                 missing.append("rep")
+            if need_listing:
+                missing.append("listing")
+            if need_capital or need_revenue or need_profit or need_fiscal or need_founded:
+                missing.append("finance")
+            if need_description:
+                missing.append("description")
             if not missing:
                 continue
 
@@ -1220,12 +1468,9 @@ class CompanyScraper:
                             elif field == "fiscal_months":
                                 fiscal_months.append(norm_value)
                             elif field == "founded_years":
-                                norm = unicodedata.normalize("NFKC", norm_value)
-                                m = re.search(r"(\d{4})", norm)
-                                if m:
-                                    founded_years.append(m.group(1))
-                                else:
-                                    founded_years.append(norm_value)
+                                parsed = self._parse_founded_year(norm_value)
+                                if parsed:
+                                    founded_years.append(parsed)
                             break
 
                 def walk_ld(entity: Any) -> None:
@@ -1299,6 +1544,14 @@ class CompanyScraper:
             val = re.split(r"[、。\s/|]", val)[0]
             if val:
                 listings.append(val)
+        for sm in SECURITIES_CODE_RE.finditer(text or ""):
+            code = sm.group(1).strip()
+            if code:
+                listings.append(f"証券コード{code}")
+        for mm in MARKET_CODE_RE.finditer(text or ""):
+            code = mm.group(1).strip()
+            if code:
+                listings.append(f"証券コード{code}")
         if not listings:
             lowered = (text or "").lower()
             for term in LISTING_KEYWORDS:
@@ -1312,12 +1565,9 @@ class CompanyScraper:
         fiscal_months.extend(m.group(1).strip() for m in FISCAL_RE.finditer(text or ""))
         for fm in FOUNDED_RE.finditer(text or ""):
             val = fm.group(1).strip()
-            val = unicodedata.normalize("NFKC", val)
-            if len(val) == 2 and val.isdigit():
-                # Heisei/Showa not handled; skip ambiguous short years
-                continue
-            if val.isdigit():
-                founded_years.append(val)
+            parsed = self._parse_founded_year(val)
+            if parsed:
+                founded_years.append(parsed)
 
         def dedupe(seq: List[str]) -> List[str]:
             seen: set[str] = set()

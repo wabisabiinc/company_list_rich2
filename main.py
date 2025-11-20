@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from src.database_manager import DatabaseManager
 from src.company_scraper import CompanyScraper
 from src.ai_verifier import AIVerifier, DEFAULT_MODEL as AI_MODEL_NAME
+from src.reference_checker import ReferenceChecker
 
 # --------------------------------------------------
 # ロギング設定
@@ -42,6 +43,7 @@ ID_MAX = int(os.getenv("ID_MAX", "0"))
 AI_COOLDOWN_SEC = float(os.getenv("AI_COOLDOWN_SEC", "0"))
 SLEEP_BETWEEN_SEC = float(os.getenv("SLEEP_BETWEEN_SEC", "0"))
 JITTER_RATIO = float(os.getenv("JITTER_RATIO", "0.30"))
+REFERENCE_CSVS = [p.strip() for p in os.getenv("REFERENCE_CSVS", "").split(",") if p.strip()]
 
 MIRROR_TO_CSV = os.getenv("MIRROR_TO_CSV", "false").lower() == "true"
 OUTPUT_CSV_PATH = os.getenv("OUTPUT_CSV_PATH", "data/output.csv")
@@ -51,8 +53,27 @@ CSV_FIELDNAMES = [
     "listing", "revenue", "profit", "capital", "fiscal_month", "founded_year"
 ]
 
+REFERENCE_CHECKER: ReferenceChecker | None = None
+if REFERENCE_CSVS:
+    try:
+        REFERENCE_CHECKER = ReferenceChecker.from_csvs(REFERENCE_CSVS)
+        log.info("Reference data loaded: %s rows", len(REFERENCE_CHECKER))
+    except Exception:
+        log.exception("Reference data loading failed")
+
 ZIP_CODE_RE = re.compile(r"(\d{3}-\d{4})")
 KANJI_TOKEN_RE = re.compile(r"[一-龥]{2,}")
+LISTING_ALLOWED_KEYWORDS = [
+    "上場", "未上場", "非上場", "東証", "名証", "札証", "福証", "JASDAQ",
+    "TOKYO PRO", "マザーズ", "グロース", "スタンダード", "プライム",
+    "Nasdaq", "NYSE"
+]
+AMOUNT_ALLOWED_UNITS = ("億円", "万円", "千円", "円")
+DESCRIPTION_HINTS = (
+    "会社概要", "法人概要", "団体概要", "組合概要", "企業情報", "基本情報",
+    "事業内容", "事業紹介", "沿革", "理念", "ごあいさつ", "ご挨拶",
+    "私たちについて", "about", "会社紹介", "法人紹介", "概要"
+)
 
 # --------------------------------------------------
 # 正規化 & 一致判定
@@ -124,6 +145,80 @@ def pick_best_address(expected_addr: str | None, candidates: list[str]) -> str |
             best_score = score
             best = cand
     return best
+
+def clean_listing_value(val: str) -> str:
+    text = (val or "").strip().replace("　", " ")
+    if not text:
+        return ""
+    if len(text) > 40:
+        text = text[:40]
+    if any(keyword.lower() in text.lower() for keyword in LISTING_ALLOWED_KEYWORDS):
+        return text
+    if re.fullmatch(r"(?:上場|未上場|非上場)", text):
+        return text
+    return ""
+
+def clean_amount_value(val: str) -> str:
+    text = (val or "").strip().replace("　", " ")
+    if not text:
+        return ""
+    if not re.search(r"[0-9０-９]", text):
+        return ""
+    if not any(unit in text for unit in AMOUNT_ALLOWED_UNITS):
+        return ""
+    text = re.sub(r"\s+", "", text)
+    if len(text) > 40:
+        text = text[:40]
+    return text
+
+def clean_description_value(val: str) -> str:
+    text = (val or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"\s+", " ", text)
+    return text[:80]
+
+def clean_fiscal_month(val: str) -> str:
+    text = (val or "").strip().replace("　", " ")
+    if not text:
+        return ""
+    m = re.search(r"(1[0-2]|0?[1-9])\s*月", text)
+    if m:
+        return f"{int(m.group(1))}月"
+    m = re.search(r"(1[0-2]|0?[1-9])", text)
+    if m:
+        return f"{int(m.group(1))}月"
+    return ""
+
+
+def extract_description_snippet(text: str | None) -> str | None:
+    if not text:
+        return None
+    paragraphs = [p.strip() for p in re.split(r"[\r\n]+", text) if p.strip()]
+    if not paragraphs:
+        return None
+    lowered = [p.lower() for p in paragraphs]
+    for idx, para in enumerate(paragraphs):
+        if any(hint.lower() in lowered[idx] for hint in DESCRIPTION_HINTS):
+            cleaned = clean_description_value(para)
+            if cleaned:
+                return cleaned
+    for para in paragraphs:
+        cleaned = clean_description_value(para)
+        if cleaned:
+            return cleaned
+    return None
+
+def clean_founded_year(val: str) -> str:
+    text = (val or "").strip()
+    if not text:
+        return ""
+    m = re.search(r"(18|19|20)\d{2}", text)
+    if m:
+        return m.group(0)
+    if text.isdigit() and len(text) == 4:
+        return text
+    return ""
 
 # --------------------------------------------------
 # 内部: 次ジョブ取得
@@ -219,19 +314,19 @@ async def process():
                         info = candidate_info
                         primary_cands = extracted
                         break
-                    fallback_cands.append(extracted)
+                    fallback_cands.append((candidate, extracted))
                     log.info("[%s] 非公式と判断: %s", cid, candidate)
 
                 phone = ""
                 found_address = ""
                 rep_name_val = scraper.clean_rep_name(company.get("rep_name")) or ""
-                description_val = (company.get("description") or "").strip()
-                listing_val = (company.get("listing") or "").strip()
-                revenue_val = (company.get("revenue") or "").strip()
-                profit_val = (company.get("profit") or "").strip()
-                capital_val = (company.get("capital") or "").strip()
-                fiscal_val = (company.get("fiscal_month") or "").strip()
-                founded_val = (company.get("founded_year") or "").strip()
+                description_val = clean_description_value(company.get("description") or "")
+                listing_val = clean_listing_value(company.get("listing") or "")
+                revenue_val = clean_amount_value(company.get("revenue") or "")
+                profit_val = clean_amount_value(company.get("profit") or "")
+                capital_val = clean_amount_value(company.get("capital") or "")
+                fiscal_val = clean_fiscal_month(company.get("fiscal_month") or "")
+                founded_val = clean_founded_year(company.get("founded_year") or "")
                 phone_source = "none"
                 address_source = "none"
                 ai_used = 0
@@ -248,6 +343,13 @@ async def process():
                 src_rep = ""
                 verify_result = {"phone_ok": False, "address_ok": False}
                 confidence = 0.0
+                need_listing = not bool(listing_val)
+                need_capital = not bool(capital_val)
+                need_revenue = not bool(revenue_val)
+                need_profit = not bool(profit_val)
+                need_fiscal = not bool(fiscal_val)
+                need_founded = not bool(founded_val)
+                need_description = not bool(description_val)
 
                 if homepage and info:
                     info_url = info.get("url") or homepage
@@ -281,13 +383,25 @@ async def process():
                     if profits and not profit_val:
                         profit_val = profits[0].strip()
                     if fiscals and not fiscal_val:
-                        fiscal_val = fiscals[0].strip()
+                        fiscal_val = clean_fiscal_month(fiscals[0])
                     if founded_years and not founded_val:
                         founded_val = founded_years[0].strip()
 
+                    need_listing = not bool(listing_val)
+                    need_capital = not bool(capital_val)
+                    need_revenue = not bool(revenue_val)
+                    need_profit = not bool(profit_val)
+                    need_fiscal = not bool(fiscal_val)
+                    need_founded = not bool(founded_val)
+                    need_description = not bool(description_val)
+
                     try:
+                        priority_limit = 8 if any([
+                            need_listing, need_capital, need_revenue,
+                            need_profit, need_fiscal, need_founded, need_description,
+                        ]) else 4
                         priority_docs = await scraper.fetch_priority_documents(
-                            homepage, info.get("html", ""), max_links=4
+                            homepage, info.get("html", ""), max_links=priority_limit
                         )
                     except Exception:
                         priority_docs = {}
@@ -311,20 +425,50 @@ async def process():
                                 src_rep = url
                         if not listing_val and cc.get("listings"):
                             listing_val = (cc["listings"][0] or "").strip()
+                            need_listing = not bool(listing_val)
                         if not capital_val and cc.get("capitals"):
                             capital_val = (cc["capitals"][0] or "").strip()
+                            need_capital = not bool(capital_val)
                         if not revenue_val and cc.get("revenues"):
                             revenue_val = (cc["revenues"][0] or "").strip()
+                            need_revenue = not bool(revenue_val)
                         if not profit_val and cc.get("profits"):
                             profit_val = (cc["profits"][0] or "").strip()
+                            need_profit = not bool(profit_val)
                         if not fiscal_val and cc.get("fiscal_months"):
-                            fiscal_val = (cc["fiscal_months"][0] or "").strip()
+                            fiscal_val = clean_fiscal_month(cc["fiscal_months"][0])
+                            need_fiscal = not bool(fiscal_val)
                         if not founded_val and cc.get("founded_years"):
                             founded_val = (cc["founded_years"][0] or "").strip()
+                            need_founded = not bool(founded_val)
+                        if need_description and not description_val:
+                            snippet = extract_description_snippet(pdata.get("text", ""))
+                            if snippet:
+                                description_val = snippet
+                                need_description = False
 
                     ai_result = None
                     ai_attempted = False
-                    if USE_AI and verifier is not None:
+                    pre_ai_phone_ok = bool(rule_phone or phone)
+                    pre_ai_addr_ok = bool(rule_address or found_address)
+                    pre_ai_rep_ok = bool(rule_rep or rep_name_val)
+                    ai_needed = (
+                        USE_AI
+                        and verifier is not None
+                        and any([
+                            not pre_ai_phone_ok,
+                            not pre_ai_addr_ok,
+                            not pre_ai_rep_ok,
+                            need_listing,
+                            need_capital,
+                            need_revenue,
+                            need_profit,
+                            need_fiscal,
+                            need_founded,
+                            need_description,
+                        ])
+                    )
+                    if ai_needed:
                         ai_attempted = True
                         try:
                             ai_result = await verifier.verify_info(
@@ -345,12 +489,118 @@ async def process():
                         ai_addr = normalize_address(ai_result.get("address"))
                         ai_rep = ai_result.get("rep_name") or ai_result.get("representative")
                         ai_rep = scraper.clean_rep_name(ai_rep) if ai_rep else None
+                        if not listing_val:
+                            listing_ai = ai_result.get("listing")
+                            if isinstance(listing_ai, str) and listing_ai.strip():
+                                listing_val = listing_ai.strip()
+                        if not capital_val:
+                            capital_ai = ai_result.get("capital")
+                            if isinstance(capital_ai, str) and capital_ai.strip():
+                                capital_val = capital_ai.strip()
+                        if not revenue_val:
+                            revenue_ai = ai_result.get("revenue")
+                            if isinstance(revenue_ai, str) and revenue_ai.strip():
+                                revenue_val = revenue_ai.strip()
+                        if not profit_val:
+                            profit_ai = ai_result.get("profit")
+                            if isinstance(profit_ai, str) and profit_ai.strip():
+                                profit_val = profit_ai.strip()
+                        if not fiscal_val:
+                            fiscal_ai = ai_result.get("fiscal_month")
+                            if isinstance(fiscal_ai, str) and fiscal_ai.strip():
+                                fiscal_val = clean_fiscal_month(fiscal_ai)
+                        if not founded_val:
+                            founded_ai = ai_result.get("founded_year")
+                            if isinstance(founded_ai, str) and founded_ai.strip():
+                                founded_val = founded_ai.strip()
                         description = ai_result.get("description")
                         if isinstance(description, str) and description.strip():
                             description_val = description.strip()[:50]
                     else:
                         if ai_attempted and AI_COOLDOWN_SEC > 0:
                             await asyncio.sleep(jittered_seconds(AI_COOLDOWN_SEC, JITTER_RATIO))
+                    need_listing = not bool(listing_val)
+                    need_capital = not bool(capital_val)
+                    need_revenue = not bool(revenue_val)
+                    need_profit = not bool(profit_val)
+                    need_fiscal = not bool(fiscal_val)
+                    need_founded = not bool(founded_val)
+                    need_description = not bool(description_val)
+
+                    # AI 2回目: まだ欠損がある場合に、優先リンクから集めたテキストで再度問い合わせ
+                    if USE_AI and verifier is not None and priority_docs:
+                        missing_fields = any([
+                            not phone,
+                            not found_address,
+                            not rep_name_val,
+                            need_description,
+                            need_listing,
+                            need_capital,
+                            need_revenue,
+                            need_profit,
+                            need_fiscal,
+                            need_founded,
+                        ])
+                        if missing_fields:
+                            combined_text = "\n\n".join(v.get("text", "") or "" for v in priority_docs.values())
+                            if combined_text.strip():
+                                try:
+                                    ai_attempted = True
+                                    ai_result2 = await verifier.verify_info(combined_text, None, name, addr)
+                                except Exception:
+                                    ai_result2 = None
+                                if ai_result2:
+                                    ai_used = 1
+                                    ai_model = AI_MODEL_NAME
+                                    ai_phone2 = normalize_phone(ai_result2.get("phone_number"))
+                                    ai_addr2 = normalize_address(ai_result2.get("address"))
+                                    ai_rep2 = ai_result2.get("rep_name") or ai_result2.get("representative")
+                                    ai_rep2 = scraper.clean_rep_name(ai_rep2) if ai_rep2 else None
+                                    desc2 = ai_result2.get("description")
+                                    if not listing_val:
+                                        listing_ai2 = ai_result2.get("listing")
+                                        if isinstance(listing_ai2, str) and listing_ai2.strip():
+                                            listing_val = listing_ai2.strip()
+                                    if not capital_val:
+                                        capital_ai2 = ai_result2.get("capital")
+                                        if isinstance(capital_ai2, str) and capital_ai2.strip():
+                                            capital_val = capital_ai2.strip()
+                                    if not revenue_val:
+                                        revenue_ai2 = ai_result2.get("revenue")
+                                        if isinstance(revenue_ai2, str) and revenue_ai2.strip():
+                                            revenue_val = revenue_ai2.strip()
+                                    if not profit_val:
+                                        profit_ai2 = ai_result2.get("profit")
+                                        if isinstance(profit_ai2, str) and profit_ai2.strip():
+                                            profit_val = profit_ai2.strip()
+                                    if not fiscal_val:
+                                        fiscal_ai2 = ai_result2.get("fiscal_month")
+                                        if isinstance(fiscal_ai2, str) and fiscal_ai2.strip():
+                                            fiscal_val = clean_fiscal_month(fiscal_ai2)
+                                    if not founded_val:
+                                        founded_ai2 = ai_result2.get("founded_year")
+                                        if isinstance(founded_ai2, str) and founded_ai2.strip():
+                                            founded_val = founded_ai2.strip()
+                                    if ai_phone2 and not phone:
+                                        phone = ai_phone2
+                                        phone_source = "ai"
+                                        src_phone = info_url
+                                    if ai_addr2 and not found_address:
+                                        found_address = ai_addr2
+                                        address_source = "ai"
+                                        src_addr = info_url
+                                    if ai_rep2 and not rep_name_val:
+                                        rep_name_val = ai_rep2
+                                        src_rep = info_url
+                                    if isinstance(desc2, str) and desc2.strip() and not description_val:
+                                        description_val = desc2.strip()[:50]
+                                    need_listing = not bool(listing_val)
+                                    need_capital = not bool(capital_val)
+                                    need_revenue = not bool(revenue_val)
+                                    need_profit = not bool(profit_val)
+                                    need_fiscal = not bool(fiscal_val)
+                                    need_founded = not bool(founded_val)
+                                    need_description = not bool(description_val)
 
                     if ai_phone:
                         phone = ai_phone
@@ -390,7 +640,11 @@ async def process():
                     need_phone = not bool(phone)
                     need_addr = not bool(found_address)
                     need_rep = not bool(rep_name_val)
-                    if need_phone or need_addr or need_rep:
+                    need_extra_fields = any([
+                        need_listing, need_capital, need_revenue,
+                        need_profit, need_fiscal, need_founded, need_description,
+                    ])
+                    if need_phone or need_addr or need_rep or need_extra_fields:
                         try:
                             related = await scraper.crawl_related(
                                 homepage,
@@ -399,6 +653,13 @@ async def process():
                                 need_rep,
                                 max_pages=6,
                                 max_hops=2,
+                                need_listing=need_listing,
+                                need_capital=need_capital,
+                                need_revenue=need_revenue,
+                                need_profit=need_profit,
+                                need_fiscal=need_fiscal,
+                                need_founded=need_founded,
+                                need_description=need_description,
                             )
                         except Exception:
                             related = {}
@@ -427,19 +688,33 @@ async def process():
                                     rep_name_val = cand_rep
                                     src_rep = url
                                     need_rep = False
-                            if not listing_val and cc.get("listings"):
+                            if need_listing and cc.get("listings"):
                                 listing_val = (cc["listings"][0] or "").strip()
-                            if not capital_val and cc.get("capitals"):
+                                need_listing = not bool(listing_val)
+                            if need_capital and cc.get("capitals"):
                                 capital_val = (cc["capitals"][0] or "").strip()
-                            if not revenue_val and cc.get("revenues"):
+                                need_capital = not bool(capital_val)
+                            if need_revenue and cc.get("revenues"):
                                 revenue_val = (cc["revenues"][0] or "").strip()
-                            if not profit_val and cc.get("profits"):
+                                need_revenue = not bool(revenue_val)
+                            if need_profit and cc.get("profits"):
                                 profit_val = (cc["profits"][0] or "").strip()
-                            if not fiscal_val and cc.get("fiscal_months"):
-                                fiscal_val = (cc["fiscal_months"][0] or "").strip()
-                            if not founded_val and cc.get("founded_years"):
+                                need_profit = not bool(profit_val)
+                            if need_fiscal and cc.get("fiscal_months"):
+                                fiscal_val = clean_fiscal_month(cc["fiscal_months"][0])
+                                need_fiscal = not bool(fiscal_val)
+                            if need_founded and cc.get("founded_years"):
                                 founded_val = (cc["founded_years"][0] or "").strip()
-                            if not (need_phone or need_addr or need_rep):
+                                need_founded = not bool(founded_val)
+                            if need_description and not description_val:
+                                snippet = extract_description_snippet(text)
+                                if snippet:
+                                    description_val = snippet
+                                    need_description = False
+                            if not (
+                                need_phone or need_addr or need_rep or need_listing or need_capital
+                                or need_revenue or need_profit or need_fiscal or need_founded or need_description
+                            ):
                                 break
 
                     try:
@@ -465,43 +740,65 @@ async def process():
                     confidence = 0.4
 
                 # 公式サイトから取得できなかった指標は検索結果の非公式ページから補完
+                if not phone or not found_address or not rep_name_val:
+                    for url, data in fallback_cands:
+                        if not phone and data.get("phone_numbers"):
+                            cand = normalize_phone(data["phone_numbers"][0])
+                            if cand:
+                                phone = cand
+                                phone_source = "rule"
+                                src_phone = url
+                        if not found_address and data.get("addresses"):
+                            cand_addr = pick_best_address(addr, data["addresses"])
+                            if cand_addr:
+                                found_address = cand_addr
+                                address_source = "rule"
+                                src_addr = url
+                        if not rep_name_val and data.get("rep_names"):
+                            cand_rep = scraper.clean_rep_name(data["rep_names"][0])
+                            if cand_rep:
+                                rep_name_val = cand_rep
+                                src_rep = url
+                        if phone and found_address and rep_name_val:
+                            break
+
                 if not listing_val:
-                    for data in fallback_cands:
+                    for url, data in fallback_cands:
                         values = data.get("listings") or []
                         if values:
                             listing_val = (values[0] or "").strip()
                             if listing_val:
                                 break
                 if not capital_val:
-                    for data in fallback_cands:
+                    for url, data in fallback_cands:
                         values = data.get("capitals") or []
                         if values:
                             capital_val = (values[0] or "").strip()
                             if capital_val:
                                 break
                 if not revenue_val:
-                    for data in fallback_cands:
+                    for url, data in fallback_cands:
                         values = data.get("revenues") or []
                         if values:
                             revenue_val = (values[0] or "").strip()
                             if revenue_val:
                                 break
                 if not profit_val:
-                    for data in fallback_cands:
+                    for url, data in fallback_cands:
                         values = data.get("profits") or []
                         if values:
                             profit_val = (values[0] or "").strip()
                             if profit_val:
                                 break
                 if not fiscal_val:
-                    for data in fallback_cands:
+                    for url, data in fallback_cands:
                         values = data.get("fiscal_months") or []
                         if values:
-                            fiscal_val = (values[0] or "").strip()
+                            fiscal_val = clean_fiscal_month(values[0] or "")
                             if fiscal_val:
                                 break
                 if not founded_val:
-                    for data in fallback_cands:
+                    for url, data in fallback_cands:
                         values = data.get("founded_years") or []
                         if values:
                             founded_val = (values[0] or "").strip()
@@ -510,13 +807,13 @@ async def process():
 
                 normalized_found_address = normalize_address(found_address) if found_address else ""
                 rep_name_val = scraper.clean_rep_name(rep_name_val) or ""
-                description_val = description_val.strip()[:50]
-                listing_val = listing_val.strip()
-                capital_val = capital_val.strip()
-                revenue_val = revenue_val.strip()
-                profit_val = profit_val.strip()
-                fiscal_val = fiscal_val.strip()
-                founded_val = founded_val.strip()
+                description_val = clean_description_value(description_val)
+                listing_val = clean_listing_value(listing_val)
+                capital_val = clean_amount_value(capital_val)
+                revenue_val = clean_amount_value(revenue_val)
+                profit_val = clean_amount_value(profit_val)
+                fiscal_val = clean_fiscal_month(fiscal_val)
+                founded_val = clean_founded_year(founded_val)
                 company.update({
                     "homepage": homepage,
                     "phone": phone or "",
@@ -538,6 +835,11 @@ async def process():
                     "source_url_address": src_addr,
                     "source_url_rep": src_rep,
                 })
+
+                if REFERENCE_CHECKER:
+                    accuracy_payload = REFERENCE_CHECKER.evaluate(company)
+                    if accuracy_payload:
+                        company.update(accuracy_payload)
 
                 status = "done" if homepage else "error"
                 if status == "done" and found_address and not addr_compatible(addr, found_address):
