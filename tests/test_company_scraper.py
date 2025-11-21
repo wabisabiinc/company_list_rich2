@@ -16,6 +16,8 @@ SAMPLE_HTML = """
     <a class="result__a" href="//bar.com/page">Bar</a>
     <!-- 相対パス -->
     <a class="result__a" href="/relative/path">Rel</a>
+    <!-- 会社概要のパス -->
+    <a class="result__a" href="https://profile.example.com/company/overview">Profile</a>
     <!-- 空 href -->
     <a class="result__a" href="">Empty</a>
     <!-- 旅行系集客ドメイン（除外対象） -->
@@ -50,6 +52,7 @@ async def test_search_company_filters_and_resolves(mock_get, scraper):
     urls = await scraper.search_company("トヨタ自動車株式会社", "愛知県豊田市", num_results=10)
     first_query = mock_get.call_args_list[0].kwargs["params"]["q"]
     assert "会社" in first_query
+    assert "公式" in first_query
 
     # /l/?uddg= が正しく剥がれている（相対/絶対）
     assert "https://example.com/home" in urls
@@ -90,6 +93,15 @@ async def test_search_company_empty_on_http_error(mock_get, scraper):
 
     urls = await scraper.search_company("社名", "住所")
     assert urls == []
+
+
+@pytest.mark.asyncio
+async def test_search_company_info_pages_prefers_profile(scraper):
+    fake_fetch = AsyncMock(return_value=SAMPLE_HTML)
+    with patch.object(scraper, "_fetch_duckduckgo", fake_fetch):
+        urls = await scraper.search_company_info_pages("社名", "東京都", max_results=1)
+    assert urls
+    assert any("profile.example.com" in u for u in urls)
 
 
 @pytest.mark.asyncio
@@ -290,6 +302,19 @@ def test_is_likely_official_site_allows_google_sites(scraper):
         "〒113-0033 東京都文京区本郷3-35",
         extracted,
     )
+
+
+def test_is_likely_official_site_details(scraper):
+    text = "会社概要\n株式会社Exampleの公式サイト"
+    details = scraper.is_likely_official_site(
+        "株式会社Example",
+        "https://www.example.co.jp/company",
+        {"text": text},
+        return_details=True,
+    )
+    assert isinstance(details, dict)
+    assert details["is_official"] is True
+    assert details["score"] >= 4
 
 
 def test_extract_candidates_phone_with_parentheses(scraper):

@@ -333,3 +333,70 @@ class AIVerifier:
         except Exception as e:
             log.error(f"Failed to verify info for {company_name} ({address}): {e}", exc_info=True)
             return None
+
+    async def judge_official_homepage(
+        self,
+        text: str,
+        screenshot: bytes | None,
+        company_name: str,
+        address: str,
+        url: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not self.model:
+            return None
+        snippet = (text or "").strip()
+        if len(snippet) > 4000:
+            snippet = snippet[:4000]
+        prompt = (
+            "あなたは企業サイトの審査官です。候補URLが公式ホームページかどうかを判定してください。\n"
+            "以下を根拠に、true/false と理由、信頼度(0-1)をJSONのみで出力してください。\n"
+            "出力フォーマット:\n"
+            "{\\\"is_official\\\": true/false, \\\"confidence\\\": 0.0-1.0, \\\"reason\\\": \"簡潔な根拠\"}\n"
+            "判断基準:\n"
+            "- 企業名・所在地・サービス内容の一致を確認。\n"
+            "- 口コミ/求人/まとめサイトは false。\n"
+            "- URLが企業ドメインや自治体/学校の公式ドメインなら true に寄せる。\n"
+            f"企業名: {company_name}\n住所: {address}\n候補URL: {url}\n本文抜粋:\n{snippet}\n"
+        )
+        content = [prompt]
+        if screenshot:
+            try:
+                b64 = base64.b64encode(screenshot).decode("utf-8")
+                content.append({"inline_data": {"mime_type": "image/png", "data": b64}})
+            except Exception:
+                pass
+        try:
+            try:
+                resp = await self.model.generate_content_async(content, safety_settings=None)
+            except TypeError:
+                resp = await self.model.generate_content_async(content)
+            raw = _resp_text(resp)
+            result = _extract_first_json(raw)
+            if not isinstance(result, dict):
+                return None
+            verdict = result.get("is_official")
+            if isinstance(verdict, str):
+                verdict = verdict.strip().lower()
+                verdict = verdict in {"true", "yes", "official", "1"}
+            elif isinstance(verdict, (int, float)):
+                verdict = bool(verdict)
+            elif not isinstance(verdict, bool):
+                return None
+            confidence_val = result.get("confidence")
+            try:
+                confidence = float(confidence_val) if confidence_val is not None else None
+            except Exception:
+                confidence = None
+            reason = result.get("reason")
+            if isinstance(reason, str):
+                reason = reason.strip()
+            else:
+                reason = ""
+            return {
+                "is_official": bool(verdict),
+                "confidence": confidence,
+                "reason": reason,
+            }
+        except Exception as exc:  # pylint: disable=broad-except
+            log.warning(f"judge_official_homepage failed for {company_name} ({url}): {exc}")
+            return None

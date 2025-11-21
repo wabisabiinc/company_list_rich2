@@ -3,6 +3,7 @@ import csv
 import os
 import sqlite3
 import time
+import urllib.parse
 from typing import Optional, Dict, Any
 
 
@@ -191,6 +192,12 @@ class DatabaseManager:
             self.conn.execute("ALTER TABLE companies ADD COLUMN accuracy_phone TEXT;")
         if "accuracy_address" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN accuracy_address TEXT;")
+        if "homepage_official_flag" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN homepage_official_flag INTEGER;")
+        if "homepage_official_source" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN homepage_official_source TEXT;")
+        if "homepage_official_score" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN homepage_official_score REAL;")
 
         self.conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_companies_name_addr ON companies(company_name, address);"
@@ -201,6 +208,24 @@ class DatabaseManager:
             "CREATE INDEX IF NOT EXISTS idx_companies_corporate_number_norm ON companies(corporate_number_norm);"
         )
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_companies_hubspot_id ON companies(hubspot_id);")
+
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS url_flags (
+                normalized_value TEXT PRIMARY KEY,
+                scope TEXT NOT NULL,
+                is_official INTEGER NOT NULL,
+                host TEXT,
+                judge_source TEXT,
+                reason TEXT,
+                confidence REAL,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_url_flags_scope_host ON url_flags(scope, host)"
+        )
 
         self._commit_with_checkpoint()
 
@@ -241,6 +266,73 @@ class DatabaseManager:
                     if kw.lower() in low:
                         return False
         return True
+
+    @staticmethod
+    def _normalize_flag_target(url: str) -> tuple[str, str]:
+        if not url:
+            return "", ""
+        try:
+            parsed = urllib.parse.urlparse(url.strip())
+        except Exception:
+            return "", ""
+        host = (parsed.netloc or "").lower()
+        if not host:
+            return "", ""
+        scheme = parsed.scheme or "https"
+        path = parsed.path or "/"
+        normalized_path = path if path == "/" else path.rstrip("/")
+        normalized_url = urllib.parse.urlunparse((scheme, host, normalized_path or "/", "", "", ""))
+        return normalized_url, host
+
+    def get_url_flag(self, url: str) -> Optional[Dict[str, Any]]:
+        normalized_url, host = self._normalize_flag_target(url)
+        if not host:
+            return None
+        row = self.conn.execute(
+            "SELECT normalized_value, scope, is_official, judge_source, reason, confidence FROM url_flags WHERE scope='url' AND normalized_value=?",
+            (normalized_url,)
+        ).fetchone()
+        if row:
+            return dict(row)
+        row = self.conn.execute(
+            "SELECT normalized_value, scope, is_official, judge_source, reason, confidence FROM url_flags WHERE scope='host' AND normalized_value=?",
+            (host,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def upsert_url_flag(
+        self,
+        url: str,
+        *,
+        is_official: bool,
+        source: str,
+        reason: str = "",
+        confidence: Optional[float] = None,
+        scope: str = "url",
+    ) -> None:
+        normalized_url, host = self._normalize_flag_target(url)
+        if not host:
+            return
+        scope_value = scope if scope in {"url", "host"} else "url"
+        normalized_value = host if scope_value == "host" else normalized_url
+        if not normalized_value:
+            return
+        self.conn.execute(
+            """
+            INSERT INTO url_flags (normalized_value, scope, is_official, host, judge_source, reason, confidence, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(normalized_value) DO UPDATE SET
+                scope=excluded.scope,
+                is_official=excluded.is_official,
+                host=excluded.host,
+                judge_source=excluded.judge_source,
+                reason=excluded.reason,
+                confidence=excluded.confidence,
+                updated_at=datetime('now')
+            """,
+            (normalized_value, scope_value, int(bool(is_official)), host, source, reason or "", confidence),
+        )
+        self._commit_with_checkpoint()
 
     # ---------- 並列安全な1件確保 ----------
     def claim_next_company(self, worker_id: str) -> Optional[Dict[str, Any]]:
@@ -367,6 +459,9 @@ class DatabaseManager:
         set_value("accuracy_homepage", company.get("accuracy_homepage", "") or "")
         set_value("accuracy_phone", company.get("accuracy_phone", "") or "")
         set_value("accuracy_address", company.get("accuracy_address", "") or "")
+        set_value("homepage_official_flag", company.get("homepage_official_flag"))
+        set_value("homepage_official_source", company.get("homepage_official_source", "") or "")
+        set_value("homepage_official_score", company.get("homepage_official_score"))
 
         if "last_checked_at" in cols:
             updates.append("last_checked_at = datetime('now')")

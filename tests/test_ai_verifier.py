@@ -68,3 +68,17 @@ def test_normalize_amount_formats_and_converts():
     assert _normalize_amount("6億6,700万円") == "667,000,000円"
     assert _normalize_amount("▲3百万円") == "▲3,000,000円"
     assert _normalize_amount("401,000千円") == "401,000,000円"
+
+
+@pytest.mark.asyncio
+async def test_judge_official_homepage_parses_json():
+    fake_json = {
+        "is_official": True,
+        "confidence": 0.85,
+        "reason": "ドメイン一致",
+    }
+    verifier = AIVerifier(model=DummyModel(fake_json))
+    result = await verifier.judge_official_homepage("text", b"", "Example", "Tokyo", "https://example.com")
+    assert result is not None
+    assert result["is_official"] is True
+    assert abs(result["confidence"] - 0.85) < 1e-6

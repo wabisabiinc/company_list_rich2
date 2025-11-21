@@ -100,3 +100,20 @@ def test_save_company_data_updates_row_and_writes_csv(db_manager: DatabaseManage
     with open(csv_path, newline="", encoding="utf-8-sig") as f:
         reader = list(csv.DictReader(f))
         assert len(reader) == 1  # CSVには再度書き込まれないことを確認
+
+
+def test_url_flag_roundtrip(db_manager: DatabaseManager):
+    db_manager.upsert_url_flag("https://example.com/company", is_official=True, source="ai")
+    flag = db_manager.get_url_flag("https://example.com/company")
+    assert flag is not None
+    assert flag["is_official"] == 1
+
+    db_manager.upsert_url_flag(
+        "https://block.example.com/page",
+        is_official=False,
+        source="rule",
+        scope="host",
+    )
+    host_flag = db_manager.get_url_flag("https://block.example.com/another")
+    assert host_flag is not None
+    assert host_flag["is_official"] == 0

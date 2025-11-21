@@ -6,6 +6,7 @@ import logging
 import re
 import random
 from difflib import SequenceMatcher
+from typing import Any
 from dotenv import load_dotenv
 
 from src.database_manager import DatabaseManager
@@ -302,20 +303,146 @@ async def process():
                 homepage = ""
                 info = None
                 primary_cands: dict[str, list[str]] = {}
-                fallback_cands: list[dict[str, list[str]]] = []
+                fallback_cands: list[tuple[str, dict[str, list[str]]]] = []
+                homepage_official_flag = 0
+                homepage_official_source = ""
+                homepage_official_score = 0.0
 
+                candidate_records: list[dict[str, Any]] = []
                 for candidate in urls:
+                    normalized_candidate = scraper.normalize_homepage_url(candidate)
+                    url_for_flag = normalized_candidate or candidate
+                    try:
+                        flag_info = manager.get_url_flag(url_for_flag)
+                    except Exception:
+                        flag_info = None
+                    if flag_info and not flag_info.get("is_official"):
+                        log.info("[%s] 既知の非公式URLを除外: %s", cid, candidate)
+                        continue
                     candidate_info = await scraper.get_page_info(candidate)
                     candidate_text = candidate_info.get("text", "") or ""
                     candidate_html = candidate_info.get("html") or ""
                     extracted = scraper.extract_candidates(candidate_text, candidate_html)
-                    if scraper.is_likely_official_site(name, candidate, candidate_info, addr, extracted):
-                        homepage = scraper.normalize_homepage_url(candidate, candidate_info)
-                        info = candidate_info
+                    rule_details = scraper.is_likely_official_site(
+                        name, candidate, candidate_info, addr, extracted, return_details=True
+                    )
+                    if not isinstance(rule_details, dict):
+                        rule_details = {"is_official": bool(rule_details), "score": 0.0}
+                    candidate_records.append({
+                        "url": candidate,
+                        "normalized_url": url_for_flag,
+                        "info": candidate_info,
+                        "extracted": extracted,
+                        "rule": rule_details,
+                        "flag_info": flag_info,
+                    })
+
+                ai_official_attempted = False
+                if USE_AI and verifier is not None and hasattr(verifier, "judge_official_homepage"):
+                    for record in candidate_records[:3]:
+                        preflag = record.get("flag_info")
+                        if preflag and preflag.get("is_official"):
+                            continue
+                        info_payload = record.get("info") or {}
+                        try:
+                            ai_verdict = await verifier.judge_official_homepage(
+                                info_payload.get("text", "") or "",
+                                info_payload.get("screenshot"),
+                                name,
+                                addr,
+                                record.get("normalized_url") or record.get("url"),
+                            )
+                        except Exception:
+                            log.warning("[%s] AI公式判定失敗: %s", cid, record.get("url"), exc_info=True)
+                            ai_verdict = None
+                        if ai_verdict:
+                            record["ai_judge"] = ai_verdict
+                            ai_official_attempted = True
+                        if ai_official_attempted and AI_COOLDOWN_SEC > 0:
+                            await asyncio.sleep(jittered_seconds(AI_COOLDOWN_SEC, JITTER_RATIO))
+
+                for record in candidate_records:
+                    normalized_url = record.get("normalized_url") or record.get("url")
+                    extracted = record.get("extracted") or {}
+                    rule_details = record.get("rule") or {}
+                    ai_judge = record.get("ai_judge")
+                    flag_info = record.get("flag_info")
+                    if ai_judge:
+                        if ai_judge.get("is_official") is False:
+                            manager.upsert_url_flag(
+                                normalized_url,
+                                is_official=False,
+                                source="ai",
+                                reason=ai_judge.get("reason", ""),
+                                confidence=ai_judge.get("confidence"),
+                            )
+                            fallback_cands.append((record.get("url"), extracted))
+                            log.info("[%s] AIが非公式判定: %s", cid, record.get("url"))
+                            continue
+                        if ai_judge.get("is_official") is True:
+                            homepage = normalized_url
+                            info = record.get("info")
+                            primary_cands = extracted
+                            homepage_official_flag = 1
+                            homepage_official_source = "ai"
+                            homepage_official_score = float(rule_details.get("score") or 0.0)
+                            manager.upsert_url_flag(
+                                normalized_url,
+                                is_official=True,
+                                source="ai",
+                                reason=ai_judge.get("reason", ""),
+                                confidence=ai_judge.get("confidence"),
+                            )
+                            break
+                    if flag_info and flag_info.get("is_official"):
+                        homepage = normalized_url
+                        info = record.get("info")
                         primary_cands = extracted
+                        homepage_official_flag = 1
+                        homepage_official_source = flag_info.get("judge_source") or "cache"
+                        homepage_official_score = float(rule_details.get("score") or 0.0)
                         break
-                    fallback_cands.append((candidate, extracted))
-                    log.info("[%s] 非公式と判断: %s", cid, candidate)
+                    if rule_details.get("is_official"):
+                        homepage = normalized_url
+                        info = record.get("info")
+                        primary_cands = extracted
+                        homepage_official_flag = 1
+                        homepage_official_source = "rule"
+                        homepage_official_score = float(rule_details.get("score") or 0.0)
+                        manager.upsert_url_flag(
+                            normalized_url,
+                            is_official=True,
+                            source="rule",
+                            reason=f"score={rule_details.get('score', 0.0):.1f}",
+                        )
+                        break
+                    score_val = float(rule_details.get("score") or 0.0)
+                    if score_val <= 1 and not rule_details.get("strong_domain"):
+                        manager.upsert_url_flag(
+                            normalized_url,
+                            is_official=False,
+                            source="rule",
+                            reason=f"score={score_val:.1f}",
+                        )
+                    fallback_cands.append((record.get("url"), extracted))
+                    log.info("[%s] 非公式と判断: %s", cid, record.get("url"))
+
+                priority_docs: dict[str, dict[str, Any]] = {}
+                try:
+                    profile_urls = await scraper.search_company_info_pages(name, addr, max_results=3)
+                except Exception:
+                    profile_urls = []
+                for profile_url in profile_urls:
+                    if homepage and profile_url == homepage:
+                        continue
+                    try:
+                        profile_info = await scraper.get_page_info(profile_url)
+                    except Exception:
+                        continue
+                    priority_docs[profile_url] = {
+                        "text": profile_info.get("text", "") or "",
+                        "html": profile_info.get("html", "") or "",
+                    }
 
                 phone = ""
                 found_address = ""
@@ -350,6 +477,9 @@ async def process():
                 need_fiscal = not bool(fiscal_val)
                 need_founded = not bool(founded_val)
                 need_description = not bool(description_val)
+                rule_phone = None
+                rule_address = None
+                rule_rep = None
 
                 if homepage and info:
                     info_url = info.get("url") or homepage
@@ -400,52 +530,54 @@ async def process():
                             need_listing, need_capital, need_revenue,
                             need_profit, need_fiscal, need_founded, need_description,
                         ]) else 4
-                        priority_docs = await scraper.fetch_priority_documents(
+                        site_docs = await scraper.fetch_priority_documents(
                             homepage, info.get("html", ""), max_links=priority_limit
                         )
                     except Exception:
-                        priority_docs = {}
+                        site_docs = {}
+                    for url, pdata in site_docs.items():
+                        priority_docs[url] = pdata
 
-                    for url, pdata in priority_docs.items():
-                        cc = scraper.extract_candidates(pdata.get("text", ""), pdata.get("html", ""))
-                        if not rule_phone and cc.get("phone_numbers"):
-                            cand = normalize_phone(cc["phone_numbers"][0])
-                            if cand:
-                                rule_phone = cand
-                                src_phone = url
-                        if not rule_address and cc.get("addresses"):
-                            cand_addr = pick_best_address(addr, cc["addresses"])
-                            if cand_addr:
-                                rule_address = cand_addr
-                                src_addr = url
-                        if not rule_rep and cc.get("rep_names"):
-                            cand_rep = scraper.clean_rep_name(cc["rep_names"][0])
-                            if cand_rep:
-                                rule_rep = cand_rep
-                                src_rep = url
-                        if not listing_val and cc.get("listings"):
-                            listing_val = (cc["listings"][0] or "").strip()
-                            need_listing = not bool(listing_val)
-                        if not capital_val and cc.get("capitals"):
-                            capital_val = (cc["capitals"][0] or "").strip()
-                            need_capital = not bool(capital_val)
-                        if not revenue_val and cc.get("revenues"):
-                            revenue_val = (cc["revenues"][0] or "").strip()
-                            need_revenue = not bool(revenue_val)
-                        if not profit_val and cc.get("profits"):
-                            profit_val = (cc["profits"][0] or "").strip()
-                            need_profit = not bool(profit_val)
-                        if not fiscal_val and cc.get("fiscal_months"):
-                            fiscal_val = clean_fiscal_month(cc["fiscal_months"][0])
-                            need_fiscal = not bool(fiscal_val)
-                        if not founded_val and cc.get("founded_years"):
-                            founded_val = (cc["founded_years"][0] or "").strip()
-                            need_founded = not bool(founded_val)
-                        if need_description and not description_val:
-                            snippet = extract_description_snippet(pdata.get("text", ""))
-                            if snippet:
-                                description_val = snippet
-                                need_description = False
+                for url, pdata in priority_docs.items():
+                    cc = scraper.extract_candidates(pdata.get("text", ""), pdata.get("html", ""))
+                    if not rule_phone and cc.get("phone_numbers"):
+                        cand = normalize_phone(cc["phone_numbers"][0])
+                        if cand:
+                            rule_phone = cand
+                            src_phone = url
+                    if not rule_address and cc.get("addresses"):
+                        cand_addr = pick_best_address(addr, cc["addresses"])
+                        if cand_addr:
+                            rule_address = cand_addr
+                            src_addr = url
+                    if not rule_rep and cc.get("rep_names"):
+                        cand_rep = scraper.clean_rep_name(cc["rep_names"][0])
+                        if cand_rep:
+                            rule_rep = cand_rep
+                            src_rep = url
+                    if not listing_val and cc.get("listings"):
+                        listing_val = (cc["listings"][0] or "").strip()
+                        need_listing = not bool(listing_val)
+                    if not capital_val and cc.get("capitals"):
+                        capital_val = (cc["capitals"][0] or "").strip()
+                        need_capital = not bool(capital_val)
+                    if not revenue_val and cc.get("revenues"):
+                        revenue_val = (cc["revenues"][0] or "").strip()
+                        need_revenue = not bool(revenue_val)
+                    if not profit_val and cc.get("profits"):
+                        profit_val = (cc["profits"][0] or "").strip()
+                        need_profit = not bool(profit_val)
+                    if not fiscal_val and cc.get("fiscal_months"):
+                        fiscal_val = clean_fiscal_month(cc["fiscal_months"][0])
+                        need_fiscal = not bool(fiscal_val)
+                    if not founded_val and cc.get("founded_years"):
+                        founded_val = (cc["founded_years"][0] or "").strip()
+                        need_founded = not bool(founded_val)
+                    if need_description and not description_val:
+                        snippet = extract_description_snippet(pdata.get("text", ""))
+                        if snippet:
+                            description_val = snippet
+                            need_description = False
 
                     ai_result = None
                     ai_attempted = False
@@ -834,6 +966,9 @@ async def process():
                     "source_url_phone": src_phone,
                     "source_url_address": src_addr,
                     "source_url_rep": src_rep,
+                    "homepage_official_flag": homepage_official_flag,
+                    "homepage_official_source": homepage_official_source,
+                    "homepage_official_score": homepage_official_score,
                 })
 
                 if REFERENCE_CHECKER:
