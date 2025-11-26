@@ -66,6 +66,15 @@ PREFECTURE_NAMES = [
     "徳島県", "香川県", "愛媛県", "高知県",
     "福岡県", "佐賀県", "長崎県", "熊本県", "大分県", "宮崎県", "鹿児島県", "沖縄県",
 ]
+PROFILE_SEARCH_KEYWORDS = (
+    "公式サイト", "公式", "会社概要", "企業情報", "法人概要", "会社案内", "企業概要",
+    "profile", "about", "corporate"
+)
+INFO_PAGE_KEYWORDS = (
+    "会社概要", "企業情報", "法人概要", "会社案内", "会社紹介", "団体概要",
+    "施設案内", "profile", "about", "corporate"
+)
+
 REP_NAME_EXACT_BLOCKLIST = {
     "ブログ", "blog", "Blog", "BLOG",
     "ニュース", "News", "news",
@@ -82,7 +91,8 @@ REP_NAME_EXACT_BLOCKLIST = {
     "スタッフ紹介", "スタッフ",
     "メニュー", "Menu", "menu",
     "トップページ", "Home", "home", "ホーム",
-    "沿革", "法人紹介", "会社紹介"
+    "沿革", "法人紹介", "会社紹介",
+    "所属",
 }
 REP_NAME_SUBSTR_BLOCKLIST = (
     "ブログ", "news", "お知らせ", "採用", "求人", "recruit",
@@ -112,6 +122,7 @@ ADDR_HINT = re.compile(r"(都|道|府|県).+?(市|区|郡|町|村)")
 ADDR_FALLBACK_RE = re.compile(
     r"(〒\d{3}-\d{4}[^。\n]*|[一-龥]{2,3}[都道府県][^。\n]{0,120}[市区町村郡][^。\n]{0,140})"
 )
+CITY_RE = re.compile(r"([一-龥]{2,6}(?:市|区|町|村|郡))")
 REP_RE = re.compile(
     r"(?:代表者|代表取締役|理事長|学長|会長|社長)"
     r"\s*[:：]?\s*([^\n\r<>\|（）\(\)]{1,40})"
@@ -186,6 +197,9 @@ class CompanyScraper:
         "mynavi.jp", "tenshoku.mynavi.jp", "rikunabi.jp", "indeed.com", "doda.jp",
         "en-japan.com", "type.jp", "careerconnection.jp", "find-job.net",
         "jobstreet.jp",
+        # 企業データベース系
+        "info.gbiz.go.jp", "gbiz.go.jp", "salesnow.jp", "baseconnect.in",
+        "r-compass.jp", "coki.jp",
     ]
 
     PRIORITY_PATHS = [
@@ -218,6 +232,12 @@ class CompanyScraper:
         "note.jp",
         "note.mu",
         "buffett-code.com",
+        "info.gbiz.go.jp",
+        "gbiz.go.jp",
+        "salesnow.jp",
+        "baseconnect.in",
+        "r-compass.jp",
+        "coki.jp",
     }
 
     SUSPECT_HOSTS = {
@@ -414,14 +434,14 @@ class CompanyScraper:
     def clean_rep_name(raw: Optional[str]) -> Optional[str]:
         if not raw:
             return None
-        text = str(raw).strip()
+        text = str(raw).replace("\u200b", "").strip()
         if not text:
             return None
         # remove parentheses content
         text = re.sub(r"[（(][^）)]*[）)]", "", text)
         # keep only segment before punctuation/newline
         text = re.split(r"[、。\n/|｜,;；]", text)[0]
-        text = text.strip(" 　:：-‐―－ー")
+        text = text.strip(" 　:：-‐―－ー'\"")
         titles = (
             "代表取締役社長", "代表取締役副社長", "代表取締役会長", "代表取締役",
             "代表社員", "代表理事", "代表理事長", "代表執行役", "代表執行役社長",
@@ -482,6 +502,51 @@ class CompanyScraper:
         if not re.search(r"[一-龥ぁ-んァ-ン]", text):
             return None
         return text
+
+    def _build_company_queries(self, company_name: str, address: Optional[str]) -> List[str]:
+        base_name = (company_name or "").strip()
+        if not base_name:
+            return []
+        pref = self._extract_prefecture(address or "")
+        city = self._extract_city(address or "")
+        variants = [base_name]
+        stripped = base_name.replace("株式会社", "").replace("有限会社", "").strip()
+        if stripped and stripped not in variants:
+            variants.append(stripped)
+
+        queries: List[str] = []
+
+        def add_query(text: str) -> None:
+            normalized = re.sub(r"\s+", " ", text).strip()
+            if normalized and normalized not in queries:
+                queries.append(normalized)
+
+        for variant in variants:
+            add_query(f"{variant} 公式サイト 会社")
+            add_query(variant)
+            add_query(f"{variant} 公式サイト")
+            for keyword in PROFILE_SEARCH_KEYWORDS:
+                add_query(f"{variant} {keyword}")
+            if pref:
+                add_query(f"{variant} {pref} 会社")
+                add_query(f"{variant} {pref} 会社概要")
+            if city:
+                add_query(f"{variant} {city} 会社")
+            add_query(f"{variant} 連絡先")
+            add_query(f"{variant} site:.jp")
+            add_query(f"{variant} site:.go.jp")
+            add_query(f"{variant} site:.or.jp")
+            add_query(f"{variant} site:.co.jp")
+
+        if address:
+            addr_tokens = address.strip().split()
+            if addr_tokens:
+                addr_hint = addr_tokens[0]
+                if addr_hint:
+                    add_query(f"{base_name} {addr_hint}")
+
+        max_queries = 20
+        return queries[:max_queries]
 
     @staticmethod
     def _domain_tokens(url: str) -> List[str]:
@@ -546,11 +611,45 @@ class CompanyScraper:
             href = urljoin("https://duckduckgo.com", href)
         return href
 
+    def _is_ddg_challenge(self, html: str) -> bool:
+        if not html:
+            return False
+        lowered = html.lower()
+        return (
+            "anomaly-modal__title" in lowered
+            or "duckduckgo.com/anomaly.js" in lowered
+            or "select all squares containing a duck" in lowered
+            or "bots use duckduckgo too" in lowered
+        )
+
+    def _fetch_duckduckgo_via_proxy(self, query: str) -> str:
+        try:
+            proxy_url = "https://r.jina.ai/https://duckduckgo.com/html/"
+            resp = requests.get(
+                proxy_url,
+                params={"q": query, "kl": "jp-jp"},
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=(5, 30),
+            )
+            resp.raise_for_status()
+            return resp.text
+        except Exception:
+            return ""
+
     def _extract_search_urls(self, html: str) -> Iterable[str]:
         soup = BeautifulSoup(html, "html.parser")
         anchors = soup.select("a.result__a")
-        for a in anchors:
-            cleaned = self._clean_candidate_url(a.get("href"))
+        if anchors:
+            for a in anchors:
+                cleaned = self._clean_candidate_url(a.get("href"))
+                if not cleaned or self._is_excluded(cleaned):
+                    continue
+                yield cleaned
+            return
+
+        # Proxy経由のレスポンスはMarkdown/テキスト形式なので手動抽出する
+        for match in re.findall(r"https://duckduckgo\.com/l/\?uddg=[^\s)]+", html or ""):
+            cleaned = self._clean_candidate_url(match)
             if not cleaned or self._is_excluded(cleaned):
                 continue
             yield cleaned
@@ -561,10 +660,27 @@ class CompanyScraper:
             href = block.get("href")
             if not href:
                 continue
+            href = href.strip()
             if href.startswith("//"):
                 href = "https:" + href
             elif href.startswith("/"):
                 href = urllib.parse.urljoin("https://www.bing.com", href)
+            if "bing.com/ck/a" in href.lower():
+                try:
+                    parsed = urllib.parse.urlparse(href)
+                    qs = urllib.parse.parse_qs(parsed.query or "")
+                    if "u" in qs and qs["u"]:
+                        decoded = urllib.parse.unquote(qs["u"][0])
+                        if decoded.startswith("a1") and len(decoded) > 2:
+                            import base64
+                            try:
+                                decoded = base64.urlsafe_b64decode(decoded[2:] + "=" * (-len(decoded[2:]) % 4)).decode("utf-8")
+                            except Exception:
+                                decoded = decoded[2:]
+                        if decoded:
+                            href = decoded
+                except Exception:
+                    pass
             if not href or self._is_excluded(href):
                 continue
             yield href
@@ -587,10 +703,17 @@ class CompanyScraper:
                     await asyncio.sleep(0.8 * (2 ** attempt))
                     continue
                 resp.raise_for_status()
-                return resp.text
+                text = resp.text
+                if self._is_ddg_challenge(text):
+                    proxy_html = self._fetch_duckduckgo_via_proxy(query)
+                    if proxy_html:
+                        return proxy_html
+                    await asyncio.sleep(0.8 * (2 ** attempt))
+                    continue
+                return text
             except Exception:
                 if attempt == 2:
-                    return ""
+                    return self._fetch_duckduckgo_via_proxy(query)
                 await asyncio.sleep(0.8 * (2 ** attempt))
         return ""
 
@@ -652,17 +775,42 @@ class CompanyScraper:
         page_info: Optional[Dict[str, Any]] = None,
         expected_address: Optional[str] = None,
         extracted: Optional[Dict[str, List[str]]] = None,
-    ) -> bool:
+        *,
+        return_details: bool = False,
+    ) -> bool | Dict[str, Any]:
+        def finalize(
+            is_official: bool,
+            *,
+            score: float = 0.0,
+            name_present: bool = False,
+            strong_domain: bool = False,
+            address_match: bool = False,
+            domain_score: int = 0,
+            host_value: str = "",
+            blocked_host: bool = False,
+        ) -> bool | Dict[str, Any]:
+            payload = {
+                "is_official": is_official,
+                "score": score,
+                "name_present": name_present,
+                "strong_domain": strong_domain,
+                "address_match": address_match,
+                "domain_score": domain_score,
+                "host": host_value,
+                "blocked_host": blocked_host,
+            }
+            return payload if return_details else payload["is_official"]
+
         try:
             parsed = urllib.parse.urlparse(url)
         except Exception:
-            return False
+            return finalize(False)
         host = (parsed.netloc or "").lower().split(":")[0]
         if not host:
-            return False
+            return finalize(False)
         is_google_sites = host == "sites.google.com"
         if not is_google_sites and any(host == domain or host.endswith(f".{domain}") for domain in self.HARD_EXCLUDE_HOSTS):
-            return False
+            return finalize(False, host_value=host, blocked_host=True)
 
         score = 0
         if any(host == domain or host.endswith(f".{domain}") for domain in self.SUSPECT_HOSTS):
@@ -716,6 +864,7 @@ class CompanyScraper:
         if any(kw in host for kw in self.NON_OFFICIAL_KEYWORDS):
             score -= 3
 
+        address_hit = False
         if expected_address:
             candidate_addrs: List[str] = []
             if extracted and extracted.get("addresses"):
@@ -725,13 +874,23 @@ class CompanyScraper:
             for cand in candidate_addrs:
                 if self._address_matches(expected_address, cand):
                     score += 5
+                    address_hit = True
                     break
 
         name_present = bool(norm_name and norm_name in combined) or any(tok in host for tok in company_tokens)
         strong_domain = domain_match_score >= 4
         if not (name_present or strong_domain):
-            return False
-        return score >= 4
+            return finalize(False, score=score, name_present=name_present, strong_domain=strong_domain, address_match=address_hit, domain_score=domain_match_score, host_value=host)
+        result = score >= 4
+        return finalize(
+            result,
+            score=score,
+            name_present=name_present,
+            strong_domain=strong_domain,
+            address_match=address_hit,
+            domain_score=domain_match_score,
+            host_value=host,
+        )
 
     @staticmethod
     def normalize_homepage_url(url: str, page_info: Optional[Dict[str, Any]] = None) -> str:
@@ -924,6 +1083,13 @@ class CompanyScraper:
         return ""
 
     @staticmethod
+    def _extract_city(address: str | None) -> str:
+        if not address:
+            return ""
+        match = CITY_RE.search(address)
+        return match.group(1) if match else ""
+
+    @staticmethod
     def _address_matches(expected: str, candidate: str) -> bool:
         if not expected or not candidate:
             return False
@@ -1025,25 +1191,7 @@ class CompanyScraper:
         """
         DuckDuckGoで検索し、候補URLを返す（「公式サイト」クエリを優先）。
         """
-        base_name = (company_name or "").strip()
-        base_address = (address or "").strip()
-        prefecture = self._extract_prefecture(base_address)
-        queries: List[str] = []
-        if base_name:
-            # 公式検索前に会社名+都道府県+「会社」で絞り込む
-            base_query = f"{base_name} {prefecture} 会社".strip() if prefecture else f"{base_name} 会社"
-            queries.append(base_query)
-            queries.append(f"{base_name} 公式サイト")
-        if base_name and base_address:
-            q_addr = f"{base_name} {base_address}".strip()
-            if q_addr and q_addr not in queries:
-                queries.append(q_addr)
-        if base_name and prefecture:
-            pref_query = f"{base_name} {prefecture}".strip()
-            if pref_query and pref_query not in queries:
-                queries.append(pref_query)
-        if base_name and base_name not in queries:
-            queries.append(base_name)
+        queries = self._build_company_queries(company_name, address)
         if not queries:
             return []
 
@@ -1072,7 +1220,7 @@ class CompanyScraper:
                         break
                 if len(candidates) >= max_candidates:
                     break
-            if provider_hit and len(candidates) >= num_results:
+            if len(candidates) >= max_candidates:
                 break
 
         if not candidates:
@@ -1096,6 +1244,87 @@ class CompanyScraper:
         for _, _, _, url in scored:
             ordered.append(url)
         return ordered[:num_results]
+
+    async def search_company_info_pages(self, company_name: str, address: str, max_results: int = 3) -> List[str]:
+        """
+        会社概要ページを優先してDuckDuckGoから取得する。
+        """
+        base_name = (company_name or "").strip()
+        if not base_name:
+            return []
+        pref = self._extract_prefecture(address or "")
+        city = self._extract_city(address or "")
+        queries: List[str] = []
+
+        def add_query(text: str) -> None:
+            normalized = re.sub(r"\s+", " ", text).strip()
+            if normalized and normalized not in queries:
+                queries.append(normalized)
+
+        for keyword in INFO_PAGE_KEYWORDS:
+            add_query(f"{base_name} {keyword}")
+            if pref:
+                add_query(f"{base_name} {pref} {keyword}")
+            if city:
+                add_query(f"{base_name} {city} {keyword}")
+
+        if not queries:
+            return []
+
+        candidates: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        max_candidates = max(max_results * 4, 12)
+
+        for q_idx, query in enumerate(queries):
+            html = await self._fetch_duckduckgo(query)
+            if not html:
+                continue
+            for rank, url in enumerate(self._extract_search_urls(html)):
+                if url in seen or self._is_excluded(url):
+                    continue
+                seen.add(url)
+                try:
+                    host = urllib.parse.urlparse(url).netloc.lower()
+                except Exception:
+                    continue
+                if any(host == domain or host.endswith(f".{domain}") for domain in self.HARD_EXCLUDE_HOSTS):
+                    continue
+                path_priority = self._path_priority_value(url)
+                keyword_bonus = 2 if any(kw in url.lower() for kw in ("about", "profile", "company", "overview", "gaiyou", "kaisya")) else 0
+                if path_priority <= 0 and keyword_bonus == 0:
+                    continue
+                candidates.append(
+                    {
+                        "url": url,
+                        "query_idx": q_idx,
+                        "rank": rank,
+                        "score": path_priority * 2 + keyword_bonus,
+                    }
+                )
+                if len(candidates) >= max_candidates:
+                    break
+            if len(candidates) >= max_candidates:
+                break
+
+        if not candidates:
+            return []
+
+        tokens = self._company_tokens(company_name)
+        scored: List[tuple[int, int, int, str]] = []
+        for item in candidates:
+            url = item["url"]
+            score = self._domain_score(tokens, url) + item["score"]
+            score += max(0, 4 - item["rank"])
+            if item["query_idx"] == 0:
+                score += 2
+            scored.append((score, item["query_idx"], item["rank"], url))
+        scored.sort(key=lambda x: (-x[0], x[1], x[2], x[3]))
+        ordered: List[str] = []
+        for _, _, _, url in scored:
+            ordered.append(url)
+            if len(ordered) >= max_results:
+                break
+        return ordered
 
     # ===== ページ取得（ブラウザ再利用＋軽いリトライ） =====
     async def get_page_info(self, url: str, timeout: int = 25000) -> Dict[str, Any]:
@@ -1440,6 +1669,56 @@ class CompanyScraper:
                         value = dd.get_text(separator=" ", strip=True)
                         if label and value:
                             pair_values.append((label, value))
+
+                sequential_texts: List[str] = []
+                try:
+                    for block in soup.find_all(["p", "li", "span", "div"]):
+                        text = block.get_text(separator=" ", strip=True)
+                        text = text.replace("\u200b", "")
+                        text = re.sub(r"\s+", " ", text)
+                        if text:
+                            sequential_texts.append(text)
+                except Exception:
+                    sequential_texts = []
+
+                def _looks_like_label(text: str) -> tuple[bool, str]:
+                    if not text:
+                        return False, ""
+                    cleaned = text.replace("\u200b", "").strip()
+                    if cleaned.startswith("・"):
+                        cleaned = cleaned.lstrip("・").strip()
+                    cleaned = cleaned.rstrip(":：").strip()
+                    if not cleaned or len(cleaned) > 20:
+                        return False, ""
+                    for keywords in TABLE_LABEL_MAP.values():
+                        if any(
+                            cleaned == kw
+                            or cleaned.startswith(kw)
+                            or kw in cleaned
+                            for kw in keywords
+                        ):
+                            return True, cleaned
+                    return False, ""
+
+                for idx in range(len(sequential_texts) - 1):
+                    is_label, normalized = _looks_like_label(sequential_texts[idx])
+                    if not is_label:
+                        continue
+                    value_text = ""
+                    for j in range(idx + 1, len(sequential_texts)):
+                        candidate = sequential_texts[j].replace("\u200b", "").strip()
+                        if not candidate:
+                            continue
+                        if candidate.startswith("・"):
+                            continue
+                        looks_like_next, _ = _looks_like_label(candidate)
+                        if looks_like_next:
+                            break
+                        value_text = candidate
+                        break
+                    if not value_text or len(value_text) > 120:
+                        continue
+                    pair_values.append((normalized, value_text))
 
                 for label, value in pair_values:
                     norm_label = label.replace("：", ":").strip()

@@ -299,7 +299,7 @@ async def process():
             log.info("[%s] %s の処理開始 (worker=%s)", cid, name, WORKER_ID)
 
             try:
-                urls = await scraper.search_company(name, addr, num_results=5)
+                urls = await scraper.search_company(name, addr, num_results=10)
                 homepage = ""
                 info = None
                 primary_cands: dict[str, list[str]] = {}
@@ -367,6 +367,17 @@ async def process():
                     rule_details = record.get("rule") or {}
                     ai_judge = record.get("ai_judge")
                     flag_info = record.get("flag_info")
+                    if rule_details.get("blocked_host"):
+                        manager.upsert_url_flag(
+                            normalized_url,
+                            is_official=False,
+                            source="rule",
+                            reason=f"blocked_host:{rule_details.get('host', '')}",
+                            scope="host",
+                        )
+                        fallback_cands.append((record.get("url"), extracted))
+                        log.info("[%s] 除外ホスト(%s)をスキップ: %s", cid, rule_details.get("host"), record.get("url"))
+                        continue
                     if ai_judge:
                         if ai_judge.get("is_official") is False:
                             manager.upsert_url_flag(
@@ -481,8 +492,9 @@ async def process():
                 rule_address = None
                 rule_rep = None
 
-                if homepage and info:
-                    info_url = info.get("url") or homepage
+                if homepage:
+                    info_dict = info or {}
+                    info_url = info_dict.get("url") or homepage
                     cands = primary_cands or {}
                     phones = cands.get("phone_numbers") or []
                     addrs = cands.get("addresses") or []
@@ -531,7 +543,7 @@ async def process():
                             need_profit, need_fiscal, need_founded, need_description,
                         ]) else 4
                         site_docs = await scraper.fetch_priority_documents(
-                            homepage, info.get("html", ""), max_links=priority_limit
+                            homepage, info_dict.get("html", ""), max_links=priority_limit
                         )
                     except Exception:
                         site_docs = {}
@@ -604,7 +616,7 @@ async def process():
                         ai_attempted = True
                         try:
                             ai_result = await verifier.verify_info(
-                                info.get("text", "") or "", info.get("screenshot"),
+                                info_dict.get("text", "") or "", info_dict.get("screenshot"),
                                 name, addr
                             )
                         except Exception:
