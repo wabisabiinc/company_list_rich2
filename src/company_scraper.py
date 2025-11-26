@@ -67,7 +67,7 @@ PREFECTURE_NAMES = [
     "福岡県", "佐賀県", "長崎県", "熊本県", "大分県", "宮崎県", "鹿児島県", "沖縄県",
 ]
 PROFILE_SEARCH_KEYWORDS = (
-    "公式サイト", "公式", "会社概要", "企業情報", "法人概要", "会社案内", "企業概要",
+    "公式サイト", "会社概要", "企業情報", "法人概要", "会社案内", "企業概要",
     "profile", "about", "corporate"
 )
 INFO_PAGE_KEYWORDS = (
@@ -200,6 +200,9 @@ class CompanyScraper:
         # 企業データベース系
         "info.gbiz.go.jp", "gbiz.go.jp", "salesnow.jp", "baseconnect.in",
         "r-compass.jp", "coki.jp",
+        # 海外系まとめ/掲示板
+        "zhihu.com", "baidu.com", "tieba.baidu.com", "sogou.com", "sohu.com",
+        "weibo.com", "bilibili.com", "douban.com", "toutiao.com", "qq.com",
     ]
 
     PRIORITY_PATHS = [
@@ -238,6 +241,16 @@ class CompanyScraper:
         "baseconnect.in",
         "r-compass.jp",
         "coki.jp",
+        "zhihu.com",
+        "baidu.com",
+        "tieba.baidu.com",
+        "sogou.com",
+        "sohu.com",
+        "weibo.com",
+        "bilibili.com",
+        "douban.com",
+        "toutiao.com",
+        "qq.com",
     }
 
     SUSPECT_HOSTS = {
@@ -245,6 +258,31 @@ class CompanyScraper:
         "ameblo.jp",
         "blog.jp",
         "ja-jp.facebook.com",
+    }
+
+    GOV_ENTITY_KEYWORDS = (
+        "県", "府", "都", "道", "市", "区", "町", "村", "庁", "役所",
+        "議会", "連合", "連絡協議会", "消防", "警察", "公共", "振興局",
+        "上下水道", "教育委員会", "広域", "公社", "公団", "自治体", "道路公社",
+    )
+    EDU_ENTITY_KEYWORDS = (
+        "学校", "学校法人", "大学", "学院", "高等学校", "高校",
+        "中学校", "小学校", "幼稚園", "こども園", "保育園", "専門学校",
+    )
+    MED_ENTITY_KEYWORDS = (
+        "病院", "クリニック", "診療所", "医療法人", "社会医療法人",
+        "保健", "衛生", "看護", "福祉", "介護", "社会福祉法人",
+    )
+    NPO_ENTITY_KEYWORDS = (
+        "社団法人", "財団法人", "公益社団", "公益財団", "一般社団", "一般財団",
+        "協会", "連盟", "組合", "商工会", "協議会", "NPO", "非営利",
+    )
+
+    ENTITY_SITE_SUFFIXES = {
+        "gov": (".lg.jp", ".go.jp"),
+        "edu": (".ac.jp", ".ed.jp"),
+        "med": (".or.jp", ".go.jp"),
+        "npo": (".or.jp",),
     }
 
     NON_OFFICIAL_KEYWORDS = {
@@ -259,6 +297,10 @@ class CompanyScraper:
         "リストス", "上場区分", "企業情報サイト", "まとめ", "一覧", "ランキング", "プラン",
         "sales promotion", "booking", "reservation", "hotel", "travel", "camp",
     )
+    EXEC_TITLE_KEYWORDS = (
+        "代表取締役", "代表理事", "代表者", "社長", "会長", "理事長", "学長",
+        "園長", "校長", "院長", "組合長", "議長", "知事", "市長", "区長", "町長", "村長",
+    )
 
     CORP_SUFFIXES = [
         "株式会社", "（株）", "(株)", "有限会社", "合同会社", "合名会社", "合資会社",
@@ -271,6 +313,11 @@ class CompanyScraper:
         "会社概要", "会社情報", "企業情報", "corporate", "about",
         "お問い合わせ", "問い合わせ", "contact",
         "アクセス", "access", "本社", "所在地", "沿革",
+    )
+    PROFILE_URL_HINTS = (
+        "company", "about", "profile", "corporate", "overview", "info",
+        "information", "gaiyou", "gaiyo", "kaisya", "outline",
+        "companyinfo", "company-information",
     )
 
     _romaji_converter = None  # lazy pykakasi converter
@@ -307,6 +354,29 @@ class CompanyScraper:
             norm = norm.replace(suffix, "")
         norm = re.sub(r"[\s　]+", "", norm)
         return norm
+
+    @classmethod
+    def _detect_entity_tags(cls, company_name: str) -> set[str]:
+        tags: set[str] = set()
+        if not company_name:
+            return tags
+        name = unicodedata.normalize("NFKC", company_name)
+        if any(keyword in name for keyword in cls.GOV_ENTITY_KEYWORDS):
+            tags.add("gov")
+        if any(keyword in name for keyword in cls.EDU_ENTITY_KEYWORDS):
+            tags.add("edu")
+        if any(keyword in name for keyword in cls.MED_ENTITY_KEYWORDS):
+            tags.add("med")
+        if any(keyword in name for keyword in cls.NPO_ENTITY_KEYWORDS):
+            tags.add("npo")
+        return tags
+
+    @classmethod
+    def _is_exec_title(cls, label: str) -> bool:
+        if not label:
+            return False
+        normalized = unicodedata.normalize("NFKC", label)
+        return any(keyword in normalized for keyword in cls.EXEC_TITLE_KEYWORDS)
 
     @classmethod
     def _romanize(cls, text: str) -> str:
@@ -375,6 +445,38 @@ class CompanyScraper:
             seen.add(tok)
             ordered.append(tok)
         return ordered
+
+    @staticmethod
+    def _host_matches_suffix(host: str, suffix: str) -> bool:
+        suffix = suffix.lstrip(".")
+        return host.endswith(suffix)
+
+    def is_relevant_profile_url(self, company_name: str, url: str) -> bool:
+        try:
+            parsed = urllib.parse.urlparse(url)
+            host = parsed.netloc.lower()
+            path_lower = (parsed.path or "").lower()
+        except Exception:
+            return False
+        keyword_hit = any(hint in path_lower for hint in self.PROFILE_URL_HINTS)
+        entity_tags = self._detect_entity_tags(company_name)
+        if "gov" in entity_tags:
+            allowed = self.ENTITY_SITE_SUFFIXES.get("gov", ())
+            if not any(self._host_matches_suffix(host, suffix) for suffix in allowed):
+                return False
+        tokens = self._company_tokens(company_name)
+        score = self._domain_score(tokens, url)
+        if score >= 2:
+            return True
+        if keyword_hit:
+            return True
+        for tag in entity_tags:
+            for suffix in self.ENTITY_SITE_SUFFIXES.get(tag, ()):
+                if self._host_matches_suffix(host, suffix):
+                    return True
+        if not tokens and not entity_tags:
+            return score >= 1
+        return False
 
     @staticmethod
     def _ascii_tokens(text: str) -> List[str]:
@@ -514,6 +616,7 @@ class CompanyScraper:
         if stripped and stripped not in variants:
             variants.append(stripped)
 
+        entity_tags = self._detect_entity_tags(base_name)
         queries: List[str] = []
 
         def add_query(text: str) -> None:
@@ -521,31 +624,54 @@ class CompanyScraper:
             if normalized and normalized not in queries:
                 queries.append(normalized)
 
+        general_keywords = ("公式サイト", "ホームページ")
+
         for variant in variants:
+            has_ascii = bool(re.search(r"[A-Za-z]", variant))
             add_query(f"{variant} 公式サイト 会社")
             add_query(variant)
             add_query(f"{variant} 公式サイト")
+            add_query(f"{variant} ホームページ")
+            for gkw in general_keywords:
+                add_query(f"{variant} {gkw}")
             for keyword in PROFILE_SEARCH_KEYWORDS:
+                if keyword in {"profile", "about", "corporate"} and not has_ascii:
+                    continue
                 add_query(f"{variant} {keyword}")
             if pref:
                 add_query(f"{variant} {pref} 会社")
                 add_query(f"{variant} {pref} 会社概要")
             if city:
                 add_query(f"{variant} {city} 会社")
-            add_query(f"{variant} 連絡先")
             add_query(f"{variant} site:.jp")
-            add_query(f"{variant} site:.go.jp")
-            add_query(f"{variant} site:.or.jp")
             add_query(f"{variant} site:.co.jp")
+            if "gov" in entity_tags:
+                add_query(f"{variant} site:.go.jp")
+            if entity_tags & {"med", "npo"}:
+                add_query(f"{variant} site:.or.jp")
+            if "gov" in entity_tags:
+                add_query(f"{variant} 行政情報")
+                add_query(f"{variant} 組織")
+            if "edu" in entity_tags:
+                add_query(f"{variant} 学校案内")
+                add_query(f"{variant} 教育情報")
+            if "med" in entity_tags:
+                add_query(f"{variant} 医療法人")
+                add_query(f"{variant} 病院案内")
+            if "npo" in entity_tags:
+                add_query(f"{variant} 活動内容")
+                add_query(f"{variant} 事業報告")
 
-        if address:
-            addr_tokens = address.strip().split()
-            if addr_tokens:
-                addr_hint = addr_tokens[0]
-                if addr_hint:
-                    add_query(f"{base_name} {addr_hint}")
+        site_suffixes: set[str] = set()
+        for tag in entity_tags:
+            for suffix in self.ENTITY_SITE_SUFFIXES.get(tag, ()):
+                site_suffixes.add(suffix)
+        for suffix in sorted(site_suffixes):
+            add_query(f"{base_name} site:{suffix}")
+            if pref:
+                add_query(f"{base_name} {pref} site:{suffix}")
 
-        max_queries = 20
+        max_queries = 28
         return queries[:max_queries]
 
     @staticmethod
@@ -1254,6 +1380,7 @@ class CompanyScraper:
             return []
         pref = self._extract_prefecture(address or "")
         city = self._extract_city(address or "")
+        entity_tags = self._detect_entity_tags(base_name)
         queries: List[str] = []
 
         def add_query(text: str) -> None:
@@ -1261,7 +1388,17 @@ class CompanyScraper:
             if normalized and normalized not in queries:
                 queries.append(normalized)
 
-        for keyword in INFO_PAGE_KEYWORDS:
+        info_keywords = list(INFO_PAGE_KEYWORDS)
+        if "gov" in entity_tags:
+            info_keywords.extend(["行政情報", "組織案内", "部局紹介"])
+        if "edu" in entity_tags:
+            info_keywords.extend(["学校案内", "教育情報"])
+        if "med" in entity_tags:
+            info_keywords.extend(["病院案内", "診療科", "医療情報"])
+        if "npo" in entity_tags:
+            info_keywords.extend(["事業報告", "活動報告"])
+
+        for keyword in info_keywords:
             add_query(f"{base_name} {keyword}")
             if pref:
                 add_query(f"{base_name} {pref} {keyword}")
@@ -1281,6 +1418,8 @@ class CompanyScraper:
                 continue
             for rank, url in enumerate(self._extract_search_urls(html)):
                 if url in seen or self._is_excluded(url):
+                    continue
+                if not self.is_relevant_profile_url(company_name, url):
                     continue
                 seen.add(url)
                 try:
@@ -1327,7 +1466,7 @@ class CompanyScraper:
         return ordered
 
     # ===== ページ取得（ブラウザ再利用＋軽いリトライ） =====
-    async def get_page_info(self, url: str, timeout: int = 25000) -> Dict[str, Any]:
+    async def get_page_info(self, url: str, timeout: int = 25000, need_screenshot: bool = False) -> Dict[str, Any]:
         """
         対象URLの本文テキストとフルページスクショを取得（2回まで再試行）
         """
@@ -1361,7 +1500,9 @@ class CompanyScraper:
                     html = await page.content()
                 except Exception:
                     html = ""
-                screenshot = await page.screenshot(full_page=True)
+                screenshot: bytes = b""
+                if need_screenshot:
+                    screenshot = await page.screenshot(full_page=True)
                 return {"url": url, "text": text, "html": html, "screenshot": screenshot}
 
             except PlaywrightTimeoutError:
@@ -1725,32 +1866,46 @@ class CompanyScraper:
                     norm_value = value.strip()
                     if not norm_value:
                         continue
+                    matched = False
                     for field, keywords in TABLE_LABEL_MAP.items():
                         if any(keyword in norm_label for keyword in keywords):
                             if field == "rep_names":
                                 cleaned = self.clean_rep_name(norm_value)
                                 if cleaned:
                                     reps.append(cleaned)
+                                    matched = True
                             elif field == "phone_numbers":
                                 for p in PHONE_RE.finditer(norm_value):
                                     phones.append(f"{p.group(1)}-{p.group(2)}-{p.group(3)}")
+                                matched = True
                             elif field == "addresses":
                                 addrs.append(norm_value)
+                                matched = True
                             elif field == "listing":
                                 listings.append(norm_value)
+                                matched = True
                             elif field == "capitals":
                                 capitals.append(norm_value)
+                                matched = True
                             elif field == "revenues":
                                 revenues.append(norm_value)
+                                matched = True
                             elif field == "profits":
                                 profits.append(norm_value)
+                                matched = True
                             elif field == "fiscal_months":
                                 fiscal_months.append(norm_value)
+                                matched = True
                             elif field == "founded_years":
                                 parsed = self._parse_founded_year(norm_value)
                                 if parsed:
                                     founded_years.append(parsed)
+                                    matched = True
                             break
+                    if not matched and self._is_exec_title(norm_label):
+                        cleaned = self.clean_rep_name(norm_value)
+                        if cleaned:
+                            reps.append(cleaned)
 
                 def walk_ld(entity: Any) -> None:
                     if isinstance(entity, dict):
