@@ -76,24 +76,25 @@ INFO_PAGE_KEYWORDS = (
 )
 
 REP_NAME_EXACT_BLOCKLIST = {
-    "ブログ", "blog", "Blog", "BLOG",
-    "ニュース", "News", "news",
-    "お知らせ", "採用", "求人", "Recruit", "recruit",
-    "アクセス", "Access", "access",
-    "お問い合わせ", "Contact", "contact",
-    "Info", "info", "Information", "information",
-    "法人案内", "法人概要", "会社案内", "会社概要",
-    "法人情報", "企業情報", "事業案内", "事業紹介",
-    "サイトマップ", "Sitemap", "sitemap",
-    "交通案内", "アクセスマップ",
-    "施設案内", "施設情報",
-    "イベント", "トピックス", "Topics", "topics",
-    "スタッフ紹介", "スタッフ",
-    "メニュー", "Menu", "menu",
-    "トップページ", "Home", "home", "ホーム",
-    "沿革", "法人紹介", "会社紹介",
-    "所属",
-}
+        "ブログ", "blog", "Blog", "BLOG",
+        "ニュース", "News", "news",
+        "お知らせ", "採用", "求人", "Recruit", "recruit",
+        "アクセス", "Access", "access",
+        "お問い合わせ", "Contact", "contact",
+        "Info", "info", "Information", "information",
+        "法人案内", "法人概要", "会社案内", "会社概要", "会社情報", "基本情報",
+        "法人情報", "企業情報", "事業案内", "事業紹介",
+        "サイトマップ", "Sitemap", "sitemap",
+        "交通案内", "アクセスマップ",
+        "施設案内", "施設情報",
+        "イベント", "トピックス", "Topics", "topics",
+        "スタッフ紹介", "スタッフ",
+        "メニュー", "Menu", "menu",
+        "トップページ", "Home", "home", "ホーム",
+        "沿革", "法人紹介", "会社紹介",
+        "交代", "任を仰せつかりました",
+        "所属",
+    }
 REP_NAME_SUBSTR_BLOCKLIST = (
     "ブログ", "news", "お知らせ", "採用", "求人", "recruit",
     "アクセス", "contact", "法人案内", "法人概要", "会社案内", "会社概要",
@@ -101,7 +102,7 @@ REP_NAME_SUBSTR_BLOCKLIST = (
     "サイトマップ", "sitemap", "交通案内", "アクセスマップ",
     "施設案内", "施設情報", "イベント", "トピックス",
     "スタッフ紹介", "スタッフ", "メニュー", "menu",
-    "トップページ", "home", "沿革", "法人紹介", "会社紹介",
+    "トップページ", "home", "沿革", "法人紹介", "会社紹介", "会社情報", "基本情報",
     "に関する", "について", "保管", "業務", "役員", "役割", "委員会",
     "学校", "学園", "大学", "保育園", "こども園", "組合", "協会",
     "センター", "法人", "こと", "公印", "いただき", "役", "組織"
@@ -241,6 +242,22 @@ class CompanyScraper:
         "baseconnect.in",
         "r-compass.jp",
         "coki.jp",
+        "biz-maps.com",
+        "data-link-plus.com",
+        "gmo-connect.com",
+        "musubu.jp",
+        "jpdb.biz",
+        "houjin-bangou.nta.go.jp",
+        "irbank.net",
+        "stockclip.net",
+        "kabutan.jp",
+        "minkabu.com",
+        "marketscreener.com",
+        "bloomberg.com",
+        "alarmbox.jp",
+        "infomart.co.jp",
+        "fumadata.com",
+        "tokyo-seihon.or.jp",
         "zhihu.com",
         "baidu.com",
         "tieba.baidu.com",
@@ -327,6 +344,7 @@ class CompanyScraper:
         self._pw = None
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
+        self.page_cache: Dict[str, Dict[str, Any]] = {}
         env_engines = os.getenv("SEARCH_ENGINES")
         if search_engines:
             engines = search_engines
@@ -572,6 +590,13 @@ class CompanyScraper:
         if not text:
             return None
         if len(text) < 2 or len(text) > 20:
+            return None
+        generic_words = {"氏名", "お名前", "名前", "name", "Name", "NAME", "役職", "役名", "役割", "担当", "選任"}
+        if text in generic_words:
+            return None
+        if re.search(r"(氏名|お名前|名前|役職|担当|選任)", text):
+            return None
+        if re.search(r"(概要|会社概要|事業概要|法人概要)", text):
             return None
         if any(word in text for word in ("株式会社", "有限会社", "合名会社", "合資会社", "合同会社")):
             return None
@@ -935,6 +960,12 @@ class CompanyScraper:
         if not host:
             return finalize(False)
         is_google_sites = host == "sites.google.com"
+        base_name = (company_name or "").strip()
+        is_prefecture_exact = base_name in PREFECTURE_NAMES
+        if is_prefecture_exact:
+            allowed_suffixes = self.ENTITY_SITE_SUFFIXES.get("gov", ())
+            if not any(self._host_matches_suffix(host, suffix) for suffix in allowed_suffixes):
+                return finalize(False, host_value=host, blocked_host=True)
         if not is_google_sites and any(host == domain or host.endswith(f".{domain}") for domain in self.HARD_EXCLUDE_HOSTS):
             return finalize(False, host_value=host, blocked_host=True)
 
@@ -1470,6 +1501,11 @@ class CompanyScraper:
         """
         対象URLの本文テキストとフルページスクショを取得（2回まで再試行）
         """
+        cached = self.page_cache.get(url)
+        cached_shot = bool(cached and cached.get("screenshot"))
+        if cached and (cached_shot or not need_screenshot):
+            return cached
+
         if not self.context:
             await self.start()
 
@@ -1503,7 +1539,17 @@ class CompanyScraper:
                 screenshot: bytes = b""
                 if need_screenshot:
                     screenshot = await page.screenshot(full_page=True)
-                return {"url": url, "text": text, "html": html, "screenshot": screenshot}
+                result = {"url": url, "text": text, "html": html, "screenshot": screenshot}
+                if cached and not screenshot:
+                    # 再訪時にスクショなしなら旧データを活かす
+                    if cached.get("screenshot"):
+                        result["screenshot"] = cached["screenshot"]
+                    if not text:
+                        result["text"] = cached.get("text", "")
+                    if not html:
+                        result["html"] = cached.get("html", "")
+                self.page_cache[url] = result
+                return result
 
             except PlaywrightTimeoutError:
                 # 軽く待ってリトライ
@@ -1514,7 +1560,13 @@ class CompanyScraper:
             finally:
                 await page.close()
 
-        return {"url": url, "text": "", "html": "", "screenshot": b""}
+        fallback = {"url": url, "text": "", "html": "", "screenshot": b""}
+        if cached:
+            fallback["text"] = cached.get("text", "")
+            fallback["html"] = cached.get("html", "")
+            fallback["screenshot"] = cached.get("screenshot", b"") or b""
+        self.page_cache[url] = fallback
+        return fallback
 
     # ===== 同一ドメイン内を浅く探索 =====
     def _rank_links(self, base: str, html: str) -> List[str]:
@@ -1992,6 +2044,11 @@ class CompanyScraper:
                 if term in text or term.lower() in lowered:
                     listings.append(term)
                     break
+
+        for m in REP_RE.finditer(text or ""):
+            cand = self.clean_rep_name(m.group(1))
+            if cand:
+                reps.append(cand)
 
         capitals.extend(m.group(1).strip() for m in CAPITAL_RE.finditer(text or ""))
         revenues.extend(m.group(1).strip() for m in REVENUE_RE.finditer(text or ""))

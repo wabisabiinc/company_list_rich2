@@ -5,6 +5,7 @@ import csv
 import logging
 import re
 import random
+import time
 from difflib import SequenceMatcher
 from typing import Any
 from urllib.parse import urlparse
@@ -48,6 +49,8 @@ JITTER_RATIO = float(os.getenv("JITTER_RATIO", "0.30"))
 REFERENCE_CSVS = [p.strip() for p in os.getenv("REFERENCE_CSVS", "").split(",") if p.strip()]
 FETCH_CONCURRENCY = max(1, int(os.getenv("FETCH_CONCURRENCY", "3")))
 PROFILE_FETCH_CONCURRENCY = max(1, int(os.getenv("PROFILE_FETCH_CONCURRENCY", "3")))
+SEARCH_CANDIDATE_LIMIT = max(1, int(os.getenv("SEARCH_CANDIDATE_LIMIT", "6")))
+TIME_LIMIT_SEC = float(os.getenv("TIME_LIMIT_SEC", "45"))
 
 MIRROR_TO_CSV = os.getenv("MIRROR_TO_CSV", "false").lower() == "true"
 OUTPUT_CSV_PATH = os.getenv("OUTPUT_CSV_PATH", "data/output.csv")
@@ -189,6 +192,8 @@ def clean_description_value(val: str) -> str:
         return ""
     if len(stripped) < 8:
         return ""
+    if re.fullmatch(r"(会社概要|事業概要|法人概要|沿革|会社案内|企業情報)", stripped):
+        return ""
     return stripped[:80]
 
 def clean_fiscal_month(val: str) -> str:
@@ -210,6 +215,23 @@ def extract_description_snippet(text: str | None) -> str | None:
     paragraphs = [p.strip() for p in re.split(r"[\r\n]+", text) if p.strip()]
     if not paragraphs:
         return None
+    # ノイズになる段落を除外（ニュース・採用・日付行など）
+    noise_patterns = (
+        r"採用", r"求人", r"募集", r"ニュース", r"お知らせ", r"新着", r"イベント",
+        r"\d{4}\s*年\s*\d{1,2}\s*月", r"\d{4}/\d{1,2}/\d{1,2}", r"\d{4}-\d{1,2}-\d{1,2}",
+        r"会社概要", r"事業概要", r"法人概要", r"沿革"
+    )
+    cleaned_paragraphs: list[str] = []
+    for para in paragraphs:
+        lowered = para.lower()
+        if any(re.search(pat, para) for pat in noise_patterns):
+            continue
+        if "news" in lowered or "recruit" in lowered or "採用" in para:
+            continue
+        cleaned_paragraphs.append(para)
+    if cleaned_paragraphs:
+        paragraphs = cleaned_paragraphs
+
     lowered = [p.lower() for p in paragraphs]
     for idx, para in enumerate(paragraphs):
         if any(hint.lower() in lowered[idx] for hint in DESCRIPTION_HINTS):
@@ -338,8 +360,17 @@ async def process():
 
             log.info("[%s] %s の処理開始 (worker=%s)", cid, name, WORKER_ID)
 
+            started_at = time.monotonic()
+            timed_out = False
+
+            def elapsed() -> float:
+                return time.monotonic() - started_at
+
+            def over_time_limit() -> bool:
+                return TIME_LIMIT_SEC > 0 and elapsed() > TIME_LIMIT_SEC
+
             try:
-                urls = await scraper.search_company(name, addr, num_results=10)
+                urls = await scraper.search_company(name, addr, num_results=SEARCH_CANDIDATE_LIMIT)
                 homepage = ""
                 info = None
                 primary_cands: dict[str, list[str]] = {}
@@ -397,11 +428,18 @@ async def process():
                     ordered.sort(key=lambda x: x[0])
                     candidate_records = [record for _, record in ordered]
 
+                if over_time_limit():
+                    timed_out = True
+
                 ai_official_attempted = False
                 if USE_AI and verifier is not None and hasattr(verifier, "judge_official_homepage"):
                     for record in candidate_records[:3]:
                         if not record_needs_official_ai(record):
                             continue
+                        domain_score = scraper._domain_score(  # type: ignore
+                            scraper._company_tokens(name),  # type: ignore
+                            record.get("normalized_url") or record.get("url") or "",
+                        )
                         info_payload = record.get("info") or {}
                         info_payload = await ensure_info_has_screenshot(
                             scraper,
@@ -421,6 +459,11 @@ async def process():
                             log.warning("[%s] AI公式判定失敗: %s", cid, record.get("url"), exc_info=True)
                             ai_verdict = None
                         if ai_verdict:
+                            ai_ok = ai_verdict.get("is_official")
+                            addr_hit = bool(record.get("rule", {}).get("address_match"))
+                            if ai_ok and domain_score < 4 and not addr_hit:
+                                # ドメイン類似度が低く住所一致もない場合はAI判定を採用しない
+                                ai_verdict["is_official"] = False
                             record["ai_judge"] = ai_verdict
                             ai_official_attempted = True
                         if ai_official_attempted and AI_COOLDOWN_SEC > 0:
@@ -430,6 +473,10 @@ async def process():
                     normalized_url = record.get("normalized_url") or record.get("url")
                     extracted = record.get("extracted") or {}
                     rule_details = record.get("rule") or {}
+                    domain_score = scraper._domain_score(  # type: ignore
+                        scraper._company_tokens(name),  # type: ignore
+                        normalized_url or "",
+                    )
                     ai_judge = record.get("ai_judge")
                     flag_info = record.get("flag_info")
                     if rule_details.get("blocked_host"):
@@ -456,6 +503,18 @@ async def process():
                             log.info("[%s] AIが非公式判定: %s", cid, record.get("url"))
                             continue
                         if ai_judge.get("is_official") is True:
+                            addr_hit = bool(rule_details.get("address_match"))
+                            if domain_score < 4 and not addr_hit:
+                                manager.upsert_url_flag(
+                                    normalized_url,
+                                    is_official=False,
+                                    source="ai",
+                                    reason="domain_mismatch_no_address_hit",
+                                    confidence=ai_judge.get("confidence"),
+                                )
+                                fallback_cands.append((record.get("url"), extracted))
+                                log.info("[%s] AI公式判定を却下: domain_score=%s url=%s", cid, domain_score, record.get("url"))
+                                continue
                             homepage = normalized_url
                             info = record.get("info")
                             primary_cands = extracted
@@ -479,6 +538,17 @@ async def process():
                         homepage_official_score = float(rule_details.get("score") or 0.0)
                         break
                     if rule_details.get("is_official"):
+                        addr_hit = bool(rule_details.get("address_match"))
+                        if domain_score < 4 and not addr_hit:
+                            manager.upsert_url_flag(
+                                normalized_url,
+                                is_official=False,
+                                source="rule",
+                                reason=f"weak_domain_score={domain_score}",
+                            )
+                            fallback_cands.append((record.get("url"), extracted))
+                            log.info("[%s] 低ドメイン一致のため公式判定を却下: %s", cid, record.get("url"))
+                            continue
                         homepage = normalized_url
                         info = record.get("info")
                         primary_cands = extracted
@@ -641,13 +711,20 @@ async def process():
                     need_founded = not bool(founded_val)
                     need_description = not bool(description_val)
 
+                    if over_time_limit():
+                        timed_out = True
+
                     try:
-                        priority_limit = 8 if any([
+                        priority_limit = 6 if any([
                             need_listing, need_capital, need_revenue,
                             need_profit, need_fiscal, need_founded, need_description,
-                        ]) else 4
-                        site_docs = await scraper.fetch_priority_documents(
-                            homepage, info_dict.get("html", ""), max_links=priority_limit
+                        ]) else 3
+                        site_docs = (
+                            {}
+                            if timed_out
+                            else await scraper.fetch_priority_documents(
+                                homepage, info_dict.get("html", ""), max_links=priority_limit
+                            )
                         )
                     except Exception:
                         site_docs = {}
@@ -669,7 +746,7 @@ async def process():
                     or need_description
                 )
 
-                if need_external_profiles:
+                if need_external_profiles and not timed_out:
                     try:
                         profile_urls = await scraper.search_company_info_pages(name, addr, max_results=3)
                     except Exception:
@@ -690,7 +767,7 @@ async def process():
                                 continue
                         filtered_profile_urls.append(profile_url)
 
-                    if filtered_profile_urls:
+                    if filtered_profile_urls and not timed_out:
                         profile_sem = asyncio.Semaphore(PROFILE_FETCH_CONCURRENCY)
 
                         async def fetch_profile(url: str):
@@ -733,7 +810,7 @@ async def process():
                         need_description,
                     ])
                 )
-                if ai_needed:
+                if ai_needed and not timed_out:
                     ai_attempted = True
                     info_dict = await ensure_info_has_screenshot(scraper, info_url, info_dict)
                     info = info_dict
@@ -786,90 +863,90 @@ async def process():
                     if isinstance(description, str) and description.strip():
                         description_val = description.strip()[:50]
                 else:
-                        if ai_attempted and AI_COOLDOWN_SEC > 0:
-                            await asyncio.sleep(jittered_seconds(AI_COOLDOWN_SEC, JITTER_RATIO))
-                    need_listing = not bool(listing_val)
-                    need_capital = not bool(capital_val)
-                    need_revenue = not bool(revenue_val)
-                    need_profit = not bool(profit_val)
-                    need_fiscal = not bool(fiscal_val)
-                    need_founded = not bool(founded_val)
-                    need_description = not bool(description_val)
+                    if ai_attempted and AI_COOLDOWN_SEC > 0:
+                        await asyncio.sleep(jittered_seconds(AI_COOLDOWN_SEC, JITTER_RATIO))
+                need_listing = not bool(listing_val)
+                need_capital = not bool(capital_val)
+                need_revenue = not bool(revenue_val)
+                need_profit = not bool(profit_val)
+                need_fiscal = not bool(fiscal_val)
+                need_founded = not bool(founded_val)
+                need_description = not bool(description_val)
 
-                    # AI 2回目: まだ欠損がある場合に、優先リンクから集めたテキストで再度問い合わせ
-                    if USE_AI and verifier is not None and priority_docs:
-                        missing_fields = any([
-                            not phone,
-                            not found_address,
-                            not rep_name_val,
-                            need_description,
-                            need_listing,
-                            need_capital,
-                            need_revenue,
-                            need_profit,
-                            need_fiscal,
-                            need_founded,
-                        ])
-                        if missing_fields:
-                            combined_text = "\n\n".join(v.get("text", "") or "" for v in priority_docs.values())
-                            if combined_text.strip():
-                                try:
-                                    ai_attempted = True
-                                    ai_result2 = await verifier.verify_info(combined_text, None, name, addr)
-                                except Exception:
-                                    ai_result2 = None
-                                if ai_result2:
-                                    ai_used = 1
-                                    ai_model = AI_MODEL_NAME
-                                    ai_phone2 = normalize_phone(ai_result2.get("phone_number"))
-                                    ai_addr2 = normalize_address(ai_result2.get("address"))
-                                    ai_rep2 = ai_result2.get("rep_name") or ai_result2.get("representative")
-                                    ai_rep2 = scraper.clean_rep_name(ai_rep2) if ai_rep2 else None
-                                    desc2 = ai_result2.get("description")
-                                    if not listing_val:
-                                        listing_ai2 = ai_result2.get("listing")
-                                        if isinstance(listing_ai2, str) and listing_ai2.strip():
-                                            listing_val = listing_ai2.strip()
-                                    if not capital_val:
-                                        capital_ai2 = ai_result2.get("capital")
-                                        if isinstance(capital_ai2, str) and capital_ai2.strip():
-                                            capital_val = capital_ai2.strip()
-                                    if not revenue_val:
-                                        revenue_ai2 = ai_result2.get("revenue")
-                                        if isinstance(revenue_ai2, str) and revenue_ai2.strip():
-                                            revenue_val = revenue_ai2.strip()
-                                    if not profit_val:
-                                        profit_ai2 = ai_result2.get("profit")
-                                        if isinstance(profit_ai2, str) and profit_ai2.strip():
-                                            profit_val = profit_ai2.strip()
-                                    if not fiscal_val:
-                                        fiscal_ai2 = ai_result2.get("fiscal_month")
-                                        if isinstance(fiscal_ai2, str) and fiscal_ai2.strip():
-                                            fiscal_val = clean_fiscal_month(fiscal_ai2)
-                                    if not founded_val:
-                                        founded_ai2 = ai_result2.get("founded_year")
-                                        if isinstance(founded_ai2, str) and founded_ai2.strip():
-                                            founded_val = founded_ai2.strip()
-                                    if ai_phone2 and not phone:
-                                        phone = ai_phone2
-                                        phone_source = "ai"
-                                        src_phone = info_url
-                                    if ai_addr2 and not found_address:
-                                        found_address = ai_addr2
-                                        address_source = "ai"
-                                        src_addr = info_url
-                                    if ai_rep2 and not rep_name_val:
-                                        rep_name_val = ai_rep2
-                                        src_rep = info_url
-                                    if isinstance(desc2, str) and desc2.strip() and not description_val:
-                                        description_val = desc2.strip()[:50]
-                                    need_listing = not bool(listing_val)
-                                    need_capital = not bool(capital_val)
-                                    need_revenue = not bool(revenue_val)
-                                    need_profit = not bool(profit_val)
-                                    need_fiscal = not bool(fiscal_val)
-                                    need_founded = not bool(founded_val)
-                                    need_description = not bool(description_val)
+                # AI 2回目: まだ欠損がある場合に、優先リンクから集めたテキストで再度問い合わせ
+                if USE_AI and verifier is not None and priority_docs and not timed_out:
+                    missing_fields = any([
+                        not phone,
+                        not found_address,
+                        not rep_name_val,
+                        need_description,
+                        need_listing,
+                        need_capital,
+                        need_revenue,
+                        need_profit,
+                        need_fiscal,
+                        need_founded,
+                    ])
+                    if missing_fields:
+                        combined_text = "\n\n".join(v.get("text", "") or "" for v in priority_docs.values())
+                        if combined_text.strip():
+                            try:
+                                ai_attempted = True
+                                ai_result2 = await verifier.verify_info(combined_text, None, name, addr)
+                            except Exception:
+                                ai_result2 = None
+                            if ai_result2:
+                                ai_used = 1
+                                ai_model = AI_MODEL_NAME
+                                ai_phone2 = normalize_phone(ai_result2.get("phone_number"))
+                                ai_addr2 = normalize_address(ai_result2.get("address"))
+                                ai_rep2 = ai_result2.get("rep_name") or ai_result2.get("representative")
+                                ai_rep2 = scraper.clean_rep_name(ai_rep2) if ai_rep2 else None
+                                desc2 = ai_result2.get("description")
+                                if not listing_val:
+                                    listing_ai2 = ai_result2.get("listing")
+                                    if isinstance(listing_ai2, str) and listing_ai2.strip():
+                                        listing_val = listing_ai2.strip()
+                                if not capital_val:
+                                    capital_ai2 = ai_result2.get("capital")
+                                    if isinstance(capital_ai2, str) and capital_ai2.strip():
+                                        capital_val = capital_ai2.strip()
+                                if not revenue_val:
+                                    revenue_ai2 = ai_result2.get("revenue")
+                                    if isinstance(revenue_ai2, str) and revenue_ai2.strip():
+                                        revenue_val = revenue_ai2.strip()
+                                if not profit_val:
+                                    profit_ai2 = ai_result2.get("profit")
+                                    if isinstance(profit_ai2, str) and profit_ai2.strip():
+                                        profit_val = profit_ai2.strip()
+                                if not fiscal_val:
+                                    fiscal_ai2 = ai_result2.get("fiscal_month")
+                                    if isinstance(fiscal_ai2, str) and fiscal_ai2.strip():
+                                        fiscal_val = clean_fiscal_month(fiscal_ai2)
+                                if not founded_val:
+                                    founded_ai2 = ai_result2.get("founded_year")
+                                    if isinstance(founded_ai2, str) and founded_ai2.strip():
+                                        founded_val = founded_ai2.strip()
+                                if ai_phone2 and not phone:
+                                    phone = ai_phone2
+                                    phone_source = "ai"
+                                    src_phone = info_url
+                                if ai_addr2 and not found_address:
+                                    found_address = ai_addr2
+                                    address_source = "ai"
+                                    src_addr = info_url
+                                if ai_rep2 and not rep_name_val:
+                                    rep_name_val = ai_rep2
+                                    src_rep = info_url
+                                if isinstance(desc2, str) and desc2.strip() and not description_val:
+                                    description_val = desc2.strip()[:50]
+                                need_listing = not bool(listing_val)
+                                need_capital = not bool(capital_val)
+                                need_revenue = not bool(revenue_val)
+                                need_profit = not bool(profit_val)
+                                need_fiscal = not bool(fiscal_val)
+                                need_founded = not bool(founded_val)
+                                need_description = not bool(description_val)
 
                     if ai_phone:
                         phone = ai_phone
@@ -913,14 +990,19 @@ async def process():
                         need_listing, need_capital, need_revenue,
                         need_profit, need_fiscal, need_founded, need_description,
                     ])
+                    related_page_limit = 4 if need_extra_fields else 3
                     if need_phone or need_addr or need_rep or need_extra_fields:
+                        if over_time_limit():
+                            timed_out = True
+                            related = {}
+                        else:
                         try:
                             related = await scraper.crawl_related(
                                 homepage,
                                 need_phone,
                                 need_addr,
                                 need_rep,
-                                max_pages=6,
+                                max_pages=related_page_limit,
                                 max_hops=2,
                                 need_listing=need_listing,
                                 need_capital=need_capital,
@@ -986,11 +1068,14 @@ async def process():
                             ):
                                 break
 
-                    try:
-                        verify_result = await scraper.verify_on_site(homepage, phone or None, found_address or None)
-                    except Exception:
-                        log.warning("[%s] verify_on_site 失敗", cid, exc_info=True)
+                    if timed_out:
                         verify_result = {"phone_ok": False, "address_ok": False}
+                    else:
+                        try:
+                            verify_result = await scraper.verify_on_site(homepage, phone or None, found_address or None)
+                        except Exception:
+                            log.warning("[%s] verify_on_site 失敗", cid, exc_info=True)
+                            verify_result = {"phone_ok": False, "address_ok": False}
 
                     matches = int(bool(verify_result.get("phone_ok"))) + int(bool(verify_result.get("address_ok")))
                     if matches == 2:
@@ -1009,7 +1094,7 @@ async def process():
                     confidence = 0.4
 
                 # 公式サイトから取得できなかった指標は検索結果の非公式ページから補完
-                if not phone or not found_address or not rep_name_val:
+                if not phone or not found_address or (not rep_name_val and not homepage):
                     for url, data in fallback_cands:
                         if not phone and data.get("phone_numbers"):
                             cand = normalize_phone(data["phone_numbers"][0])
@@ -1113,7 +1198,10 @@ async def process():
                     if accuracy_payload:
                         company.update(accuracy_payload)
 
-                status = "done" if homepage else "error"
+                status = "done" if homepage else "no_homepage"
+                if timed_out:
+                    company["error_code"] = "timeout"
+                    status = "review"
                 if status == "done" and found_address and not addr_compatible(addr, found_address):
                     status = "review"
                 if status == "done" and not verify_result.get("phone_ok") and not verify_result.get("address_ok"):
@@ -1122,7 +1210,7 @@ async def process():
                 company.setdefault("error_code", "")
 
                 manager.save_company_data(company, status=status)
-                log.info("[%s] 保存完了: status=%s (worker=%s)", cid, status, WORKER_ID)
+                log.info("[%s] 保存完了: status=%s elapsed=%.1fs (worker=%s)", cid, status, elapsed(), WORKER_ID)
 
                 if csv_writer:
                     csv_writer.writerow({k: company.get(k, "") for k in CSV_FIELDNAMES})

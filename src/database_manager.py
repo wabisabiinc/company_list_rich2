@@ -42,6 +42,8 @@ class DatabaseManager:
         self._claim_order_clause = self._build_claim_order_clause()
         self.wal_checkpoint_interval = max(0, int(os.getenv("WAL_CHECKPOINT_INTERVAL", "200")))
         self._writes_since_checkpoint = 0
+        retry_statuses_env = os.getenv("RETRY_STATUSES", "review,no_homepage")
+        self.retry_statuses: list[str] = [s.strip() for s in retry_statuses_env.split(",") if s.strip()]
 
         # ★ 初期化はロック競合が起きやすいので安全にリトライ
         self._ensure_schema_with_retry()
@@ -338,8 +340,8 @@ class DatabaseManager:
     def claim_next_company(self, worker_id: str) -> Optional[Dict[str, Any]]:
         """
         1) 古い running を TTL で pending に戻す
-        2) pending の先頭1件を running にし、locked_by/locked_at を付与
-        3) そのレコードを返す
+        2) pending を優先して1件確保。pending が無ければ retry_statuses（例: review,no_homepage）から順に1件確保
+        3) running にし、locked_by/locked_at を付与して返す
         """
         cur = self.conn.cursor()
         # IMMEDIATE: 直ちに RESERVED ロック（書込予約）を取り、競合を避ける
@@ -355,53 +357,60 @@ class DatabaseManager:
 
             # RETURNING が利用可能な SQLite ならこちらを使用
             try:
-                row = cur.execute(
-                    f"""
-                    WITH picked AS (
-                      SELECT id FROM companies
-                       WHERE status='pending'
-                       {self._claim_order_clause}
-                       LIMIT 1
-                    )
-                    UPDATE companies
-                       SET status='running',
-                           locked_by=?,
-                           locked_at=datetime('now')
-                     WHERE id=(SELECT id FROM picked)
-                    RETURNING id, company_name, address, employee_count, homepage, phone, found_address, status, corporate_number, corporate_number_norm
-                    """,
-                    (worker_id,),
-                ).fetchone()
+                row = None
+                statuses = ["pending"] + self.retry_statuses
+                for st in statuses:
+                    row = cur.execute(
+                        f"""
+                        WITH picked AS (
+                          SELECT id FROM companies
+                           WHERE status=?
+                           {self._claim_order_clause}
+                           LIMIT 1
+                        )
+                        UPDATE companies
+                           SET status='running',
+                               locked_by=?,
+                               locked_at=datetime('now')
+                         WHERE id=(SELECT id FROM picked)
+                        RETURNING id, company_name, address, employee_count, homepage, phone, found_address, status, corporate_number, corporate_number_norm
+                        """,
+                        (st, worker_id),
+                    ).fetchone()
+                    if row:
+                        break
             except sqlite3.OperationalError:
                 # 古い SQLite 向けフォールバック（RETURNING 無し）
-                cur.execute(
-                    """
-                    UPDATE companies
-                       SET status='running',
-                           locked_by=?,
-                           locked_at=datetime('now')
-                     WHERE id = (
-                       SELECT id FROM companies
-                        WHERE status='pending'
-                        {self._claim_order_clause}
-                        LIMIT 1
-                     ) AND status='pending'
-                    """,
-                    (worker_id,),
-                )
-                if cur.rowcount == 0:
-                    self._commit_with_checkpoint()
-                    return None
-                row = cur.execute(
-                    """
-                    SELECT id, company_name, address, employee_count, homepage, phone, found_address, status, corporate_number, corporate_number_norm
-                      FROM companies
-                     WHERE locked_by=? AND status='running'
-                     ORDER BY locked_at DESC, id DESC
-                     LIMIT 1
-                    """,
-                    (worker_id,),
-                ).fetchone()
+                row = None
+                statuses = ["pending"] + self.retry_statuses
+                for st in statuses:
+                    cur.execute(
+                        f"""
+                        UPDATE companies
+                           SET status='running',
+                               locked_by=?,
+                               locked_at=datetime('now')
+                         WHERE id = (
+                           SELECT id FROM companies
+                            WHERE status=?
+                            {self._claim_order_clause}
+                            LIMIT 1
+                         ) AND status=?
+                        """,
+                        (worker_id, st, st),
+                    )
+                    if cur.rowcount > 0:
+                        row = cur.execute(
+                            """
+                            SELECT id, company_name, address, employee_count, homepage, phone, found_address, status, corporate_number, corporate_number_norm
+                              FROM companies
+                             WHERE locked_by=? AND status='running'
+                             ORDER BY locked_at DESC, id DESC
+                             LIMIT 1
+                            """,
+                            (worker_id,),
+                        ).fetchone()
+                        break
 
             self._commit_with_checkpoint()
             return dict(row) if row else None

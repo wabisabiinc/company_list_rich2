@@ -5,6 +5,7 @@ import time
 import re
 import unicodedata
 import base64
+import hashlib
 from typing import Optional, Dict, Any
 
 # ---- .env -------------------------------------------------------
@@ -21,6 +22,7 @@ def _getenv_bool(name: str, default: bool = False) -> bool:
 USE_AI: bool = _getenv_bool("USE_AI", False)
 API_KEY: str = (os.getenv("GEMINI_API_KEY") or "").strip()
 DEFAULT_MODEL: str = (os.getenv("GEMINI_MODEL") or "gemini-2.5-flash-lite").strip()
+AI_CONTEXT_PATH: str = os.getenv("AI_CONTEXT_PATH", "docs/ai_context.md")
 
 # ---- deps -------------------------------------------------------
 try:
@@ -198,6 +200,7 @@ class AIVerifier:
     def __init__(self, model=None, listoss_data: Dict[str, dict] = None, db_path: str = 'data/companies.db'):
         self.db_path = db_path
         self.listoss_data = listoss_data if listoss_data is not None else {}
+        self.system_prompt = self._load_system_prompt()
 
         if model is not None:
             self.model = model
@@ -213,6 +216,22 @@ class AIVerifier:
                 self.model = None
                 if GEN_IMPORT_ERROR:
                     log.warning(f"AIVerifier: AI disabled due to import/config error: {GEN_IMPORT_ERROR}")
+
+    def _load_system_prompt(self) -> Optional[str]:
+        """
+        docs/ai_context.md をsystemプロンプトとして読み込む。
+        読み込みに失敗した場合は None を返す。
+        """
+        path = AI_CONTEXT_PATH
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:8]
+            log.info(f"AIVerifier: loaded system prompt from %s (sha256[:8]=%s)", path, digest)
+            return content
+        except Exception as e:
+            log.warning(f"AIVerifier: failed to load system prompt from %s: %s", path, e)
+            return None
 
     def _build_prompt(self, text: str) -> str:
         snippet = (text or "").strip()
@@ -257,7 +276,10 @@ class AIVerifier:
             log.error(f"No model initialized for {company_name} ({address})")
             return None
 
-        content = [self._build_prompt(text)]
+        content: list[Any] = []
+        if self.system_prompt:
+            content.append(self.system_prompt)
+        content.append(self._build_prompt(text))
         if screenshot:
             try:
                 b64 = base64.b64encode(screenshot).decode("utf-8")
@@ -358,7 +380,10 @@ class AIVerifier:
             "- URLが企業ドメインや自治体/学校の公式ドメインなら true に寄せる。\n"
             f"企業名: {company_name}\n住所: {address}\n候補URL: {url}\n本文抜粋:\n{snippet}\n"
         )
-        content = [prompt]
+        content: list[Any] = []
+        if self.system_prompt:
+            content.append(self.system_prompt)
+        content.append(prompt)
         if screenshot:
             try:
                 b64 = base64.b64encode(screenshot).decode("utf-8")
