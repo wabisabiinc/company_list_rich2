@@ -49,8 +49,11 @@ JITTER_RATIO = float(os.getenv("JITTER_RATIO", "0.30"))
 REFERENCE_CSVS = [p.strip() for p in os.getenv("REFERENCE_CSVS", "").split(",") if p.strip()]
 FETCH_CONCURRENCY = max(1, int(os.getenv("FETCH_CONCURRENCY", "3")))
 PROFILE_FETCH_CONCURRENCY = max(1, int(os.getenv("PROFILE_FETCH_CONCURRENCY", "3")))
-SEARCH_CANDIDATE_LIMIT = max(1, int(os.getenv("SEARCH_CANDIDATE_LIMIT", "6")))
-TIME_LIMIT_SEC = float(os.getenv("TIME_LIMIT_SEC", "45"))
+SEARCH_CANDIDATE_LIMIT = max(1, int(os.getenv("SEARCH_CANDIDATE_LIMIT", "3")))
+# 全体のタイムアウトは使わず、フェーズ別で管理する
+TIME_LIMIT_SEC = float(os.getenv("TIME_LIMIT_SEC", "0"))
+TIME_LIMIT_FETCH_ONLY = float(os.getenv("TIME_LIMIT_FETCH_ONLY", "60"))  # 公式未確定で候補取得フェーズ（0で無効）
+TIME_LIMIT_WITH_OFFICIAL = float(os.getenv("TIME_LIMIT_WITH_OFFICIAL", "90"))  # 公式確定後、主要項目未充足（0で無効）
 
 MIRROR_TO_CSV = os.getenv("MIRROR_TO_CSV", "false").lower() == "true"
 OUTPUT_CSV_PATH = os.getenv("OUTPUT_CSV_PATH", "data/output.csv")
@@ -59,6 +62,7 @@ CSV_FIELDNAMES = [
     "homepage", "phone", "found_address", "rep_name", "description",
     "listing", "revenue", "profit", "capital", "fiscal_month", "founded_year"
 ]
+PHASE_METRICS_PATH = os.getenv("PHASE_METRICS_PATH", "logs/phase_metrics.csv")
 
 REFERENCE_CHECKER: ReferenceChecker | None = None
 if REFERENCE_CSVS:
@@ -161,11 +165,17 @@ def clean_listing_value(val: str) -> str:
     text = (val or "").strip().replace("　", " ")
     if not text:
         return ""
-    if len(text) > 40:
-        text = text[:40]
-    if any(keyword.lower() in text.lower() for keyword in LISTING_ALLOWED_KEYWORDS):
+    if re.search(r"[。！？!?\n]", text):
+        return ""
+    text = re.sub(r"\s+", "", text)
+    if len(text) > 15:
+        return ""
+    lowered = text.lower()
+    if any(keyword.lower() in lowered for keyword in LISTING_ALLOWED_KEYWORDS):
         return text
     if re.fullmatch(r"(?:上場|未上場|非上場)", text):
+        return text
+    if re.fullmatch(r"[0-9]{4}", text):  # 証券コードのみ
         return text
     return ""
 
@@ -193,6 +203,10 @@ def clean_description_value(val: str) -> str:
     if len(stripped) < 8:
         return ""
     if re.fullmatch(r"(会社概要|事業概要|法人概要|沿革|会社案内|企業情報)", stripped):
+        return ""
+    # 事業内容を示す動詞/名詞が無い見出しは除外
+    biz_keywords = ("事業", "製造", "開発", "販売", "提供", "サービス", "運営", "支援", "施工", "設計", "製作")
+    if not any(k in stripped for k in biz_keywords):
         return ""
     return stripped[:80]
 
@@ -281,7 +295,89 @@ async def ensure_info_has_screenshot(
         refreshed = await scraper.get_page_info(url, need_screenshot=True)
     except Exception:
         return info
-    return refreshed
+    if not refreshed:
+        return info
+    merged = dict(info)
+    for key in ("text", "html", "url", "screenshot"):
+        if key in refreshed and refreshed[key]:
+            merged[key] = refreshed[key]
+    return merged
+
+async def ensure_info_text(
+    scraper: CompanyScraper,
+    url: str,
+    info: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """
+    テキスト/HTMLのみ不足している場合に軽量に再取得する（スクショは撮らない）。
+    """
+    info = info or {}
+    if info.get("text") and info.get("html"):
+        return info
+    try:
+        refreshed = await scraper.get_page_info(url, need_screenshot=False)
+        if refreshed:
+            if refreshed.get("text"):
+                info["text"] = refreshed.get("text", "")
+            if refreshed.get("html"):
+                info["html"] = refreshed.get("html", "")
+    except Exception:
+        pass
+    return info
+
+def log_phase_metric(
+    company_id: int,
+    phase: str,
+    elapsed_sec: float,
+    status: str,
+    homepage: str,
+    error_code: str,
+) -> None:
+    if not PHASE_METRICS_PATH:
+        return
+    try:
+        os.makedirs(os.path.dirname(PHASE_METRICS_PATH) or ".", exist_ok=True)
+        file_exists = os.path.exists(PHASE_METRICS_PATH)
+        with open(PHASE_METRICS_PATH, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(["id", "phase", "elapsed_sec", "status", "homepage", "worker", "error_code"])
+            writer.writerow([company_id, phase, f"{elapsed_sec:.3f}", status, homepage or "", WORKER_ID, error_code or ""])
+    except Exception:
+        log.debug("phase metrics write skipped", exc_info=True)
+
+def is_ambiguous_company_name(name: str) -> bool:
+    base = CompanyScraper._normalize_company_name(name)
+    if not base:
+        return True
+    # ほぼ固有名詞がそのまま入っているとみなし、極端に短い場合のみ曖昧扱い
+    if len(base) <= 2:
+        return True
+    tokens = CompanyScraper._company_tokens(name)
+    return len(tokens) == 0
+
+def should_skip_company(name: str) -> bool:
+    """
+    明らかに法人ではない/店舗・支店のみの名称をスキップする。
+    - 都道府県名そのもの、庁・役所・役場を含む自治体名
+    - コンビニ店舗（セブン/ファミマ/ローソン等）で末尾が「店」
+    - 法人格を含まない支店/営業所/出張所のみの名称
+    """
+    base = (name or "").strip()
+    if not base:
+        return False
+    norm = CompanyScraper._normalize_company_name(base)
+    if norm in CompanyScraper.PREFECTURE_NAMES:
+        return True
+    if re.search(r"(県庁|市役所|区役所|町役場|村役場)$", base):
+        return True
+    konbini_keywords = ("セブン-イレブン", "セブンイレブン", "7-11", "7－11", "7–11", "ファミリーマート", "ファミマ", "ローソン", "ミニストップ", "セイコーマート", "デイリーヤマザキ")
+    if any(kw in base for kw in konbini_keywords) and base.endswith("店"):
+        return True
+    has_corp = any(tag in base for tag in ("株式会社", "有限会社", "合同会社", "Inc", "Co.", "Corporation", "Company", "Ltd"))
+    if not has_corp and re.search(r"(支店|営業所|出張所)$", base):
+        return True
+    return False
 
 # --------------------------------------------------
 # 内部: 次ジョブ取得
@@ -357,6 +453,10 @@ async def process():
                 log.info("[skip] id=%s はレンジ外 -> skipped (worker=%s)", cid, WORKER_ID)
                 manager.update_status(cid, "skipped")
                 continue
+            if should_skip_company(name):
+                log.info("[skip] 法人でない名称のためスキップ: id=%s name=%s", cid, name)
+                manager.update_status(cid, "skipped")
+                continue
 
             log.info("[%s] %s の処理開始 (worker=%s)", cid, name, WORKER_ID)
 
@@ -368,9 +468,17 @@ async def process():
 
             def over_time_limit() -> bool:
                 return TIME_LIMIT_SEC > 0 and elapsed() > TIME_LIMIT_SEC
+            def over_fetch_limit() -> bool:
+                return TIME_LIMIT_FETCH_ONLY > 0 and not homepage and elapsed() > TIME_LIMIT_FETCH_ONLY
+            def over_after_official() -> bool:
+                return TIME_LIMIT_WITH_OFFICIAL > 0 and homepage and elapsed() > TIME_LIMIT_WITH_OFFICIAL
 
             try:
-                urls = await scraper.search_company(name, addr, num_results=SEARCH_CANDIDATE_LIMIT)
+                candidate_limit = SEARCH_CANDIDATE_LIMIT
+                if is_ambiguous_company_name(name):
+                    candidate_limit = SEARCH_CANDIDATE_LIMIT + 1
+                    log.info("[%s] 曖昧名のため候補数を拡張: %s -> %s", cid, SEARCH_CANDIDATE_LIMIT, candidate_limit)
+                urls = await scraper.search_company(name, addr, num_results=candidate_limit)
                 homepage = ""
                 info = None
                 primary_cands: dict[str, list[str]] = {}
@@ -378,6 +486,12 @@ async def process():
                 homepage_official_flag = 0
                 homepage_official_source = ""
                 homepage_official_score = 0.0
+                force_review = False
+                ai_time_spent = 0.0
+                chosen_domain_score = 0
+                search_phase_end = 0.0
+                official_phase_end = 0.0
+                deep_phase_end = 0.0
 
                 fetch_sem = asyncio.Semaphore(FETCH_CONCURRENCY)
 
@@ -427,47 +541,88 @@ async def process():
                         ordered.append(result)
                     ordered.sort(key=lambda x: x[0])
                     candidate_records = [record for _, record in ordered]
+                search_phase_end = elapsed()
 
-                if over_time_limit():
+                if over_fetch_limit() or over_time_limit():
                     timed_out = True
+                if homepage and over_after_official():
+                    timed_out = True
+
+                if not candidate_records:
+                    company.update({
+                        "homepage": "",
+                        "phone": "",
+                        "found_address": "",
+                        "rep_name": company.get("rep_name", "") or "",
+                        "description": company.get("description", "") or "",
+                        "listing": company.get("listing", "") or "",
+                        "revenue": company.get("revenue", "") or "",
+                        "profit": company.get("profit", "") or "",
+                        "capital": company.get("capital", "") or "",
+                        "fiscal_month": company.get("fiscal_month", "") or "",
+                        "founded_year": company.get("founded_year", "") or "",
+                        "homepage_official_flag": 0,
+                        "homepage_official_source": "",
+                        "homepage_official_score": 0.0,
+                    })
+                    manager.save_company_data(company, status="no_homepage")
+                    log.info("[%s] 候補ゼロ -> no_homepage で保存", cid)
+                    if csv_writer:
+                        csv_writer.writerow({k: company.get(k, "") for k in CSV_FIELDNAMES})
+                        csv_file.flush()
+                    processed += 1
+                    if SLEEP_BETWEEN_SEC > 0:
+                        await asyncio.sleep(jittered_seconds(SLEEP_BETWEEN_SEC, JITTER_RATIO))
+                    continue
 
                 ai_official_attempted = False
                 if USE_AI and verifier is not None and hasattr(verifier, "judge_official_homepage"):
-                    for record in candidate_records[:3]:
+                    ai_tasks: list[asyncio.Task] = []
+                    ai_sem = asyncio.Semaphore(2)
+
+                    async def run_official_ai(record: dict[str, Any]):
+                        nonlocal ai_official_attempted, ai_time_spent
                         if not record_needs_official_ai(record):
-                            continue
-                        domain_score = scraper._domain_score(  # type: ignore
-                            scraper._company_tokens(name),  # type: ignore
-                            record.get("normalized_url") or record.get("url") or "",
-                        )
-                        info_payload = record.get("info") or {}
-                        info_payload = await ensure_info_has_screenshot(
-                            scraper,
-                            record.get("url"),
-                            info_payload,
-                        )
-                        record["info"] = info_payload
-                        try:
-                            ai_verdict = await verifier.judge_official_homepage(
-                                info_payload.get("text", "") or "",
-                                info_payload.get("screenshot"),
-                                name,
-                                addr,
-                                record.get("normalized_url") or record.get("url"),
+                            return
+                        async with ai_sem:
+                            domain_score = scraper._domain_score(  # type: ignore
+                                scraper._company_tokens(name),  # type: ignore
+                                record.get("normalized_url") or record.get("url") or "",
                             )
-                        except Exception:
-                            log.warning("[%s] AI公式判定失敗: %s", cid, record.get("url"), exc_info=True)
-                            ai_verdict = None
-                        if ai_verdict:
-                            ai_ok = ai_verdict.get("is_official")
-                            addr_hit = bool(record.get("rule", {}).get("address_match"))
-                            if ai_ok and domain_score < 4 and not addr_hit:
-                                # ドメイン類似度が低く住所一致もない場合はAI判定を採用しない
-                                ai_verdict["is_official"] = False
-                            record["ai_judge"] = ai_verdict
-                            ai_official_attempted = True
-                        if ai_official_attempted and AI_COOLDOWN_SEC > 0:
-                            await asyncio.sleep(jittered_seconds(AI_COOLDOWN_SEC, JITTER_RATIO))
+                            info_payload = record.get("info") or {}
+                            info_payload = await ensure_info_has_screenshot(
+                                scraper,
+                                record.get("url"),
+                                info_payload,
+                            )
+                            record["info"] = info_payload
+                            ai_started = time.monotonic()
+                            try:
+                                ai_verdict = await verifier.judge_official_homepage(
+                                    info_payload.get("text", "") or "",
+                                    info_payload.get("screenshot"),
+                                    name,
+                                    addr,
+                                    record.get("normalized_url") or record.get("url"),
+                                )
+                            except Exception:
+                                log.warning("[%s] AI公式判定失敗: %s", cid, record.get("url"), exc_info=True)
+                                ai_verdict = None
+                            ai_time_spent += time.monotonic() - ai_started
+                            if ai_verdict:
+                                ai_ok = ai_verdict.get("is_official")
+                                addr_hit = bool(record.get("rule", {}).get("address_match"))
+                                if ai_ok and domain_score < 4 and not addr_hit:
+                                    ai_verdict["is_official"] = False
+                                record["ai_judge"] = ai_verdict
+                                ai_official_attempted = True
+                            if ai_official_attempted and AI_COOLDOWN_SEC > 0:
+                                await asyncio.sleep(jittered_seconds(AI_COOLDOWN_SEC, JITTER_RATIO))
+
+                    for record in candidate_records[:3]:
+                        ai_tasks.append(asyncio.create_task(run_official_ai(record)))
+                    if ai_tasks:
+                        await asyncio.gather(*ai_tasks, return_exceptions=True)
 
                 for record in candidate_records:
                     normalized_url = record.get("normalized_url") or record.get("url")
@@ -477,6 +632,10 @@ async def process():
                         scraper._company_tokens(name),  # type: ignore
                         normalized_url or "",
                     )
+                    addr_hit = bool(rule_details.get("address_match"))
+                    pref_hit = bool(rule_details.get("prefecture_match"))
+                    zip_hit = bool(rule_details.get("postal_code_match"))
+                    address_ok = (not addr) or addr_hit or pref_hit or zip_hit
                     ai_judge = record.get("ai_judge")
                     flag_info = record.get("flag_info")
                     if rule_details.get("blocked_host"):
@@ -503,24 +662,32 @@ async def process():
                             log.info("[%s] AIが非公式判定: %s", cid, record.get("url"))
                             continue
                         if ai_judge.get("is_official") is True:
-                            addr_hit = bool(rule_details.get("address_match"))
-                            if domain_score < 4 and not addr_hit:
+                            if domain_score < 3 and not address_ok:
+                                fallback_cands.append((record.get("url"), extracted))
+                                force_review = True
+                                log.info("[%s] AI公式を見送り: low_domain_and_no_address url=%s", cid, record.get("url"))
+                                continue
+                            if domain_score < 4:
                                 manager.upsert_url_flag(
                                     normalized_url,
                                     is_official=False,
                                     source="ai",
-                                    reason="domain_mismatch_no_address_hit",
+                                    reason="domain_score_low",
                                     confidence=ai_judge.get("confidence"),
                                 )
                                 fallback_cands.append((record.get("url"), extracted))
-                                log.info("[%s] AI公式判定を却下: domain_score=%s url=%s", cid, domain_score, record.get("url"))
+                                log.info("[%s] AI公式判定を却下: low_domain_score=%s url=%s", cid, domain_score, record.get("url"))
                                 continue
+                            if domain_score < 6 and not address_ok:
+                                force_review = True
+                                log.info("[%s] AI公式判定: 住所突合弱いためreview扱い url=%s", cid, record.get("url"))
                             homepage = normalized_url
                             info = record.get("info")
                             primary_cands = extracted
                             homepage_official_flag = 1
                             homepage_official_source = "ai"
                             homepage_official_score = float(rule_details.get("score") or 0.0)
+                            chosen_domain_score = domain_score
                             manager.upsert_url_flag(
                                 normalized_url,
                                 is_official=True,
@@ -530,16 +697,24 @@ async def process():
                             )
                             break
                     if flag_info and flag_info.get("is_official"):
+                        if domain_score < 3 and not address_ok:
+                            fallback_cands.append((record.get("url"), extracted))
+                            force_review = True
+                            log.info("[%s] キャッシュ公式見送り: low_domain_and_no_address url=%s", cid, record.get("url"))
+                            continue
+                        if not address_ok:
+                            force_review = True
+                            log.info("[%s] キャッシュ公式: 住所突合弱いためreview扱い url=%s", cid, record.get("url"))
                         homepage = normalized_url
                         info = record.get("info")
                         primary_cands = extracted
                         homepage_official_flag = 1
                         homepage_official_source = flag_info.get("judge_source") or "cache"
                         homepage_official_score = float(rule_details.get("score") or 0.0)
+                        chosen_domain_score = domain_score
                         break
                     if rule_details.get("is_official"):
-                        addr_hit = bool(rule_details.get("address_match"))
-                        if domain_score < 4 and not addr_hit:
+                        if domain_score < 3 and not address_ok:
                             manager.upsert_url_flag(
                                 normalized_url,
                                 is_official=False,
@@ -547,14 +722,19 @@ async def process():
                                 reason=f"weak_domain_score={domain_score}",
                             )
                             fallback_cands.append((record.get("url"), extracted))
-                            log.info("[%s] 低ドメイン一致のため公式判定を却下: %s", cid, record.get("url"))
+                            force_review = True
+                            log.info("[%s] 低ドメイン一致+住所弱で公式判定を見送り: %s", cid, record.get("url"))
                             continue
+                        if not address_ok:
+                            force_review = True
+                            log.info("[%s] 住所突合弱いが公式扱い→review: %s", cid, record.get("url"))
                         homepage = normalized_url
                         info = record.get("info")
                         primary_cands = extracted
                         homepage_official_flag = 1
                         homepage_official_source = "rule"
                         homepage_official_score = float(rule_details.get("score") or 0.0)
+                        chosen_domain_score = domain_score
                         manager.upsert_url_flag(
                             normalized_url,
                             is_official=True,
@@ -570,9 +750,54 @@ async def process():
                             source="rule",
                             reason=f"score={score_val:.1f}",
                         )
-                    fallback_cands.append((record.get("url"), extracted))
+                        fallback_cands.append((record.get("url"), extracted))
                     log.info("[%s] 非公式と判断: %s", cid, record.get("url"))
 
+                provisional_homepage = ""
+                provisional_info = None
+                provisional_cands: dict[str, list[str]] = {}
+                provisional_domain_score = 0
+                if not homepage and candidate_records:
+                    best_score = float("-inf")
+                    best_record: dict[str, Any] | None = None
+                    for record in candidate_records:
+                        normalized_url = record.get("normalized_url") or record.get("url")
+                        rule_details = record.get("rule") or {}
+                        domain_score = scraper._domain_score(  # type: ignore
+                            scraper._company_tokens(name),  # type: ignore
+                            normalized_url or "",
+                        )
+                        addr_hit = bool(rule_details.get("address_match"))
+                        pref_hit = bool(rule_details.get("prefecture_match"))
+                        zip_hit = bool(rule_details.get("postal_code_match"))
+                        address_ok = addr_hit or pref_hit or zip_hit
+                        # 採用条件を緩和: domain_score>=2 または 住所突合あり
+                        if domain_score >= 2 or address_ok:
+                            score = domain_score * 2 + (3 if address_ok else 0) + float(rule_details.get("score") or 0.0)
+                            if score > best_score:
+                                best_score = score
+                                best_record = record
+                    if best_record:
+                        provisional_homepage = best_record.get("normalized_url") or best_record.get("url") or ""
+                        provisional_info = best_record.get("info")
+                        provisional_cands = best_record.get("extracted") or {}
+                        provisional_domain_score = scraper._domain_score(  # type: ignore
+                            scraper._company_tokens(name),  # type: ignore
+                            provisional_homepage,
+                        )
+                        log.info("[%s] 公式未確定のため暫定ホームページで深掘り: %s", cid, provisional_homepage)
+
+                if not homepage and provisional_homepage:
+                    homepage = provisional_homepage
+                    info = provisional_info
+                    primary_cands = provisional_cands
+                    homepage_official_flag = 0
+                    homepage_official_source = "provisional"
+                    homepage_official_score = 0.0
+                    chosen_domain_score = provisional_domain_score
+                    force_review = True
+
+                official_phase_end = elapsed()
                 priority_docs: dict[str, dict[str, Any]] = {}
 
                 phone = ""
@@ -714,14 +939,28 @@ async def process():
                     if over_time_limit():
                         timed_out = True
 
-                    try:
-                        priority_limit = 6 if any([
+                    fully_filled = (
+                        homepage
+                        and (rule_phone or phone)
+                        and (rule_address or found_address)
+                        and (rule_rep or rep_name_val)
+                        and not any([
                             need_listing, need_capital, need_revenue,
                             need_profit, need_fiscal, need_founded, need_description,
-                        ]) else 3
+                        ])
+                    )
+
+                    try:
+                        extra_need = any([
+                            not rule_phone,
+                            not rule_address,
+                            not rule_rep,
+                            need_description,
+                        ])
+                        priority_limit = 10 if extra_need else 6
                         site_docs = (
                             {}
-                            if timed_out
+                            if timed_out or fully_filled
                             else await scraper.fetch_priority_documents(
                                 homepage, info_dict.get("html", ""), max_links=priority_limit
                             )
@@ -746,7 +985,7 @@ async def process():
                     or need_description
                 )
 
-                if need_external_profiles and not timed_out:
+                if need_external_profiles and not timed_out and not fully_filled:
                     try:
                         profile_urls = await scraper.search_company_info_pages(name, addr, max_results=3)
                     except Exception:
@@ -790,6 +1029,7 @@ async def process():
 
                 ai_result = None
                 ai_attempted = False
+                ai_task: asyncio.Task | None = None
                 pre_ai_phone_ok = bool(rule_phone or phone)
                 pre_ai_addr_ok = bool(rule_address or found_address)
                 pre_ai_rep_ok = bool(rule_rep or rep_name_val)
@@ -814,20 +1054,29 @@ async def process():
                     ai_attempted = True
                     info_dict = await ensure_info_has_screenshot(scraper, info_url, info_dict)
                     info = info_dict
-                    try:
-                        ai_result = await verifier.verify_info(
-                            info_dict.get("text", "") or "",
-                            info_dict.get("screenshot"),
-                            name,
-                            addr,
-                        )
-                    except Exception:
-                        log.warning("[%s] AI検証失敗 -> ルールベースにフォールバック", cid, exc_info=True)
-                        ai_result = None
+                    async def run_ai_verify():
+                        nonlocal ai_time_spent
+                        ai_started = time.monotonic()
+                        try:
+                            res = await verifier.verify_info(
+                                info_dict.get("text", "") or "",
+                                info_dict.get("screenshot"),
+                                name,
+                                addr,
+                            )
+                        except Exception:
+                            log.warning("[%s] AI検証失敗 -> ルールベースにフォールバック", cid, exc_info=True)
+                            return None
+                        finally:
+                            ai_time_spent += time.monotonic() - ai_started
+                        return res
+                    ai_task = asyncio.create_task(run_ai_verify())
 
                 ai_phone: str | None = None
                 ai_addr: str | None = None
                 ai_rep: str | None = None
+                if ai_task:
+                    ai_result = await ai_task
                 if ai_result:
                     ai_used = 1
                     ai_model = AI_MODEL_NAME
@@ -890,11 +1139,21 @@ async def process():
                     if missing_fields:
                         combined_text = "\n\n".join(v.get("text", "") or "" for v in priority_docs.values())
                         if combined_text.strip():
-                            try:
-                                ai_attempted = True
-                                ai_result2 = await verifier.verify_info(combined_text, None, name, addr)
-                            except Exception:
-                                ai_result2 = None
+                            screenshot_payload = None
+                            if info_url:
+                                info_dict = await ensure_info_has_screenshot(scraper, info_url, info_dict)
+                            screenshot_payload = (info_dict or {}).get("screenshot")
+                            async def run_ai_verify2():
+                                nonlocal ai_time_spent
+                                ai_started = time.monotonic()
+                                try:
+                                    return await verifier.verify_info(combined_text, screenshot_payload, name, addr)
+                                except Exception:
+                                    return None
+                                finally:
+                                    ai_time_spent += time.monotonic() - ai_started
+                            ai_attempted = True
+                            ai_result2 = await run_ai_verify2()
                             if ai_result2:
                                 ai_used = 1
                                 ai_model = AI_MODEL_NAME
@@ -990,30 +1249,31 @@ async def process():
                         need_listing, need_capital, need_revenue,
                         need_profit, need_fiscal, need_founded, need_description,
                     ])
-                    related_page_limit = 4 if need_extra_fields else 3
+                    related_page_limit = 5 if need_extra_fields else 3
                     if need_phone or need_addr or need_rep or need_extra_fields:
                         if over_time_limit():
                             timed_out = True
                             related = {}
                         else:
-                        try:
-                            related = await scraper.crawl_related(
-                                homepage,
-                                need_phone,
-                                need_addr,
-                                need_rep,
-                                max_pages=related_page_limit,
-                                max_hops=2,
-                                need_listing=need_listing,
-                                need_capital=need_capital,
-                                need_revenue=need_revenue,
-                                need_profit=need_profit,
-                                need_fiscal=need_fiscal,
-                                need_founded=need_founded,
-                                need_description=need_description,
-                            )
-                        except Exception:
-                            related = {}
+                            try:
+                                more_pages = 3 if (need_phone or need_addr or need_rep or need_description) else 1
+                                related = await scraper.crawl_related(
+                                    homepage,
+                                    need_phone,
+                                    need_addr,
+                                    need_rep,
+                                    max_pages=related_page_limit + more_pages,
+                                    max_hops=3 if (need_phone or need_addr or need_rep or need_description) else 2,
+                                    need_listing=need_listing,
+                                    need_capital=need_capital,
+                                    need_revenue=need_revenue,
+                                    need_profit=need_profit,
+                                    need_fiscal=need_fiscal,
+                                    need_founded=need_founded,
+                                    need_description=need_description,
+                                )
+                            except Exception:
+                                related = {}
                         for url, data in related.items():
                             text = data.get("text", "") or ""
                             html_content = data.get("html", "") or ""
@@ -1068,6 +1328,20 @@ async def process():
                             ):
                                 break
 
+                    if homepage and (need_addr or not found_address) and not timed_out:
+                        try:
+                            extra_docs = await scraper.fetch_priority_documents(
+                                homepage,
+                                info_dict.get("html", ""),
+                                max_links=12,
+                            )
+                        except Exception:
+                            extra_docs = {}
+                        for url, pdata in extra_docs.items():
+                            priority_docs[url] = pdata
+                            absorb_doc_data(url, pdata)
+
+                    deep_phase_end = elapsed()
                     if timed_out:
                         verify_result = {"phone_ok": False, "address_ok": False}
                     else:
@@ -1202,12 +1476,51 @@ async def process():
                 if timed_out:
                     company["error_code"] = "timeout"
                     status = "review"
+                if not homepage and candidate_records:
+                    status = "review"
                 if status == "done" and found_address and not addr_compatible(addr, found_address):
                     status = "review"
                 if status == "done" and not verify_result.get("phone_ok") and not verify_result.get("address_ok"):
                     status = "review"
+                if force_review and status != "error":
+                    status = "review"
+                if status == "done" and chosen_domain_score and chosen_domain_score < 4 and homepage_official_source in ("ai", "cache", "rule"):
+                    status = "review"
+                if status == "review" and not verify_result.get("phone_ok") and not verify_result.get("address_ok"):
+                    homepage = ""
+                    homepage_official_flag = 0
+                    homepage_official_source = ""
+                    homepage_official_score = 0.0
 
                 company.setdefault("error_code", "")
+
+                total_elapsed = elapsed()
+                if not search_phase_end:
+                    search_phase_end = total_elapsed
+                if not official_phase_end:
+                    official_phase_end = search_phase_end
+                if not deep_phase_end:
+                    deep_phase_end = total_elapsed
+                search_time = search_phase_end
+                official_time = max(0.0, official_phase_end - search_phase_end)
+                deep_time = max(0.0, deep_phase_end - official_phase_end)
+                log.info(
+                    "[%s] timings: search=%.1fs official=%.1fs deep=%.1fs ai=%.1fs total=%.1fs",
+                    cid,
+                    search_time,
+                    official_time,
+                    deep_time,
+                    ai_time_spent,
+                    total_elapsed,
+                )
+                try:
+                    log_phase_metric(cid, "search", search_time, status, homepage, company.get("error_code", ""))
+                    log_phase_metric(cid, "official", official_time, status, homepage, company.get("error_code", ""))
+                    log_phase_metric(cid, "deep", deep_time, status, homepage, company.get("error_code", ""))
+                    log_phase_metric(cid, "ai", ai_time_spent, status, homepage, company.get("error_code", ""))
+                    log_phase_metric(cid, "total", total_elapsed, status, homepage, company.get("error_code", ""))
+                except Exception:
+                    log.debug("phase metrics skipped", exc_info=True)
 
                 manager.save_company_data(company, status=status)
                 log.info("[%s] 保存完了: status=%s elapsed=%.1fs (worker=%s)", cid, status, elapsed(), WORKER_ID)
