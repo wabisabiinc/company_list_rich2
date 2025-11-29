@@ -380,6 +380,8 @@ class CompanyScraper:
         "Inc.", "Inc", "Co.", "Co", "Corporation", "Company", "Ltd.", "Ltd",
         "Holding", "Holdings", "HD", "グループ", "ホールディングス", "本社",
     ]
+    ALLOWED_OFFICIAL_TLDS = (".co.jp", ".jp", ".com")
+    ALLOWED_HOST_WHITELIST = {"big-advance.site"}
 
     # 優先的に巡回したいURLのキーワード
     CANDIDATE_PRIORITIES = (
@@ -581,6 +583,20 @@ class CompanyScraper:
     def _host_matches_suffix(host: str, suffix: str) -> bool:
         suffix = suffix.lstrip(".")
         return host.endswith(suffix)
+
+    @classmethod
+    def _allowed_official_host(cls, url: str) -> tuple[str, str, bool, bool, bool]:
+        try:
+            parsed = urllib.parse.urlparse(url)
+            host = (parsed.netloc or "").lower().split(":")[0]
+            path_lower = (parsed.path or "").lower()
+        except Exception:
+            return "", "", False, False, False
+
+        allowed_tld = any(host.endswith(tld) for tld in cls.ALLOWED_OFFICIAL_TLDS)
+        whitelist_hit = any(host == wh or host.endswith(f".{wh}") for wh in cls.ALLOWED_HOST_WHITELIST)
+        is_google_sites = host == "sites.google.com" or (host.endswith(".google.com") and "sites" in path_lower)
+        return host, path_lower, allowed_tld, whitelist_hit, is_google_sites
 
     def is_relevant_profile_url(self, company_name: str, url: str) -> bool:
         try:
@@ -1118,23 +1134,14 @@ class CompanyScraper:
             }
             return payload if return_details else payload["is_official"]
 
-        try:
-            parsed = urllib.parse.urlparse(url)
-        except Exception:
-            return finalize(False)
-        host = (parsed.netloc or "").lower().split(":")[0]
+        host, path_lower, allowed_tld, whitelist_hit, is_google_sites = self._allowed_official_host(url)
         if not host:
             return finalize(False)
-        path_lower = (parsed.path or "").lower()
         if any(path_lower.endswith(ext) for ext in _BINARY_EXTS):
             return finalize(False, host_value=host, blocked_host=True)
         if host.endswith(".lg.jp"):
             return finalize(False, host_value=host, blocked_host=True)
-        is_google_sites = host == "sites.google.com"
-        allowed_host_whitelist = {"big-advance.site"}
-        allowed_tld = host.endswith((".co.jp", ".jp", ".com"))
-        whitelist_hit = any(host == wh or host.endswith(f".{wh}") for wh in allowed_host_whitelist)
-        if not (allowed_tld or whitelist_hit or is_google_sites or (host.endswith(".google.com") and "sites" in path_lower)):
+        if not (allowed_tld or whitelist_hit or is_google_sites):
             return finalize(False, host_value=host, blocked_host=True)
         base_name = (company_name or "").strip()
         is_prefecture_exact = base_name in PREFECTURE_NAMES
