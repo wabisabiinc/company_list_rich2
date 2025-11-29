@@ -28,8 +28,8 @@
 ## 環境パラメータ（.env）
 - 範囲・順序: `ID_MIN`, `ID_MAX`, `MAX_ROWS`, `CLAIM_ORDER`
 - 取得幅: `SEARCH_CANDIDATE_LIMIT` (デフォルト 5)、`FETCH_CONCURRENCY`, `PROFILE_FETCH_CONCURRENCY`
-- レート・タイムアウト: `TIME_LIMIT_SEC` (デフォルト 0: 無効)、`TIME_LIMIT_FETCH_ONLY` (デフォルト 60s), `TIME_LIMIT_WITH_OFFICIAL` (デフォルト 90s), `AI_COOLDOWN_SEC`, `SLEEP_BETWEEN_SEC`, `JITTER_RATIO`
-- 単ページ: `PAGE_TIMEOUT_MS` (デフォルト 20000)、`SLOW_PAGE_THRESHOLD_MS` (デフォルト 20000: 閾値超はログのみ。スキップは `SKIP_SLOW_HOSTS=true` で有効化)、`SKIP_SLOW_HOSTS` (デフォルト false)
+- レート・タイムアウト: `TIME_LIMIT_SEC` (デフォルト 0: 無効)、`TIME_LIMIT_FETCH_ONLY` (デフォルト 30s), `TIME_LIMIT_WITH_OFFICIAL` (デフォルト 45s), `AI_COOLDOWN_SEC`, `SLEEP_BETWEEN_SEC`, `JITTER_RATIO`
+- 単ページ: `PAGE_TIMEOUT_MS` (デフォルト 9000)、`SLOW_PAGE_THRESHOLD_MS` (デフォルト 9000: 閾値超はログ＋ホストスキップ。スキップ無効化は `SKIP_SLOW_HOSTS=false`)、`SKIP_SLOW_HOSTS` (デフォルト true)
 - メトリクス: `PHASE_METRICS_PATH` (デフォルト logs/phase_metrics.csv。空文字で無効)
 - フラグ: `HEADLESS`, `USE_AI`, `REFERENCE_CSVS`, `RETRY_STATUSES`（再処理順）
 
@@ -112,7 +112,7 @@
 ## 運用メモ
 - スキップ/後回し方針: `no_homepage` と `timeout` は別バッチで再処理。`review` は手動確認または緩和設定で再実行。
 - ログ: 1社ごとに `elapsed=xx.xs` + フェーズ別 (search/official/deep/ai) を出力し、`PHASE_METRICS_PATH` にも書き出し。`scripts/aggregate_phase_metrics.py` で平均/標準偏差/p95を集計可能。異常な遅延や誤公式はIDとURLを記録してブロックリストに反映。
-- ページ取得が20sを超えたホストはログのみ（デフォルトはスキップ無効）。必要に応じて `SKIP_SLOW_HOSTS=true` でスキップに切り替え。
+- ページ取得が `SLOW_PAGE_THRESHOLD_MS` （デフォルト約9s）を超えたホストはログを残して次回スキップ。必要に応じて `SKIP_SLOW_HOSTS=false` でスキップを無効化。
 - ブロックワード/ルールは誤りが見つかり次第このドキュメントに追記し、AIにも反映する。
 - プロンプトは短く禁止事項を冒頭に置き、few-shotは必要最小限にとどめて揺らぎを抑える。
 - 公式判定後に主要項目が埋まれば深掘りを即スキップし、時間を節約する。

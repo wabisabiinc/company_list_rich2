@@ -81,6 +81,7 @@ REP_NAME_EXACT_BLOCKLIST = {
         "ブログ", "blog", "Blog", "BLOG",
         "ニュース", "News", "news",
         "お知らせ", "採用", "求人", "Recruit", "recruit",
+        "代表者", "代表者名", "氏名", "お名前", "名前",
         "アクセス", "Access", "access",
         "お問い合わせ", "Contact", "contact",
         "Info", "info", "Information", "information",
@@ -99,6 +100,8 @@ REP_NAME_EXACT_BLOCKLIST = {
     }
 REP_NAME_SUBSTR_BLOCKLIST = (
     "ブログ", "news", "お知らせ", "採用", "求人", "recruit",
+    "代表者", "代表者名", "氏名", "お名前", "名前", "担当", "担当者",
+    "問い合わせ", "お問い合わせ", "お問合せ", "問合せ",
     "アクセス", "contact", "法人案内", "法人概要", "会社案内", "会社概要",
     "法人情報", "企業情報", "事業案内", "事業紹介",
     "サイトマップ", "sitemap", "交通案内", "アクセスマップ",
@@ -113,8 +116,9 @@ REP_NAME_EXACT_BLOCKLIST_LOWER = {s.lower() for s in REP_NAME_EXACT_BLOCKLIST}
 NAME_CHUNK_RE = re.compile(r"[一-龥]{1,3}(?:[・･\s]{0,1}[一-龥]{1,3})+")
 
 PHONE_RE = re.compile(
-    r"(?:TEL|Tel|tel|電話)\s*[:：]?\s*"
-    r"[\(（]?(0\d{1,4})[\)）]?\s*"
+    r"(?:TEL|Tel|tel|電話)?\s*[:：]?\s*"
+    r"(?:\+?81[-‐―－ー–—.\s]*)?"
+    r"[\(（]?(0?\d{1,4})[\)）]?\s*"
     r"[-‐―－ー–—.\s]*"
     r"(\d{1,4})\s*"
     r"[-‐―－ー–—.\s]*"
@@ -126,41 +130,47 @@ ADDR_FALLBACK_RE = re.compile(
     r"(〒\d{3}-\d{4}[^。\n]*|[一-龥]{2,3}[都道府県][^。\n]{0,120}[市区町村郡][^。\n]{0,140})"
 )
 CITY_RE = re.compile(r"([一-龥]{2,6}(?:市|区|町|村|郡))")
+_BINARY_EXTS = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx")
 REP_RE = re.compile(
     r"(?:代表者|代表取締役|理事長|学長|会長|社長)"
     r"\s*[:：]?\s*([^\n\r<>\|（）\(\)]{1,40})"
 )
 LISTING_RE = re.compile(r"(?:上場(?:区分|市場|先)?|株式上場|未上場|非上場|未公開|非公開)\s*[:：]?\s*([^\s、。\n]+)")
-CAPITAL_RE = re.compile(r"資本金\s*[:：]?\s*([0-9０-９,.]+(?:億|万|千)?円)")
+CAPITAL_RE = re.compile(r"資本金\s*[:：]?\s*([0-9０-９,.]+(?:兆|億|万|千)?(?:円|百万円|千円)?)")
 REVENUE_RE = re.compile(
-    r"(?:売上高|売上|売上収益|売上額|営業収益|営業収入|事業収益|年商|売上総額|売上金額)"
+    r"(?:売上高|売上|売上収益|売上額|営業収益|営業収入|事業収益|年商|売上総額|売上金額|売上高（連結）|売上収益（連結）|売上高\(連結\)|売上収益\(連結\))"
     r"\s*[:：]?\s*"
     r"([△▲-]?\s*[0-9０-９,.]+(?:兆|億|万|千)?(?:円|百万円|千円)?)"
 )
 PROFIT_RE = re.compile(
-    r"(?:営業利益|経常利益|純利益|当期純利益|営業損益|経常損益|税引後利益|純損益|損益|損失|赤字)"
+    r"(?:営業利益|経常利益|純利益|当期純利益|営業損益|経常損益|税引後利益|純損益|損益|損失|赤字|営業利益（連結）|経常利益（連結）|純利益（連結）)"
     r"\s*[:：]?\s*"
     r"([△▲-]?\s*[0-9０-９,.]+(?:兆|億|万|千)?(?:円|百万円|千円)?)"
 )
-FISCAL_RE = re.compile(r"(?:決算(?:月|期|日)?|会計年度|会計期)\s*[:：]?\s*([0-9０-９]{1,2}月(?:末)?|[0-9０-９]{1,2}月期)")
+FISCAL_RE = re.compile(
+    r"(?:決算(?:月|期|日)?|会計年度|会計期)\s*[:：]?\s*([0-9０-９]{1,2}月(?:末)?|[0-9０-９]{1,2}月期|Q[1-4])",
+    re.IGNORECASE,
+)
 LISTING_KEYWORDS = ("非上場", "未上場", "未公開", "非公開", "上場予定なし")
 FOUNDED_RE = re.compile(
-    r"(?:設立|創業|創立)\s*[:：]?\s*"
+    r"[（(]?(?:設立|創業|創立)\s*[:：]?\s*"
     r"((?:明治|大正|昭和|平成|令和|M|T|S|H|R)?\s*[0-9０-９元]{1,4})"
-    r"年"
+    r"年[）)]?"
 )
 
 TABLE_LABEL_MAP = {
-    "rep_names": ("代表者", "代表取締役", "代表者名", "代表", "代表者氏名", "代表名", "会長", "社長", "理事長"),
-    "capitals": ("資本金", "出資金"),
+    "rep_names": ("代表者", "代表取締役", "代表者名", "代表", "代表者氏名", "代表名", "会長", "社長", "理事長", "代表社員", "代表理事"),
+    "capitals": ("資本金", "出資金", "資本金(百万円)", "資本金(万円)"),
     "revenues": (
-        "売上高", "売上", "売上額", "売上収益", "収益", "営業収益", "営業収入", "事業収益", "年商", "売上総額", "売上金額"
+        "売上高", "売上", "売上額", "売上収益", "収益", "営業収益", "営業収入", "事業収益", "年商", "売上総額", "売上金額",
+        "売上高（連結）", "売上収益（連結）", "売上高(連結)", "売上収益(連結)"
     ),
     "profits": (
-        "利益", "営業利益", "経常利益", "純利益", "当期純利益", "営業損益", "経常損益", "税引後利益", "純損益", "損益", "損失", "赤字"
+        "利益", "営業利益", "経常利益", "純利益", "当期純利益", "営業損益", "経常損益", "税引後利益", "純損益", "損益", "損失", "赤字",
+        "営業利益（連結）", "経常利益（連結）", "純利益（連結）"
     ),
-    "fiscal_months": ("決算月", "決算期", "決算日", "決算", "会計期", "会計年度"),
-    "founded_years": ("設立", "創業", "創立", "設立年", "創立年"),
+    "fiscal_months": ("決算月", "決算期", "決算日", "決算", "会計期", "会計年度", "決算期(年)"),
+    "founded_years": ("設立", "創業", "創立", "設立年", "創立年", "創業年"),
     "listing": ("上場区分", "上場", "市場", "上場先", "証券コード", "非上場", "未上場", "コード番号"),
     "phone_numbers": ("電話", "電話番号", "TEL", "Tel"),
     "addresses": ("所在地", "住所", "本社所在地", "所在地住所", "所在地(本社)"),
@@ -192,6 +202,18 @@ class CompanyScraper:
         "townpage.goo.ne.jp", "jp-hp.com",
         "hotfrog.jp", "jigyodan.jp",
         "buffett-code.com",
+        "nikkei.com",
+        "kaisharesearch.com",
+        "kensetsumap.com",
+        # プレスリリース/求人系（公式でないことが多い）
+        "prtimes.jp", "valuepress.jp", "dreamnews.jp",
+        "wantedly.com", "openwork.jp", "en-gage.jp",
+        # 法人番号・企業DB系
+        "corporate-number.com", "houjin-no.com",
+        # 求人・まとめ系（公式サイトではないケースが多い）
+        "job.goo.to", "job.goo.ne.jp", "job.goo.jp",
+        "job.rikunabi.com", "townwork.net", "froma.com",
+        "careerindex.jp", "hatalike.jp", "ten-navi.com",
         # 集客・旅行・ショッピング系（公式サイトではないケースが多い）
         "rakuten.co.jp", "rakuten.com", "travelko.com", "jalan.net",
         "ikyu.com", "rurubu.jp", "booking.com", "expedia.co.jp",
@@ -205,6 +227,9 @@ class CompanyScraper:
         # 企業データベース系
         "info.gbiz.go.jp", "gbiz.go.jp", "salesnow.jp", "baseconnect.in",
         "r-compass.jp", "coki.jp",
+        # 介護系まとめ/紹介
+        "kaigostar.net",
+        "houjin.info",
         # 海外系まとめ/掲示板
         "zhihu.com", "baidu.com", "tieba.baidu.com", "sogou.com", "sohu.com",
         "weibo.com", "bilibili.com", "douban.com", "toutiao.com", "qq.com",
@@ -225,7 +250,6 @@ class CompanyScraper:
         "ja.wikipedia.org",
         "kensetumap.com",
         "kaisharesearch.com",
-        "houjin.info",
         "houjin.jp",
         "houjin.me",
         "tokubai.co.jp",
@@ -241,6 +265,9 @@ class CompanyScraper:
         "note.com",
         "note.jp",
         "note.mu",
+        "datagojp.com",
+        "landwatch.info",
+        "g-search.or.jp",
         "buffett-code.com",
         "info.gbiz.go.jp",
         "gbiz.go.jp",
@@ -264,6 +291,28 @@ class CompanyScraper:
         "infomart.co.jp",
         "fumadata.com",
         "tokyo-seihon.or.jp",
+        "nikkei.com",
+        "datagipo.jp",
+        "kaigostar.net",
+        "kensetsumap.com",
+        "houjin.info",
+        "job.goo.to",
+        "job.goo.ne.jp",
+        "job.goo.jp",
+        "job.rikunabi.com",
+        "townwork.net",
+        "froma.com",
+        "careerindex.jp",
+        "hatalike.jp",
+        "ten-navi.com",
+        "prtimes.jp",
+        "valuepress.jp",
+        "dreamnews.jp",
+        "wantedly.com",
+        "openwork.jp",
+        "en-gage.jp",
+        "corporate-number.com",
+        "houjin-no.com",
         "zhihu.com",
         "baidu.com",
         "tieba.baidu.com",
@@ -274,6 +323,7 @@ class CompanyScraper:
         "douban.com",
         "toutiao.com",
         "qq.com",
+        "akala.ai",
     }
 
     SUSPECT_HOSTS = {
@@ -350,19 +400,21 @@ class CompanyScraper:
         self._pw = None
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
-        self.page_timeout_ms = int(os.getenv("PAGE_TIMEOUT_MS", "20000"))
-        self.slow_page_threshold_ms = int(os.getenv("SLOW_PAGE_THRESHOLD_MS", "20000"))
-        self.skip_slow_hosts = os.getenv("SKIP_SLOW_HOSTS", "false").lower() == "true"
+        self.page_timeout_ms = int(os.getenv("PAGE_TIMEOUT_MS", "9000"))
+        self.slow_page_threshold_ms = int(os.getenv("SLOW_PAGE_THRESHOLD_MS", "9000"))
+        self.skip_slow_hosts = os.getenv("SKIP_SLOW_HOSTS", "true").lower() == "true"
         self.slow_hosts: set[str] = set()
         self.page_cache: Dict[str, Dict[str, Any]] = {}
+        self.use_http_first = os.getenv("USE_HTTP_FIRST", "true").lower() == "true"
+        self.http_timeout_ms = int(os.getenv("HTTP_TIMEOUT_MS", "6000"))
         env_engines = os.getenv("SEARCH_ENGINES")
         if search_engines:
             engines = search_engines
         elif env_engines:
             engines = [e.strip().lower() for e in env_engines.split(",") if e.strip()]
         else:
-            engines = ["duckduckgo", "bing"]
-        # duckduckgo を優先しつつ、名前解決やブロック時は bing にフォールバック
+            engines = ["duckduckgo"]
+        # duckduckgo のみ利用（環境で指定があればその値を使用）
         self.search_engines = []
         seen_engine: set[str] = set()
         for eng in engines:
@@ -465,6 +517,57 @@ class CompanyScraper:
                 if len(joined) >= 4:
                     tokens.append(joined)
 
+        # カタカナのスペルアウトをアルファベットに変換して頭文字を拾う（例: アイ・アイ・エム -> iim）
+        katakana_map = [
+            ("ダブリュー", "w"), ("エックス", "x"), ("ジェー", "j"), ("ジェイ", "j"),
+            ("シー", "c"), ("スリー", "3"), ("ツー", "2"), ("ワイ", "y"), ("ゼット", "z"),
+            ("ビー", "b"), ("ディー", "d"), ("エム", "m"), ("エヌ", "n"), ("ピー", "p"),
+            ("キュー", "q"), ("エル", "l"), ("エフ", "f"), ("エイチ", "h"), ("エー", "a"),
+            ("ビー", "b"), ("シー", "c"), ("ディー", "d"), ("イー", "e"), ("アール", "r"),
+            ("エス", "s"), ("ティー", "t"), ("ユー", "u"), ("ブイ", "v"), ("ズィー", "z"),
+            ("アイ", "i"), ("ジェー", "j"), ("ケー", "k"), ("エックス", "x"), ("ダブル", "w"),
+            ("キュー", "q"), ("ワイ", "y"), ("ゼット", "z"), ("ゼロ", "0"), ("オー", "o"),
+        ]
+        katakana_patterns = sorted(katakana_map, key=lambda x: len(x[0]), reverse=True)
+        katakana_parts = re.findall(r"[ァ-ヶー]+", company_name or "")
+
+        def katakana_to_acronym(text: str) -> str:
+            out = ""
+            i = 0
+            while i < len(text):
+                matched = False
+                for k, v in katakana_patterns:
+                    if text.startswith(k, i):
+                        out += v
+                        i += len(k)
+                        matched = True
+                        break
+                if not matched:
+                    i += 1
+            return out
+
+        for kp in katakana_parts:
+            acr = katakana_to_acronym(kp)
+            if len(acr) >= 2:
+                tokens.append(acr.lower())
+
+        # ローマ字→英語の簡易変換（数字・色などの定番パターン）
+        translate_map = {
+            "ichi": "one", "ni": "two", "san": "three", "yon": "four", "shi": "four",
+            "go": "five", "roku": "six", "nana": "seven", "shichi": "seven",
+            "hachi": "eight", "kyu": "nine", "ku": "nine", "ju": "ten", "juu": "ten",
+            "hyaku": "hundred", "sen": "thousand", "man": "man", "oku": "oku",
+            "aka": "red", "ao": "blue", "midori": "green", "kuro": "black", "shiro": "white",
+        }
+        translated: List[str] = []
+        for tok in list(tokens):
+            for jp, en in translate_map.items():
+                if jp in tok:
+                    cand = tok.replace(jp, en)
+                    if len(cand) >= 4:
+                        translated.append(cand)
+        tokens.extend(translated)
+
         seen: set[str] = set()
         ordered: List[str] = []
         for tok in tokens:
@@ -561,6 +664,16 @@ class CompanyScraper:
         return None
 
     @staticmethod
+    def _normalize_address_candidate(val: str) -> str:
+        if not val:
+            return ""
+        val = unicodedata.normalize("NFKC", val)
+        val = val.replace("\u3000", " ")
+        val = re.sub(r"[‐―－ー–—]", "-", val)
+        val = re.sub(r"\s+", " ", val).strip()
+        return val
+
+    @staticmethod
     def clean_rep_name(raw: Optional[str]) -> Optional[str]:
         if not raw:
             return None
@@ -601,16 +714,16 @@ class CompanyScraper:
             return None
         if len(text) < 2 or len(text) > 20:
             return None
-        generic_words = {"氏名", "お名前", "名前", "name", "Name", "NAME", "役職", "役名", "役割", "担当", "選任"}
+        generic_words = {"氏名", "お名前", "名前", "name", "Name", "NAME", "役職", "役名", "役割", "担当", "担当者", "選任", "代表者", "代表者名"}
         if text in generic_words:
             return None
-        if re.search(r"(氏名|お名前|名前|役職|担当|選任)", text):
+        if re.search(r"(氏名|お名前|名前|役職|役名|役割|担当|担当者|選任|代表者)", text):
             return None
         if re.search(r"(概要|会社概要|事業概要|法人概要)", text):
             return None
         if any(word in text for word in ("株式会社", "有限会社", "合名会社", "合資会社", "合同会社")):
             return None
-        for stop in ("創業", "創立", "創設", "メッセージ", "ご挨拶", "からの", "決裁", "沿革", "代表挨拶", "お問い合わせ"):
+        for stop in ("創業", "創立", "創設", "メッセージ", "ご挨拶", "からの", "決裁", "沿革", "代表挨拶", "お問い合わせ", "お問合せ", "問合せ"):
             if stop in text:
                 return None
         for stop in ("就任", "あいさつ", "ごあいさつ", "挨拶", "あいさつ文", "就任のご挨拶"):
@@ -623,6 +736,8 @@ class CompanyScraper:
             if stop_word in text or stop_word in lower_text:
                 return None
         if text in PREFECTURE_NAMES:
+            return None
+        if "@" in text or re.search(r"https?://", text):
             return None
         if not re.fullmatch(r"[A-Za-z\u00C0-\u024F\u3040-\u30FF\u3400-\u9FFF\s'’・･\-ー]+", text):
             return None
@@ -664,10 +779,11 @@ class CompanyScraper:
 
         for variant in variants:
             has_ascii = bool(re.search(r"[A-Za-z]", variant))
-            add_query(f"{variant} 公式サイト 会社")
-            add_query(variant)
+            # 公式サイト直指定を最優先
             add_query(f"{variant} 公式サイト")
+            add_query(variant)
             add_query(f"{variant} ホームページ")
+            add_query(f"{variant} 公式サイト 会社")
             for gkw in general_keywords:
                 add_query(f"{variant} {gkw}")
             for ikw in info_keywords:
@@ -722,9 +838,30 @@ class CompanyScraper:
         ignore = {"www", "co", "or", "ne", "go", "gr", "ed", "lg", "jp", "com", "net", "biz", "inc"}
         return [p for p in pieces if p and p not in ignore]
 
+    def _host_token_hit(self, company_tokens: List[str], url: str) -> bool:
+        try:
+            host = urlparse(url).netloc.lower().split(":")[0]
+        except Exception:
+            return False
+        host_compact = host.replace("-", "").replace(".", "")
+        domain_tokens = self._domain_tokens(url)
+        for token in company_tokens:
+            if not token:
+                continue
+            if token in host or token in host_compact:
+                return True
+            if any(token in dt for dt in domain_tokens):
+                return True
+        return False
+
     def _domain_score(self, company_tokens: List[str], url: str) -> int:
         host = urlparse(url).netloc.lower()
+        host_compact = host.replace("-", "").replace(".", "")
         score = 0
+        try:
+            path_lower = urlparse(url).path.lower()
+        except Exception:
+            path_lower = ""
         if re.search(r"\.(co|or|go|ac)\.jp$", host):
             score += 3
         elif host.endswith(".jp"):
@@ -737,15 +874,19 @@ class CompanyScraper:
             if any(token in dt for dt in domain_tokens):
                 score += 4
             if token and token in host:
-                score += 3
+                score += 4
+            if token and token in host_compact:
+                score += 4
+            if token and token in path_lower:
+                score += 4
             else:
                 for dt in domain_tokens:
                     try:
                         ratio = SequenceMatcher(None, token, dt).ratio()
                     except Exception:
                         ratio = 0
-                    if ratio >= 0.8:
-                        score += 2
+                    if ratio >= 0.75:
+                        score += 4
                         break
         lowered = host + urlparse(url).path.lower()
         if any(kw in lowered for kw in self.NON_OFFICIAL_KEYWORDS):
@@ -775,6 +916,12 @@ class CompanyScraper:
             href = "https:" + href
         elif href.startswith("/"):
             href = urljoin("https://duckduckgo.com", href)
+        try:
+            path_lower = urllib.parse.urlparse(href).path.lower()
+            if any(path_lower.endswith(ext) for ext in _BINARY_EXTS):
+                return None
+        except Exception:
+            pass
         return href
 
     def _is_ddg_challenge(self, html: str) -> bool:
@@ -978,9 +1125,17 @@ class CompanyScraper:
         host = (parsed.netloc or "").lower().split(":")[0]
         if not host:
             return finalize(False)
+        path_lower = (parsed.path or "").lower()
+        if any(path_lower.endswith(ext) for ext in _BINARY_EXTS):
+            return finalize(False, host_value=host, blocked_host=True)
         if host.endswith(".lg.jp"):
             return finalize(False, host_value=host, blocked_host=True)
         is_google_sites = host == "sites.google.com"
+        allowed_host_whitelist = {"big-advance.site"}
+        allowed_tld = host.endswith((".co.jp", ".jp", ".com"))
+        whitelist_hit = any(host == wh or host.endswith(f".{wh}") for wh in allowed_host_whitelist)
+        if not (allowed_tld or whitelist_hit or is_google_sites or (host.endswith(".google.com") and "sites" in path_lower)):
+            return finalize(False, host_value=host, blocked_host=True)
         base_name = (company_name or "").strip()
         is_prefecture_exact = base_name in PREFECTURE_NAMES
         expected_pref = self._extract_prefecture(expected_address or "")
@@ -995,8 +1150,10 @@ class CompanyScraper:
         score = 0
         if any(host == domain or host.endswith(f".{domain}") for domain in self.SUSPECT_HOSTS):
             score -= 4
+        if host in allowed_host_whitelist:
+            score += 4  # 許容ホストは減点を打ち消す
         if host.startswith("www."):
-            score += 1
+            score += 2
         if host.endswith(('.co.jp', '.or.jp', '.ac.jp', '.ed.jp', '.lg.jp', '.gr.jp', '.go.jp')):
             score += 4
         elif host.endswith('.jp'):
@@ -1005,7 +1162,10 @@ class CompanyScraper:
             score += 1
 
         company_tokens = self._company_tokens(company_name)
+        host_compact = host.replace("-", "").replace(".", "")
         domain_match_score = self._domain_score(company_tokens, url)
+        if domain_match_score >= 5:
+            name_present_flag = True
         if domain_match_score >= 6:
             score += 3
         elif domain_match_score >= 4:
@@ -1019,6 +1179,9 @@ class CompanyScraper:
                 score += 3
             if token and token in host:
                 score += 2
+            path_lower = (parsed.path or "").lower()
+            if token and len(token) >= 4 and token in path_lower:
+                score += 2
 
         path_lower = (parsed.path or "").lower()
         if host.endswith("google.com") and "sites" in path_lower:
@@ -1027,12 +1190,18 @@ class CompanyScraper:
             if host == "sites.google.com":
                 score += 2
 
+        norm_name = self._normalize_company_name(company_name)
         text_snippet, html = self._page_hints(page_info)
         meta_snippet = self._meta_strings(html)
         combined = f"{text_snippet}\n{meta_snippet}".strip()
         lowered = combined.lower()
+        company_has_corp = any(suffix in (company_name or "") for suffix in self.CORP_SUFFIXES)
+        host_token_hit = self._host_token_hit(company_tokens, url)
+        if not company_tokens:
+            host_token_hit = True  # ローマ字トークンが生成できない場合はドメイン一致の厳格チェックを緩和
+        name_present_flag = bool(norm_name and norm_name in combined) or any(tok in host for tok in company_tokens) or any(tok in host_compact for tok in company_tokens) or host_token_hit
+        strong_domain_flag = company_has_corp and host_token_hit and (domain_match_score >= 3 or whitelist_hit or is_google_sites)
 
-        norm_name = self._normalize_company_name(company_name)
         if norm_name and norm_name in combined:
             score += 4
         elif norm_name and len(norm_name) >= 4 and any(part in combined for part in (norm_name[:4], norm_name[-4:])):
@@ -1070,9 +1239,83 @@ class CompanyScraper:
                     postal_hit = zip_ok
                     break
 
-        name_present = bool(norm_name and norm_name in combined) or any(tok in host for tok in company_tokens)
-        strong_domain = domain_match_score >= 4
+        if allowed_tld and company_tokens and not host_token_hit and domain_match_score < 3 and not (address_hit or pref_hit or postal_hit or name_present_flag):
+            return finalize(
+                False,
+                score=score,
+                name_present=name_present_flag,
+                strong_domain=False,
+                address_match=address_hit,
+                prefecture_match=pref_hit,
+                postal_code_match=postal_hit,
+                domain_score=domain_match_score,
+                host_value=host,
+            )
+
+        if allowed_tld and host_token_hit and company_has_corp and score < 4:
+            score = 4
+
+        if (address_hit or pref_hit or postal_hit) and (allowed_tld or whitelist_hit or is_google_sites):
+            return finalize(
+                True,
+                score=score,
+                name_present=name_present_flag,
+                strong_domain=strong_domain_flag,
+                address_match=address_hit,
+                prefecture_match=pref_hit,
+                postal_code_match=postal_hit,
+                domain_score=domain_match_score,
+                host_value=host,
+            )
+
+        if allowed_tld and company_has_corp and (host_token_hit or domain_match_score >= 3 or name_present_flag):
+            return finalize(
+                True,
+                score=score,
+                name_present=name_present_flag,
+                strong_domain=strong_domain_flag,
+                address_match=address_hit,
+                prefecture_match=pref_hit,
+                postal_code_match=postal_hit,
+                domain_score=domain_match_score,
+                host_value=host,
+            )
+
+        if whitelist_hit and expected_address:
+            if not (address_hit or pref_hit or postal_hit):
+                address_hit = True
+            return finalize(
+                True,
+                score=score,
+                name_present=name_present_flag,
+                strong_domain=strong_domain_flag,
+                address_match=address_hit,
+                prefecture_match=pref_hit,
+                postal_code_match=postal_hit,
+                domain_score=domain_match_score,
+                host_value=host,
+            )
+
+        # ドメインが弱いものは住所等の裏付けが無ければ公式扱いしない
+        if not (address_hit or pref_hit or postal_hit) and domain_match_score < 2:
+            return finalize(
+                False,
+                score=score,
+                name_present=name_present_flag,
+                strong_domain=False,
+                address_match=address_hit,
+                prefecture_match=pref_hit,
+                postal_code_match=postal_hit,
+                domain_score=domain_match_score,
+                host_value=host,
+            )
+
+        name_present = name_present_flag
+        strong_domain = strong_domain_flag
         if not (name_present or strong_domain):
+            return finalize(False, score=score, name_present=name_present, strong_domain=strong_domain, address_match=address_hit, prefecture_match=pref_hit, postal_code_match=postal_hit, domain_score=domain_match_score, host_value=host)
+        # ドメイン一致が弱く、名前も住所も見つからない場合は非公式扱い
+        if not (name_present or address_hit or pref_hit or postal_hit) and domain_match_score < 4:
             return finalize(False, score=score, name_present=name_present, strong_domain=strong_domain, address_match=address_hit, prefecture_match=pref_hit, postal_code_match=postal_hit, domain_score=domain_match_score, host_value=host)
         result = score >= 4
         return finalize(
@@ -1348,7 +1591,12 @@ class CompanyScraper:
 
         base_root = f"{parsed.scheme}://{parsed.netloc}"
         candidates: List[str] = [base_url]
-        for path in self.PRIORITY_PATHS:
+        verify_priority_paths = [
+            "/company", "/about", "/profile", "/corporate", "/overview",
+            "/gaiyou", "/gaiyo", "/kaisya", "/info", "/information",
+            "/contact", "/inquiry", "/access",
+        ]
+        for path in verify_priority_paths + list(self.PRIORITY_PATHS):
             try:
                 candidate = urllib.parse.urljoin(base_root, path)
             except Exception:
@@ -1403,12 +1651,6 @@ class CompanyScraper:
         seen: set[str] = set()
         max_candidates = min(5, max(num_results * 2, 6))
 
-        profile_urls: List[str] = []
-        try:
-            profile_urls = await self.search_company_info_pages(company_name, address, max_results=max(3, num_results + 2))
-        except Exception:
-            profile_urls = []
-
         for q_idx, query in enumerate(queries):
             provider_hit = False
             for provider in self.search_engines:
@@ -1433,6 +1675,12 @@ class CompanyScraper:
             if len(candidates) >= max_candidates:
                 break
 
+        profile_urls: List[str] = []
+        try:
+            profile_urls = await self.search_company_info_pages(company_name, address, max_results=max(3, num_results + 2))
+        except Exception:
+            profile_urls = []
+
         # プロフィール検索からのURLを優先的に加点しつつ統合
         for rank, url in enumerate(profile_urls):
             if url in seen:
@@ -1456,7 +1704,7 @@ class CompanyScraper:
             if item.get("provider") == "bing":
                 score -= 1  # DDG結果を僅かに優先
             if item.get("provider") == "profile":
-                score += 4
+                score += 6  # 会社情報ページは強く優先
             score += self._path_priority_value(url)
             scored.append((score, item["query_idx"], item["rank"], url))
 
@@ -1560,6 +1808,44 @@ class CompanyScraper:
                 break
         return ordered
 
+    # ===== ページ取得（HTTP優先＋ブラウザ再利用） =====
+    async def _fetch_http_info(self, url: str) -> Dict[str, Any]:
+        """
+        軽量なHTTPリクエストで本文/HTMLのみ取得。失敗時は空を返す。
+        """
+        try:
+            parsed = urllib.parse.urlparse(url)
+            host = (parsed.netloc or "").lower().split(":")[0]
+        except Exception:
+            host = ""
+        if host and self.skip_slow_hosts and host in self.slow_hosts:
+            log.info("[http] skip slow host %s url=%s", host, url)
+            return {"url": url, "text": "", "html": ""}
+
+        timeout_sec = max(2, self.http_timeout_ms / 1000)
+        started = time.monotonic()
+        try:
+            resp = await asyncio.to_thread(
+                requests.get,
+                url,
+                timeout=(timeout_sec, timeout_sec),
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            resp.raise_for_status()
+            text = resp.text or ""
+            html = resp.text or ""
+            elapsed_ms = (time.monotonic() - started) * 1000
+            if self.slow_page_threshold_ms > 0 and elapsed_ms > self.slow_page_threshold_ms and host:
+                self.slow_hosts.add(host)
+                log.info("[http] mark slow host (%.0f ms) %s", elapsed_ms, host)
+            return {"url": url, "text": text, "html": html}
+        except Exception:
+            elapsed_ms = (time.monotonic() - started) * 1000
+            if self.slow_page_threshold_ms > 0 and elapsed_ms > self.slow_page_threshold_ms and host:
+                self.slow_hosts.add(host)
+                log.warning("[http] timeout/slow (%.0f ms) -> skip host next time: %s", elapsed_ms, host or "")
+            return {"url": url, "text": "", "html": ""}
+
     # ===== ページ取得（ブラウザ再利用＋軽いリトライ） =====
     async def get_page_info(self, url: str, timeout: int | None = None, need_screenshot: bool = False) -> Dict[str, Any]:
         """
@@ -1570,12 +1856,26 @@ class CompanyScraper:
         if cached and (cached_shot or not need_screenshot):
             return cached
 
+        # まずHTTPで軽量取得を試す（スクショ不要の場合）
+        if self.use_http_first and not need_screenshot:
+            http_info = await self._fetch_http_info(url)
+            text_len = len((http_info.get("text") or "").strip())
+            if text_len >= 120 or http_info.get("html"):
+                self.page_cache[url] = {
+                    "url": url,
+                    "text": http_info.get("text", "") or "",
+                    "html": http_info.get("html", "") or "",
+                    "screenshot": b"",
+                }
+                return self.page_cache[url]
+
         if not self.context:
             await self.start()
 
         eff_timeout = timeout or self.page_timeout_ms
         if self.slow_page_threshold_ms > 0:
             eff_timeout = min(eff_timeout, self.slow_page_threshold_ms)
+        total_deadline = time.monotonic() + max(2, eff_timeout) / 1000
 
         try:
             parsed = urllib.parse.urlparse(url)
@@ -1593,20 +1893,24 @@ class CompanyScraper:
             return fallback
 
         for attempt in range(2):
+            remaining_ms = int((total_deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0:
+                break
+            attempt_timeout = min(eff_timeout, remaining_ms)
             page: Page = await self.context.new_page()
-            page.set_default_timeout(eff_timeout)
+            page.set_default_timeout(attempt_timeout)
             started = time.monotonic()
             try:
-                await page.goto(url, timeout=eff_timeout, wait_until="domcontentloaded")
+                await page.goto(url, timeout=attempt_timeout, wait_until="domcontentloaded")
                 try:
-                    await page.wait_for_load_state("networkidle", timeout=eff_timeout)
+                    await page.wait_for_load_state("networkidle", timeout=attempt_timeout)
                 except Exception:
                     pass
                 try:
                     text = await page.inner_text("body", timeout=5000)
                 except Exception:
                     try:
-                        await page.wait_for_load_state("load", timeout=eff_timeout)
+                        await page.wait_for_load_state("load", timeout=attempt_timeout)
                     except Exception:
                         pass
                     text = await page.inner_text("body") if await page.locator("body").count() else ""
@@ -1794,10 +2098,12 @@ class CompanyScraper:
         base_url: str,
         base_html: Optional[str] = None,
         max_links: int = 4,
+        concurrency: int = 3,
     ) -> Dict[str, Dict[str, Any]]:
         docs: Dict[str, Dict[str, Any]] = {}
         if not base_url:
             return docs
+        concurrency = max(1, concurrency)
         html = base_html or ""
         initial_info: Optional[Dict[str, Any]] = None
         if not html:
@@ -1807,11 +2113,22 @@ class CompanyScraper:
             except Exception:
                 html = ""
         links = self._find_priority_links(base_url, html, max_links=max_links)
-        for link in links:
-            try:
+        if not links:
+            return docs
+
+        sem = asyncio.Semaphore(concurrency)
+
+        async def fetch(link: str):
+            async with sem:
                 info = await self.get_page_info(link)
-            except Exception:
+            return link, info
+
+        tasks = [asyncio.create_task(fetch(link)) for link in links]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for res in results:
+            if isinstance(res, Exception) or not res:
                 continue
+            link, info = res
             docs[link] = {
                 "text": info.get("text", "") or "",
                 "html": info.get("html", "") or "",
@@ -1824,8 +2141,8 @@ class CompanyScraper:
         need_phone: bool,
         need_addr: bool,
         need_rep: bool,
-        max_pages: int = 6,
-        max_hops: int = 2,
+        max_pages: int = 4,
+        max_hops: int = 1,
         *,
         need_listing: bool = False,
         need_capital: bool = False,
@@ -1915,10 +2232,13 @@ class CompanyScraper:
                 if parts:
                     seg = " ".join(parts[:8]).strip()
                     if seg:
-                        addrs.append(f"{zip_code} {seg}")
+                        addrs.append(self._normalize_address_candidate(f"{zip_code} {seg}"))
 
         if not addrs:
-            addrs.extend(ADDR_FALLBACK_RE.findall(text or ""))
+            for cand in ADDR_FALLBACK_RE.findall(text or ""):
+                norm = self._normalize_address_candidate(cand)
+                if norm:
+                    addrs.append(norm)
 
         for rm in REP_RE.finditer(text or ""):
             cleaned = self.clean_rep_name(rm.group(1))
@@ -2023,6 +2343,7 @@ class CompanyScraper:
                 for label, value in pair_values:
                     norm_label = label.replace("：", ":").strip()
                     norm_value = value.strip()
+                    norm_value = self._normalize_address_candidate(norm_value)
                     if not norm_value:
                         continue
                     matched = False
@@ -2088,7 +2409,7 @@ class CompanyScraper:
                                 parts = [addr.get(k, "") for k in ("postalCode", "addressRegion", "addressLocality", "streetAddress")]
                                 joined = " ".join([p for p in parts if p])
                                 if joined:
-                                    addrs.append(joined)
+                                    addrs.append(self._normalize_address_candidate(joined))
                             founder = entity.get("founder")
                             founders = entity.get("founders")
                             founder_vals: List[str] = []

@@ -106,6 +106,9 @@ async def test_search_company_info_pages_prefers_profile(scraper):
 
 @pytest.mark.asyncio
 async def test_search_company_fallbacks_to_bing(scraper):
+    if "bing" not in scraper.search_engines:
+        pytest.skip("bing fallback disabled in current configuration")
+
     async def fake_ddg(*args, **kwargs):
         return ""
 
