@@ -1199,8 +1199,9 @@ class CompanyScraper:
         host_token_hit = self._host_token_hit(company_tokens, url)
         if not company_tokens:
             host_token_hit = True  # ローマ字トークンが生成できない場合はドメイン一致の厳格チェックを緩和
-        name_present_flag = bool(norm_name and norm_name in combined) or any(tok in host for tok in company_tokens) or any(tok in host_compact for tok in company_tokens) or host_token_hit
-        strong_domain_flag = company_has_corp and host_token_hit and (domain_match_score >= 3 or whitelist_hit or is_google_sites)
+        loose_host_hit = host_token_hit or (company_has_corp and allowed_tld and domain_match_score >= 3)
+        name_present_flag = bool(norm_name and norm_name in combined) or any(tok in host for tok in company_tokens) or any(tok in host_compact for tok in company_tokens) or loose_host_hit
+        strong_domain_flag = company_has_corp and loose_host_hit and (domain_match_score >= 3 or whitelist_hit or is_google_sites)
 
         if norm_name and norm_name in combined:
             score += 4
@@ -1238,19 +1239,6 @@ class CompanyScraper:
                     pref_hit = pref_ok
                     postal_hit = zip_ok
                     break
-
-        if allowed_tld and company_tokens and not host_token_hit and domain_match_score < 3 and not (address_hit or pref_hit or postal_hit or name_present_flag):
-            return finalize(
-                False,
-                score=score,
-                name_present=name_present_flag,
-                strong_domain=False,
-                address_match=address_hit,
-                prefecture_match=pref_hit,
-                postal_code_match=postal_hit,
-                domain_score=domain_match_score,
-                host_value=host,
-            )
 
         if allowed_tld and host_token_hit and company_has_corp and score < 4:
             score = 4
