@@ -737,7 +737,7 @@ class CompanyScraper:
         text = text.strip()
         if not text:
             return None
-        if len(text) < 2 or len(text) > 20:
+        if len(text) < 2 or len(text) > 40:
             return None
         generic_words = {"氏名", "お名前", "名前", "name", "Name", "NAME", "役職", "役名", "役割", "担当", "担当者", "選任", "代表者", "代表者名"}
         if text in generic_words:
@@ -767,15 +767,12 @@ class CompanyScraper:
         if not re.fullmatch(r"[A-Za-z\u00C0-\u024F\u3040-\u30FF\u3400-\u9FFF\s'’・･\-ー]+", text):
             return None
         tokens = [tok for tok in re.split(r"\s+", text) if tok]
-        if len(tokens) > 4:
+        if len(tokens) > 6:
             return None
-        if any(len(tok) > 10 for tok in tokens if re.search(r"[一-龥]", tok)):
+        if any(len(tok) > 15 for tok in tokens if re.search(r"[一-龥]", tok)):
             return None
         if re.search(r"(こと|する|される|ます|でした|いたします|いただき)", text):
             return None
-        chunk = CompanyScraper._extract_name_chunk(text)
-        if chunk:
-            text = chunk
         if not re.search(r"[一-龥ぁ-んァ-ン]", text):
             return None
         return text
@@ -990,10 +987,11 @@ class CompanyScraper:
             or "bots use duckduckgo too" in lowered
         )
 
-    def _fetch_duckduckgo_via_proxy(self, query: str) -> str:
+    async def _fetch_duckduckgo_via_proxy(self, query: str) -> str:
         try:
             proxy_url = "https://r.jina.ai/https://duckduckgo.com/html/"
-            resp = requests.get(
+            resp = await asyncio.to_thread(
+                requests.get,
                 proxy_url,
                 params={"q": query, "kl": "jp-jp"},
                 headers={"User-Agent": "Mozilla/5.0"},
@@ -1061,7 +1059,8 @@ class CompanyScraper:
         }
         for attempt in range(3):
             try:
-                resp = requests.get(
+                resp = await asyncio.to_thread(
+                    requests.get,
                     "https://html.duckduckgo.com/html",
                     params={"q": query, "kl": "jp-jp"},
                     headers=headers,
@@ -1073,7 +1072,7 @@ class CompanyScraper:
                 resp.raise_for_status()
                 text = resp.text
                 if self._is_ddg_challenge(text):
-                    proxy_html = self._fetch_duckduckgo_via_proxy(query)
+                    proxy_html = await self._fetch_duckduckgo_via_proxy(query)
                     if proxy_html:
                         return proxy_html
                     await asyncio.sleep(0.8 * (2 ** attempt))
@@ -1081,7 +1080,7 @@ class CompanyScraper:
                 return text
             except Exception:
                 if attempt == 2:
-                    return self._fetch_duckduckgo_via_proxy(query)
+                    return await self._fetch_duckduckgo_via_proxy(query)
                 await asyncio.sleep(0.8 * (2 ** attempt))
         return ""
 
@@ -1094,7 +1093,8 @@ class CompanyScraper:
         params = {"q": query, "setlang": "ja", "mkt": "ja-JP"}
         for attempt in range(3):
             try:
-                resp = requests.get(
+                resp = await asyncio.to_thread(
+                    requests.get,
                     "https://www.bing.com/search",
                     params=params,
                     headers=headers,
@@ -1247,7 +1247,8 @@ class CompanyScraper:
         meta_snippet = self._meta_strings(html)
         combined = f"{text_snippet}\n{meta_snippet}".strip()
         lowered = combined.lower()
-        company_has_corp = any(suffix in (company_name or "") for suffix in self.CORP_SUFFIXES)
+        entity_tags = self._detect_entity_tags(company_name)
+        company_has_corp = any(suffix in (company_name or "") for suffix in self.CORP_SUFFIXES) or bool(entity_tags)
         host_token_hit = self._host_token_hit(company_tokens, url)
         if not company_tokens:
             host_token_hit = True  # ローマ字トークンが生成できない場合はドメイン一致の厳格チェックを緩和

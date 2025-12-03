@@ -15,7 +15,7 @@ from bs4 import BeautifulSoup
 
 from src.database_manager import DatabaseManager
 from src.company_scraper import CompanyScraper
-from src.ai_verifier import AIVerifier, DEFAULT_MODEL as AI_MODEL_NAME
+from src.ai_verifier import AIVerifier, DEFAULT_MODEL as AI_MODEL_NAME, _normalize_amount as ai_normalize_amount
 from src.reference_checker import ReferenceChecker
 
 # --------------------------------------------------
@@ -148,6 +148,31 @@ def normalize_address(s: str | None) -> str | None:
         return f"〒{m.group(1)} {body}"
     return s if s else None
 
+
+def looks_like_address(text: str | None) -> bool:
+    """
+    明らかに住所ではない文字列（例: 「企業理念」「企業紹介映像」など）を弾くための軽い判定。
+    - 郵便番号 or 都道府県名が含まれていれば住所らしいとみなす
+    """
+    if not text:
+        return False
+    s = (text or "").strip()
+    if not s:
+        return False
+    # 郵便番号があれば住所として扱う
+    if ZIP_CODE_RE.search(s):
+        return True
+    # 都道府県名が含まれていれば住所らしいとみなす
+    try:
+        if any(pref in s for pref in CompanyScraper.PREFECTURE_NAMES):
+            return True
+    except Exception:
+        pass
+    # 「丁目」「番地」など住所に特有の語を含むか
+    if re.search(r"(丁目|番地|号|ビル|マンション)", s):
+        return True
+    return False
+
 def addr_compatible(input_addr: str, found_addr: str) -> bool:
     input_addr = normalize_address(input_addr)
     found_addr = normalize_address(found_addr)
@@ -215,9 +240,22 @@ def clean_listing_value(val: str) -> str:
     return ""
 
 def clean_amount_value(val: str) -> str:
-    text = (val or "").strip().replace("　", " ")
-    if not text:
+    raw = (val or "").strip()
+    if not raw:
         return ""
+    # まず AI 側と同等の金額正規化ロジックを流用して数値＋「円」に統一を試みる
+    try:
+        normalized = ai_normalize_amount(raw)
+    except Exception:
+        normalized = None
+    if isinstance(normalized, str) and normalized.strip():
+        return normalized.strip()[:40]
+
+    # フォールバック: 単位付きの金額部分だけを抽出して軽くクレンジング
+    text = raw.replace("　", " ")
+    m = re.search(r"([0-9０-９,\.]+(?:兆|億|百|十)?万円?|[0-9０-９,\.]+円)", text)
+    if m:
+        text = m.group(1)
     if not re.search(r"[0-9０-９]", text):
         return ""
     if not any(unit in text for unit in AMOUNT_ALLOWED_UNITS):
@@ -917,9 +955,9 @@ async def process():
                 provisional_info = None
                 provisional_cands: dict[str, list[str]] = {}
                 provisional_domain_score = 0
+                best_record: dict[str, Any] | None = None
                 if not homepage and candidate_records:
                     best_score = float("-inf")
-                    best_record: dict[str, Any] | None = None
                     for record in candidate_records:
                         normalized_url = record.get("normalized_url") or record.get("url")
                         rule_details = record.get("rule") or {}
@@ -978,6 +1016,30 @@ async def process():
                     chosen_domain_score = provisional_domain_score
                     force_review = True
 
+                if not homepage and timed_out and best_record:
+                    normalized_url = best_record.get("normalized_url") or best_record.get("url") or ""
+                    if normalized_url:
+                        rule_details = best_record.get("rule") or {}
+                        domain_score = int(best_record.get("domain_score") or 0)
+                        host_token_hit = bool(best_record.get("host_token_hit"))
+                        strong_domain_host = bool(best_record.get("strong_domain_host"))
+                        name_present = bool(rule_details.get("name_present"))
+                        strong_domain = bool(rule_details.get("strong_domain"))
+                        addr_hit = bool(rule_details.get("address_match"))
+                        pref_hit = bool(rule_details.get("prefecture_match"))
+                        zip_hit = bool(rule_details.get("postal_code_match"))
+                        address_ok = addr_hit or pref_hit or zip_hit
+                        if host_token_hit or domain_score >= 2 or name_present or strong_domain or address_ok:
+                            log.info("[%s] タイムアウトで暫定公式として保存: %s", cid, normalized_url)
+                            homepage = normalized_url
+                            info = best_record.get("info")
+                            primary_cands = best_record.get("extracted") or {}
+                            homepage_official_flag = 0
+                            homepage_official_source = homepage_official_source or "provisional_timeout"
+                            homepage_official_score = float(rule_details.get("score") or 0.0)
+                            chosen_domain_score = domain_score
+                            force_review = True
+
                 official_phase_end = elapsed()
                 priority_docs: dict[str, dict[str, Any]] = {}
 
@@ -1008,6 +1070,10 @@ async def process():
                 verify_result = {"phone_ok": False, "address_ok": False}
                 verify_result_source = "none"
                 confidence = 0.0
+                rule_phone = None
+                rule_address = None
+                rule_rep = None
+
                 need_listing = not bool(listing_val)
                 need_capital = not bool(capital_val)
                 need_revenue = not bool(revenue_val)
@@ -1015,9 +1081,6 @@ async def process():
                 need_fiscal = not bool(fiscal_val)
                 need_founded = not bool(founded_val)
                 need_description = not bool(description_val)
-                rule_phone = None
-                rule_address = None
-                rule_rep = None
 
                 info_dict = info or {}
                 info_url = homepage
@@ -1083,6 +1146,32 @@ async def process():
                             description_val = lead_desc
                             need_description = False
 
+                def refresh_need_flags() -> tuple[int, int]:
+                    nonlocal need_phone, need_addr, need_rep
+                    nonlocal need_listing, need_capital, need_revenue
+                    nonlocal need_profit, need_fiscal, need_founded, need_description
+                    need_phone = not bool(phone or rule_phone)
+                    need_addr = not bool(found_address or rule_address or addr)
+                    need_rep = not bool(rep_name_val or rule_rep)
+                    need_listing = not bool(listing_val)
+                    need_capital = not bool(capital_val)
+                    need_revenue = not bool(revenue_val)
+                    need_profit = not bool(profit_val)
+                    need_fiscal = not bool(fiscal_val)
+                    need_founded = not bool(founded_val)
+                    need_description = not bool(description_val)
+                    missing_contact = int(need_phone) + int(need_addr) + int(need_rep)
+                    missing_extra = sum([
+                        int(need_listing), int(need_capital), int(need_revenue),
+                        int(need_profit), int(need_fiscal), int(need_founded), int(need_description),
+                    ])
+                    return missing_contact, missing_extra
+
+                if homepage and info_dict:
+                    absorb_doc_data(info_url, info_dict)
+
+                missing_contact, missing_extra = refresh_need_flags()
+
                 def quick_verify_from_docs(phone_val: str | None, addr_val: str | None) -> dict[str, Any]:
                     result = {"phone_ok": False, "address_ok": False}
                     phone_pat = scraper._phone_variants_regex(phone_val) if phone_val else None  # type: ignore
@@ -1112,6 +1201,7 @@ async def process():
                             break
                     return result
 
+                fully_filled = False
                 if homepage:
                     info_dict = info or {}
                     info_url = info_dict.get("url") or homepage
@@ -1134,8 +1224,11 @@ async def process():
                         src_phone = info_url
                     if rule_address and not src_addr:
                         src_addr = info_url
-                    if rule_rep and not src_rep:
-                        src_rep = info_url
+                    if rule_rep:
+                        if not rep_name_val or len(rule_rep) > len(rep_name_val):
+                            rep_name_val = rule_rep
+                        if not src_rep:
+                            src_rep = info_url
                     if listings and not listing_val:
                         listing_val = listings[0].strip()
                     if capitals and not capital_val:
@@ -1168,38 +1261,21 @@ async def process():
                             description_val = lead_desc
                             need_description = False
 
+                    missing_contact, missing_extra = refresh_need_flags()
+
                     if over_time_limit():
                         timed_out = True
 
-                    fully_filled = (
-                        homepage
-                        and (rule_phone or phone)
-                        and (rule_address or found_address)
-                        and (rule_rep or rep_name_val)
-                        and not any([
-                            need_listing, need_capital, need_revenue,
-                            need_profit, need_fiscal, need_founded, need_description,
-                        ])
-                    )
+                    fully_filled = homepage and missing_contact == 0 and missing_extra == 0
 
                     try:
-                        extra_need = any([
-                            not rule_phone,
-                            not rule_address,
-                            not rule_rep,
-                            need_description,
-                            need_listing,
-                            need_capital,
-                            need_revenue,
-                            need_profit,
-                            need_fiscal,
-                            need_founded,
-                        ])
                         # 深掘りは不足があるときだけ最小限に実施
-                        priority_limit = 3 if extra_need else 0
+                        priority_limit = 0
+                        if not timed_out and not fully_filled:
+                            priority_limit = 3 if missing_contact else (2 if missing_extra else 0)
                         site_docs = (
                             {}
-                            if timed_out or fully_filled or priority_limit == 0
+                            if priority_limit == 0
                             else await scraper.fetch_priority_documents(
                                 homepage,
                                 info_dict.get("html", ""),
@@ -1212,67 +1288,18 @@ async def process():
                     for url, pdata in site_docs.items():
                         priority_docs[url] = pdata
                         absorb_doc_data(url, pdata)
+                    if site_docs:
+                        missing_contact, missing_extra = refresh_need_flags()
 
                 ai_result = None
                 ai_attempted = False
                 ai_task: asyncio.Task | None = None
-                pre_ai_phone_ok = bool(rule_phone or phone)
-                pre_ai_addr_ok = bool(rule_address or found_address)
-                pre_ai_rep_ok = bool(rule_rep or rep_name_val)
-                ai_needed = (
-                    homepage
-                    and USE_AI
-                    and verifier is not None
-                    and any([
-                        not pre_ai_phone_ok,
-                        not pre_ai_addr_ok,
-                        not pre_ai_rep_ok,
-                        need_listing,
-                        need_capital,
-                        need_revenue,
-                        need_profit,
-                        need_fiscal,
-                        need_founded,
-                        need_description,
-                    ])
-                )
-                if ai_needed and not timed_out:
-                    ai_attempted = True
-                    info_dict = await ensure_info_has_screenshot(scraper, info_url, info_dict, need_screenshot=OFFICIAL_AI_USE_SCREENSHOT)
-                    info = info_dict
-
-                    async def run_ai_verify():
-                        nonlocal ai_time_spent
-                        ai_started = time.monotonic()
-                        try:
-                            res = await verifier.verify_info(
-                                info_dict.get("text", "") or "",
-                                info_dict.get("screenshot"),
-                                name,
-                                addr,
-                            )
-                        except Exception:
-                            log.warning("[%s] AI検証失敗 -> ルールベースにフォールバック", cid, exc_info=True)
-                            return None
-                        finally:
-                            ai_time_spent += time.monotonic() - ai_started
-                        return res
-
-                    ai_task = asyncio.create_task(run_ai_verify())
 
                 # 外部プロフィール検索（同一ドメインのみ最大2件）
                 need_external_profiles = (
                     not homepage
-                    or not rule_phone
-                    or not rule_address
-                    or not rule_rep
-                    or need_listing
-                    or need_capital
-                    or need_revenue
-                    or need_profit
-                    or need_fiscal
-                    or need_founded
-                    or need_description
+                    or missing_contact > 0
+                    or missing_extra > 0
                 )
 
                 if need_external_profiles and not timed_out and not fully_filled:
@@ -1318,13 +1345,48 @@ async def process():
                             }
                             priority_docs[profile_url] = pdata
                             absorb_doc_data(profile_url, pdata)
+                        missing_contact, missing_extra = refresh_need_flags()
+
+                missing_contact, missing_extra = refresh_need_flags()
+                pre_ai_phone_ok = bool(rule_phone or phone)
+                pre_ai_addr_ok = bool(rule_address or found_address)
+                pre_ai_rep_ok = bool(rule_rep or rep_name_val)
+                ai_needed = (
+                    homepage
+                    and USE_AI
+                    and verifier is not None
+                    and (missing_contact > 0 or missing_extra > 0 or not pre_ai_phone_ok or not pre_ai_addr_ok or not pre_ai_rep_ok)
+                )
+                if ai_needed and not timed_out:
+                    ai_attempted = True
+                    info_dict = await ensure_info_has_screenshot(scraper, info_url, info_dict, need_screenshot=OFFICIAL_AI_USE_SCREENSHOT)
+                    info = info_dict
+
+                    async def run_ai_verify():
+                        nonlocal ai_time_spent
+                        ai_started = time.monotonic()
+                        try:
+                            res = await verifier.verify_info(
+                                info_dict.get("text", "") or "",
+                                info_dict.get("screenshot"),
+                                name,
+                                addr,
+                            )
+                        except Exception:
+                            log.warning("[%s] AI検証失敗 -> ルールベースにフォールバック", cid, exc_info=True)
+                            return None
+                        finally:
+                            ai_time_spent += time.monotonic() - ai_started
+                        return res
+
+                    ai_task = asyncio.create_task(run_ai_verify())
 
                 ai_phone: str | None = None
                 ai_addr: str | None = None
                 ai_rep: str | None = None
                 if ai_task:
                     ai_result = await ai_task
-                elif info_url and verifier is not None and USE_AI and not timed_out:
+                elif ai_needed and info_url and verifier is not None and USE_AI and not timed_out:
                     # 公式候補はあるがテキストが乏しい場合のフォールバック: 再取得してでもAIを1回回す
                     try:
                         info_dict = await ensure_info_has_screenshot(scraper, info_url, info_dict, need_screenshot=OFFICIAL_AI_USE_SCREENSHOT)
@@ -1376,28 +1438,21 @@ async def process():
                 else:
                     if ai_attempted and AI_COOLDOWN_SEC > 0:
                         await asyncio.sleep(jittered_seconds(AI_COOLDOWN_SEC, JITTER_RATIO))
-                need_listing = not bool(listing_val)
-                need_capital = not bool(capital_val)
-                need_revenue = not bool(revenue_val)
-                need_profit = not bool(profit_val)
-                need_fiscal = not bool(fiscal_val)
-                need_founded = not bool(founded_val)
-                need_description = not bool(description_val)
+                missing_contact, missing_extra = refresh_need_flags()
 
                 # AI 2回目: まだ欠損がある場合に、優先リンクから集めたテキストで再度問い合わせ
                 if USE_AI and verifier is not None and priority_docs and not timed_out:
-                    missing_fields = any([
-                        not phone,
-                        not found_address,
-                        not rep_name_val,
-                        need_description,
-                        need_listing,
-                        need_capital,
-                        need_revenue,
-                        need_profit,
-                        need_fiscal,
-                        need_founded,
+                    provisional_contact_missing = int(not (phone or ai_phone or rule_phone)) + int(not (found_address or ai_addr or rule_address or addr)) + int(not (rep_name_val or ai_rep or rule_rep))
+                    missing_extra = sum([
+                        int(need_description),
+                        int(need_listing),
+                        int(need_capital),
+                        int(need_revenue),
+                        int(need_profit),
+                        int(need_fiscal),
+                        int(need_founded),
                     ])
+                    missing_fields = (provisional_contact_missing > 0) or (missing_extra >= 2)
                     if missing_fields:
                         combined_text = "\n\n".join(v.get("text", "") or "" for v in priority_docs.values())
                         if combined_text.strip():
@@ -1456,18 +1511,13 @@ async def process():
                                     found_address = ai_addr2
                                     address_source = "ai"
                                     src_addr = info_url
-                                if ai_rep2 and not rep_name_val:
+                                if ai_rep2 and (not rep_name_val or len(ai_rep2) > len(rep_name_val)):
                                     rep_name_val = ai_rep2
                                     src_rep = info_url
                                 if isinstance(desc2, str) and desc2.strip() and not description_val:
                                     description_val = desc2.strip()[:50]
-                                need_listing = not bool(listing_val)
-                                need_capital = not bool(capital_val)
-                                need_revenue = not bool(revenue_val)
-                                need_profit = not bool(profit_val)
-                                need_fiscal = not bool(fiscal_val)
-                                need_founded = not bool(founded_val)
-                                need_description = not bool(description_val)
+
+                    missing_contact, missing_extra = refresh_need_flags()
 
                     if ai_phone:
                         phone = ai_phone
@@ -1496,29 +1546,26 @@ async def process():
                         address_source = "none"
 
                     if ai_rep:
-                        rep_name_val = ai_rep
-                        src_rep = info_url
-                    elif rule_rep:
-                        rep_name_val = rule_rep
-                        if not src_rep:
+                        if not rep_name_val or len(ai_rep) > len(rep_name_val):
+                            rep_name_val = ai_rep
                             src_rep = info_url
+                    elif rule_rep:
+                        if not rep_name_val or len(rule_rep) > len(rep_name_val):
+                            rep_name_val = rule_rep
+                            if not src_rep:
+                                src_rep = info_url
 
                     # 欠落情報があれば浅く探索して補完
-                    need_phone = not bool(phone)
-                    need_addr = not bool(found_address)
-                    need_rep = not bool(rep_name_val)
-                    need_extra_fields = any([
-                        need_listing, need_capital, need_revenue,
-                        need_profit, need_fiscal, need_founded, need_description,
-                    ])
-                    related_page_limit = 3 if need_extra_fields else 2
-                    if need_phone or need_addr or need_rep or need_extra_fields:
+                    missing_contact, missing_extra = refresh_need_flags()
+                    need_extra_fields = missing_extra > 0
+                    related_page_limit = 2 if missing_extra else 1
+                    related = {}
+                    if not timed_out and ((missing_contact > 0) or need_extra_fields):
                         if over_time_limit() or over_deep_limit():
                             timed_out = True
-                            related = {}
                         else:
+                            more_pages = 1 if (need_phone or need_addr or need_rep or need_description) else 0
                             try:
-                                more_pages = 1 if (need_phone or need_addr or need_rep or need_description) else 1
                                 related = await scraper.crawl_related(
                                     homepage,
                                     need_phone,
@@ -1648,8 +1695,8 @@ async def process():
                     company["description"] = company.get("description", "") or ""
                     confidence = 0.4
 
-                # 公式サイトから取得できなかった指標は検索結果の非公式ページから補完
-                if not phone or not found_address or (not rep_name_val and not homepage):
+                # 公式サイトが無い場合のみ、検索結果の非公式ページから連絡先を補完
+                if not homepage and (not phone or not found_address or not rep_name_val):
                     for url, data in fallback_cands:
                         if not phone and data.get("phone_numbers"):
                             cand = normalize_phone(data["phone_numbers"][0])
@@ -1714,6 +1761,8 @@ async def process():
                             if founded_val:
                                 break
 
+                if found_address and not looks_like_address(found_address):
+                    found_address = ""
                 normalized_found_address = normalize_address(found_address) if found_address else ""
                 rep_name_val = scraper.clean_rep_name(rep_name_val) or ""
                 description_val = clean_description_value(description_val)
@@ -1780,6 +1829,21 @@ async def process():
                 if status == "review" and homepage_official_source == "provisional" and not verify_result.get("phone_ok") and not verify_result.get("address_ok"):
                     # 暫定URLで検証できない場合でも、深掘り/AI結果があれば保持し、ホームページは空に戻さない
                     pass
+
+                if status == "done":
+                    strong_official = bool(
+                        homepage
+                        and homepage_official_flag == 1
+                        and (chosen_domain_score or 0) >= 4
+                        and (not addr or not found_address or addr_compatible(addr, found_address))
+                        and (
+                            not had_verify_target
+                            or verify_result.get("phone_ok")
+                            or verify_result.get("address_ok")
+                        )
+                    )
+                    if not strong_official:
+                        status = "review"
 
                 company.setdefault("error_code", "")
 
