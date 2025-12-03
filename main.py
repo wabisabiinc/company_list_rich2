@@ -1276,10 +1276,12 @@ async def process():
                 )
 
                 if need_external_profiles and not timed_out and not fully_filled:
-                    try:
-                        profile_urls = await scraper.search_company_info_pages(name, addr, max_results=2)
-                    except Exception:
-                        profile_urls = []
+                    profile_urls = scraper.get_cached_profile_urls(name, addr, max_results=2)
+                    if not profile_urls:
+                        try:
+                            profile_urls = await scraper.search_company_info_pages(name, addr, max_results=2)
+                        except Exception:
+                            profile_urls = []
                     filtered_profile_urls: list[str] = []
                     for profile_url in profile_urls:
                         if homepage:

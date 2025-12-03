@@ -17,7 +17,7 @@ SAMPLE_HTML = """
     <!-- 相対パス -->
     <a class="result__a" href="/relative/path">Rel</a>
     <!-- 会社概要のパス -->
-    <a class="result__a" href="https://profile.example.com/company/overview">Profile</a>
+    <a class="result__a" href="https://example.co.jp/company/overview">Profile</a>
     <!-- 空 href -->
     <a class="result__a" href="">Empty</a>
     <!-- 旅行系集客ドメイン（除外対象） -->
@@ -99,9 +99,19 @@ async def test_search_company_empty_on_http_error(mock_get, scraper):
 async def test_search_company_info_pages_prefers_profile(scraper):
     fake_fetch = AsyncMock(return_value=SAMPLE_HTML)
     with patch.object(scraper, "_fetch_duckduckgo", fake_fetch):
-        urls = await scraper.search_company_info_pages("社名", "東京都", max_results=1)
+        urls = await scraper.search_company_info_pages("Example株式会社", "東京都", max_results=1)
     assert urls
-    assert any("profile.example.com" in u for u in urls)
+    assert any("example.co.jp" in u for u in urls)
+
+
+@pytest.mark.asyncio
+async def test_profile_cache_reuse(scraper):
+    fake_fetch = AsyncMock(return_value=SAMPLE_HTML)
+    target_name = "Example株式会社"
+    with patch.object(scraper, "_fetch_duckduckgo", fake_fetch):
+        await scraper.search_company_info_pages(target_name, "東京都", max_results=2)
+    cached = scraper.get_cached_profile_urls(target_name, "東京都", max_results=1)
+    assert cached and cached[0].startswith("https://example.co.jp")
 
 
 @pytest.mark.asyncio

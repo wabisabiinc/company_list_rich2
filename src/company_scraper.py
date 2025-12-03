@@ -407,6 +407,7 @@ class CompanyScraper:
         self.skip_slow_hosts = os.getenv("SKIP_SLOW_HOSTS", "true").lower() == "true"
         self.slow_hosts: set[str] = set()
         self.page_cache: Dict[str, Dict[str, Any]] = {}
+        self.profile_cache: Dict[tuple[str, str], List[str]] = {}
         self.use_http_first = os.getenv("USE_HTTP_FIRST", "true").lower() == "true"
         self.http_timeout_ms = int(os.getenv("HTTP_TIMEOUT_MS", "6000"))
         env_engines = os.getenv("SEARCH_ENGINES")
@@ -607,23 +608,31 @@ class CompanyScraper:
             return False
         keyword_hit = any(hint in path_lower for hint in self.PROFILE_URL_HINTS)
         entity_tags = self._detect_entity_tags(company_name)
-        if "gov" in entity_tags:
-            allowed = self.ENTITY_SITE_SUFFIXES.get("gov", ())
-            if not any(self._host_matches_suffix(host, suffix) for suffix in allowed):
-                return False
         tokens = self._company_tokens(company_name)
+        host_token_hit = self._host_token_hit(tokens, url) if tokens else False
         score = self._domain_score(tokens, url)
-        if score >= 2:
-            return True
-        if keyword_hit:
-            return True
+
+        entity_host_match = False
         for tag in entity_tags:
-            for suffix in self.ENTITY_SITE_SUFFIXES.get(tag, ()):
-                if self._host_matches_suffix(host, suffix):
-                    return True
-        if not tokens and not entity_tags:
-            return score >= 1
-        return False
+            allowed = self.ENTITY_SITE_SUFFIXES.get(tag, ())
+            if allowed and any(self._host_matches_suffix(host, suffix) for suffix in allowed):
+                entity_host_match = True
+                break
+
+        if "gov" in entity_tags and not entity_host_match:
+            return False
+
+        if not tokens and not entity_host_match:
+            return keyword_hit and score >= 2
+
+        if not entity_host_match and not host_token_hit:
+            return False
+
+        if entity_host_match:
+            return keyword_hit or host_token_hit or score >= 1
+
+        # host_token_hit is guaranteed True beyond this point
+        return keyword_hit or score >= 1
 
     @staticmethod
     def _ascii_tokens(text: str) -> List[str]:
@@ -845,6 +854,36 @@ class CompanyScraper:
 
         max_queries = 28
         return queries[:max_queries]
+
+    def _profile_cache_key(self, company_name: str, address: Optional[str]) -> tuple[str, str]:
+        return (
+            self._normalize_company_name(company_name or ""),
+            (address or "").strip(),
+        )
+
+    def _store_profile_candidates(
+        self,
+        company_name: str,
+        address: Optional[str],
+        urls: Iterable[str],
+    ) -> None:
+        cleaned = [url for url in urls if url]
+        if not cleaned:
+            return
+        self.profile_cache[self._profile_cache_key(company_name, address)] = cleaned
+
+    def get_cached_profile_urls(
+        self,
+        company_name: str,
+        address: Optional[str],
+        max_results: Optional[int] = None,
+    ) -> List[str]:
+        cached = self.profile_cache.get(self._profile_cache_key(company_name, address), [])
+        if not cached:
+            return []
+        if max_results is None:
+            return list(cached)
+        return list(cached[: max(0, max_results)])
 
     @staticmethod
     def _domain_tokens(url: str) -> List[str]:
@@ -1807,6 +1846,8 @@ class CompanyScraper:
             ordered.append(url)
             if len(ordered) >= max_results:
                 break
+        if ordered:
+            self._store_profile_candidates(company_name, address, ordered)
         return ordered
 
     # ===== ページ取得（HTTP優先＋ブラウザ再利用） =====
