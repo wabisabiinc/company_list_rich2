@@ -771,6 +771,19 @@ class CompanyScraper:
             return None
         if any(len(tok) > 15 for tok in tokens if re.search(r"[一-龥]", tok)):
             return None
+        policy_words = (
+            "方針",
+            "理念",
+            "ポリシー",
+            "コンプライアンス",
+            "品質",
+            "環境",
+            "安全",
+            "情報セキュリティ",
+            "マネジメント",
+        )
+        if any(word in text for word in policy_words):
+            return None
         if re.search(r"(こと|する|される|ます|でした|いたします|いただき)", text):
             return None
         if not re.search(r"[一-龥ぁ-んァ-ン]", text):
