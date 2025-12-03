@@ -583,10 +583,7 @@ async def process():
                 return TIME_LIMIT_DEEP > 0 and homepage and elapsed() > TIME_LIMIT_DEEP
 
             try:
-                candidate_limit = SEARCH_CANDIDATE_LIMIT
-                if is_ambiguous_company_name(name):
-                    candidate_limit = SEARCH_CANDIDATE_LIMIT + 1
-                    log.info("[%s] 曖昧名のため候補数を拡張: %s -> %s", cid, SEARCH_CANDIDATE_LIMIT, candidate_limit)
+                candidate_limit = 3
                 company_tokens = scraper._company_tokens(name)  # type: ignore
                 urls = await scraper.search_company(name, addr, num_results=candidate_limit)
                 homepage = ""

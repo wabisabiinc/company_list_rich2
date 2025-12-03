@@ -1134,6 +1134,12 @@ class CompanyScraper:
             }
             return payload if return_details else payload["is_official"]
 
+        try:
+            parsed = urllib.parse.urlparse(url)
+            parsed_path_lower = (parsed.path or "").lower()
+        except Exception:
+            return finalize(False)
+
         host, path_lower, allowed_tld, whitelist_hit, is_google_sites = self._allowed_official_host(url)
         if not host:
             return finalize(False)
@@ -1155,6 +1161,7 @@ class CompanyScraper:
             return finalize(False, host_value=host, blocked_host=True)
 
         score = 0
+        allowed_host_whitelist = self.ALLOWED_HOST_WHITELIST
         if any(host == domain or host.endswith(f".{domain}") for domain in self.SUSPECT_HOSTS):
             score -= 4
         if host in allowed_host_whitelist:
@@ -1186,11 +1193,10 @@ class CompanyScraper:
                 score += 3
             if token and token in host:
                 score += 2
-            path_lower = (parsed.path or "").lower()
-            if token and len(token) >= 4 and token in path_lower:
+            if token and len(token) >= 4 and token in parsed_path_lower:
                 score += 2
 
-        path_lower = (parsed.path or "").lower()
+        path_lower = parsed_path_lower
         if host.endswith("google.com") and "sites" in path_lower:
             if any(token in path_lower for token in company_tokens):
                 score += 5
