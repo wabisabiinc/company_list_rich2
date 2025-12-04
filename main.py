@@ -1232,7 +1232,8 @@ async def process():
                     nonlocal need_listing, need_capital, need_revenue
                     nonlocal need_profit, need_fiscal, need_founded, need_description
                     need_phone = not bool(phone or rule_phone)
-                    need_addr = not bool(found_address or rule_address or addr)
+                    # 入力住所があってもサイト住所未取得なら取りに行く（found/ruleのみで判定）
+                    need_addr = not bool(found_address or rule_address)
                     need_rep = not bool(rep_name_val or rule_rep)
                     need_listing = not bool(listing_val)
                     need_capital = not bool(capital_val)
