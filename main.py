@@ -398,6 +398,20 @@ def extract_lead_description(html: str | None) -> str | None:
             candidates.append(cleaned)
     return candidates[0] if candidates else None
 
+def extract_description_from_payload(payload: dict[str, Any]) -> str:
+    text = payload.get("text", "") or ""
+    html = payload.get("html", "") or ""
+    snippet = extract_description_snippet(text)
+    if snippet:
+        return snippet
+    meta = extract_meta_description(html)
+    if meta:
+        return meta
+    lead = extract_lead_description(html)
+    if lead:
+        return lead
+    return ""
+
 def _sanitize_ai_text_block(text: str | None) -> str:
     if not text:
         return ""
@@ -406,13 +420,17 @@ def _sanitize_ai_text_block(text: str | None) -> str:
         "copyright", "all rights reserved", "privacy policy", "サイトマップ", "sitemap",
         "recruit", "求人", "採用", "お問い合わせ", "アクセスマップ"
     )
+    DIGIT_RE = re.compile(r"[0-9０-９]")
     for raw in text.splitlines():
         line = raw.strip()
         if not line:
             continue
         lowered = line.lower()
         if any(keyword in lowered for keyword in nav_keywords):
-            continue
+            if DIGIT_RE.search(line) or "〒" in line:
+                pass
+            else:
+                continue
         cleaned_lines.append(line)
     result = " ".join(cleaned_lines)
     result = re.sub(r"\s+", " ", result).strip()
@@ -1210,7 +1228,7 @@ async def process():
                     nonlocal need_listing, need_capital, need_revenue
                     nonlocal need_profit, need_fiscal, need_founded, need_description
                     need_phone = not bool(phone or rule_phone)
-                    need_addr = not bool(found_address or rule_address)
+                    need_addr = not bool(found_address or rule_address or addr)
                     need_rep = not bool(rep_name_val or rule_rep)
                     need_listing = not bool(listing_val)
                     need_capital = not bool(capital_val)
@@ -1496,6 +1514,17 @@ async def process():
                     if ai_attempted and AI_COOLDOWN_SEC > 0:
                         await asyncio.sleep(jittered_seconds(AI_COOLDOWN_SEC, JITTER_RATIO))
                 missing_contact, missing_extra = refresh_need_flags()
+                if need_description:
+                    payloads: list[dict[str, Any]] = []
+                    if info_dict:
+                        payloads.append(info_dict)
+                    payloads.extend(priority_docs.values())
+                    for pdata in payloads:
+                        desc = extract_description_from_payload(pdata)
+                        if desc:
+                            description_val = desc
+                            need_description = False
+                            break
 
                 # AI 2回目: まだ欠損がある場合に、優先リンクから集めたテキストで再度問い合わせ
                 if USE_AI and verifier is not None and priority_docs and not timed_out:
@@ -1588,6 +1617,17 @@ async def process():
                                     update_description_candidate(desc2)
 
                     missing_contact, missing_extra = refresh_need_flags()
+                    if need_description:
+                        payloads: list[dict[str, Any]] = []
+                        if info_dict:
+                            payloads.append(info_dict)
+                        payloads.extend(priority_docs.values())
+                        for pdata in payloads:
+                            desc = extract_description_from_payload(pdata)
+                            if desc:
+                                description_val = desc
+                                need_description = False
+                                break
 
                     if ai_phone:
                         phone = ai_phone
@@ -1848,6 +1888,8 @@ async def process():
                 if found_address and not looks_like_address(found_address):
                     found_address = ""
                 normalized_found_address = normalize_address(found_address) if found_address else ""
+                if not normalized_found_address and addr:
+                    normalized_found_address = normalize_address(addr) or ""
                 rep_name_val = scraper.clean_rep_name(rep_name_val) or ""
                 description_val = clean_description_value(description_val)
                 listing_val = clean_listing_value(listing_val)
