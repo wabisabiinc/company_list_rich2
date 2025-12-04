@@ -858,17 +858,19 @@ class CompanyScraper:
         return text
 
     def _build_company_queries(self, company_name: str, address: Optional[str]) -> List[str]:
+        """
+        「会社名 公式サイト」「会社名 ホームページ」「会社名 会社概要」のみに固定する。
+        社名バリアント（株式会社/有限会社を除いた形）も同じ3本だけ生成する。
+        """
         base_name = (company_name or "").strip()
         if not base_name:
             return []
-        pref = self._extract_prefecture(address or "")
-        city = self._extract_city(address or "")
         variants = [base_name]
         stripped = base_name.replace("株式会社", "").replace("有限会社", "").strip()
         if stripped and stripped not in variants:
             variants.append(stripped)
 
-        entity_tags = self._detect_entity_tags(base_name)
+        keywords = ("公式サイト", "ホームページ", "会社概要")
         queries: List[str] = []
 
         def add_query(text: str) -> None:
@@ -876,61 +878,13 @@ class CompanyScraper:
             if normalized and normalized not in queries:
                 queries.append(normalized)
 
-        general_keywords = ("公式サイト", "ホームページ")
-        info_keywords = ("会社概要", "会社情報", "企業情報", "アクセス", "所在地")
-
         for variant in variants:
-            has_ascii = bool(re.search(r"[A-Za-z]", variant))
-            # 公式サイト直指定を最優先
-            add_query(f"{variant} 公式サイト")
-            add_query(variant)
-            add_query(f"{variant} ホームページ")
-            add_query(f"{variant} 公式サイト 会社")
-            for gkw in general_keywords:
-                add_query(f"{variant} {gkw}")
-            for ikw in info_keywords:
-                add_query(f"{variant} {ikw}")
-                if pref:
-                    add_query(f"{variant} {pref} {ikw}")
-            for keyword in PROFILE_SEARCH_KEYWORDS:
-                if keyword in {"profile", "about", "corporate"} and not has_ascii:
-                    continue
-                add_query(f"{variant} {keyword}")
-            if pref:
-                add_query(f"{variant} {pref} 会社")
-                add_query(f"{variant} {pref} 会社概要")
-            if city:
-                add_query(f"{variant} {city} 会社")
-            add_query(f"{variant} site:.jp")
-            add_query(f"{variant} site:.co.jp")
-            if "gov" in entity_tags:
-                add_query(f"{variant} site:.go.jp")
-            if entity_tags & {"med", "npo"}:
-                add_query(f"{variant} site:.or.jp")
-            if "gov" in entity_tags:
-                add_query(f"{variant} 行政情報")
-                add_query(f"{variant} 組織")
-            if "edu" in entity_tags:
-                add_query(f"{variant} 学校案内")
-                add_query(f"{variant} 教育情報")
-            if "med" in entity_tags:
-                add_query(f"{variant} 医療法人")
-                add_query(f"{variant} 病院案内")
-            if "npo" in entity_tags:
-                add_query(f"{variant} 活動内容")
-                add_query(f"{variant} 事業報告")
+            if not variant:
+                continue
+            for kw in keywords:
+                add_query(f"{variant} {kw}")
 
-        site_suffixes: set[str] = set()
-        for tag in entity_tags:
-            for suffix in self.ENTITY_SITE_SUFFIXES.get(tag, ()):
-                site_suffixes.add(suffix)
-        for suffix in sorted(site_suffixes):
-            add_query(f"{base_name} site:{suffix}")
-            if pref:
-                add_query(f"{base_name} {pref} site:{suffix}")
-
-        max_queries = 28
-        return queries[:max_queries]
+        return queries[:6]
 
     def _profile_cache_key(self, company_name: str, address: Optional[str]) -> tuple[str, str]:
         return (
