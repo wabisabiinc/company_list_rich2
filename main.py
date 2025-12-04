@@ -108,14 +108,18 @@ def normalize_phone(s: str | None) -> str | None:
     if not s:
         return None
     s = re.sub(r"(内線|ext|extension)\s*[:：]?\s*\d+$", "", s, flags=re.I)
+    # ハイフン類を統一
     s = re.sub(r"[‐―－ー–—]+", "-", s)
     digits = re.sub(r"\D", "", s)
     if digits.startswith("81") and len(digits) >= 10:
         digits = "0" + digits[2:]
-    m = re.search(r"(0\d{1,4})(\d{2,4})(\d{3,4})$", digits)
+    # 国内番号は0始まりで10〜11桁のみ許容
+    if not digits.startswith("0") or len(digits) not in (10, 11):
+        return None
+    m = re.search(r"^(0\d{1,4})(\d{2,4})(\d{3,4})$", digits)
     if m:
         return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-    m2 = re.search(r"(0\d{1,4})-?(\d{1,4})-?(\d{3,4})", s)
+    m2 = re.search(r"^(0\d{1,4})-?(\d{2,4})-?(\d{3,4})$", s)
     return f"{m2.group(1)}-{m2.group(2)}-{m2.group(3)}" if m2 else None
 
 def normalize_address(s: str | None) -> str | None:

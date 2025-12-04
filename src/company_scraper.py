@@ -391,7 +391,8 @@ class CompanyScraper:
         "Inc.", "Inc", "Co.", "Co", "Corporation", "Company", "Ltd.", "Ltd",
         "Holding", "Holdings", "HD", "グループ", "ホールディングス", "本社",
     ]
-    ALLOWED_OFFICIAL_TLDS = (".co.jp", ".jp", ".com")
+    # 公式判定で許容するTLDを拡張（.net/.org/.biz/.co なども許容）
+    ALLOWED_OFFICIAL_TLDS = (".co.jp", ".jp", ".com", ".net", ".org", ".biz", ".co", ".info")
     ALLOWED_HOST_WHITELIST = {"big-advance.site"}
 
     # 優先的に巡回したいURLのキーワード
@@ -796,6 +797,11 @@ class CompanyScraper:
         for stop in ("就任", "あいさつ", "ごあいさつ", "挨拶", "あいさつ文", "就任のご挨拶"):
             if stop in text:
                 return None
+        # 住所/所在地が混入しているケースを除外
+        if re.search(r"(所在地|住所|本社|所在地:|住所:)", text):
+            return None
+        # 文末の助詞/説明終端を落とす
+        text = re.sub(r"(さん|は|です|でした|となります|となっております)$", "", text).strip()
         lower_text = text.lower()
         if text in REP_NAME_EXACT_BLOCKLIST or lower_text in REP_NAME_EXACT_BLOCKLIST_LOWER:
             return None
