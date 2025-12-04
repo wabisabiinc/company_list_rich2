@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 
 from src.database_manager import DatabaseManager
-from src.company_scraper import CompanyScraper
+from src.company_scraper import CompanyScraper, CITY_RE
 from src.ai_verifier import AIVerifier, DEFAULT_MODEL as AI_MODEL_NAME, _normalize_amount as ai_normalize_amount
 from src.reference_checker import ReferenceChecker
 
@@ -159,17 +159,20 @@ def looks_like_address(text: str | None) -> bool:
     s = (text or "").strip()
     if not s:
         return False
-    # 郵便番号があれば住所として扱う
     if ZIP_CODE_RE.search(s):
         return True
-    # 都道府県名が含まれていれば住所らしいとみなす
+    has_pref = False
     try:
-        if any(pref in s for pref in CompanyScraper.PREFECTURE_NAMES):
-            return True
+        has_pref = any(pref in s for pref in CompanyScraper.PREFECTURE_NAMES)
     except Exception:
-        pass
-    # 「丁目」「番地」など住所に特有の語を含むか
-    if re.search(r"(丁目|番地|号|ビル|マンション)", s):
+        has_pref = False
+    has_city = bool(CITY_RE.search(s))
+    if has_pref and has_city:
+        return True
+
+    if (has_pref or has_city) and re.search(r"(丁目|番地|号)", s):
+        return True
+    if (has_pref or has_city) and re.search(r"(ビル|マンション)", s):
         return True
     return False
 
@@ -1136,23 +1139,39 @@ async def process():
                             rule_rep = cand_rep
                             src_rep = url
                     if not listing_val and cc.get("listings"):
-                        listing_val = (cc["listings"][0] or "").strip()
-                        need_listing = not bool(listing_val)
+                        candidate = (cc["listings"][0] or "").strip()
+                        cleaned_listing = clean_listing_value(candidate)
+                        if cleaned_listing:
+                            listing_val = cleaned_listing
+                            need_listing = False
                     if not capital_val and cc.get("capitals"):
-                        capital_val = (cc["capitals"][0] or "").strip()
-                        need_capital = not bool(capital_val)
+                        candidate = (cc["capitals"][0] or "").strip()
+                        cleaned_capital = clean_amount_value(candidate)
+                        if cleaned_capital:
+                            capital_val = cleaned_capital
+                            need_capital = False
                     if not revenue_val and cc.get("revenues"):
-                        revenue_val = (cc["revenues"][0] or "").strip()
-                        need_revenue = not bool(revenue_val)
+                        candidate = (cc["revenues"][0] or "").strip()
+                        cleaned_revenue = clean_amount_value(candidate)
+                        if cleaned_revenue:
+                            revenue_val = cleaned_revenue
+                            need_revenue = False
                     if not profit_val and cc.get("profits"):
-                        profit_val = (cc["profits"][0] or "").strip()
-                        need_profit = not bool(profit_val)
+                        candidate = (cc["profits"][0] or "").strip()
+                        cleaned_profit = clean_amount_value(candidate)
+                        if cleaned_profit:
+                            profit_val = cleaned_profit
+                            need_profit = False
                     if not fiscal_val and cc.get("fiscal_months"):
-                        fiscal_val = clean_fiscal_month(cc["fiscal_months"][0])
-                        need_fiscal = not bool(fiscal_val)
+                        cleaned_fiscal = clean_fiscal_month(cc["fiscal_months"][0] or "")
+                        if cleaned_fiscal:
+                            fiscal_val = cleaned_fiscal
+                            need_fiscal = False
                     if not founded_val and cc.get("founded_years"):
-                        founded_val = (cc["founded_years"][0] or "").strip()
-                        need_founded = not bool(founded_val)
+                        cleaned_founded = clean_founded_year(cc["founded_years"][0] or "")
+                        if cleaned_founded:
+                            founded_val = cleaned_founded
+                            need_founded = False
                     if need_description and not description_val:
                         snippet = extract_description_snippet(pdata.get("text", ""))
                         if snippet:
@@ -1189,6 +1208,19 @@ async def process():
                         int(need_profit), int(need_fiscal), int(need_founded), int(need_description),
                     ])
                     return missing_contact, missing_extra
+
+                def update_description_candidate(candidate: str | None) -> bool:
+                    nonlocal description_val, need_description
+                    if not candidate:
+                        return False
+                    cleaned = clean_description_value(candidate)
+                    if not cleaned:
+                        return False
+                    if not description_val or len(cleaned) > len(description_val):
+                        description_val = cleaned
+                        need_description = False
+                        return True
+                    return False
 
                 if homepage and info_dict:
                     absorb_doc_data(info_url, info_dict)
@@ -1253,17 +1285,29 @@ async def process():
                         if not src_rep:
                             src_rep = info_url
                     if listings and not listing_val:
-                        listing_val = listings[0].strip()
+                        cleaned_listing = clean_listing_value(listings[0] or "")
+                        if cleaned_listing:
+                            listing_val = cleaned_listing
                     if capitals and not capital_val:
-                        capital_val = capitals[0].strip()
+                        cleaned_capital = clean_amount_value(capitals[0] or "")
+                        if cleaned_capital:
+                            capital_val = cleaned_capital
                     if revenues and not revenue_val:
-                        revenue_val = revenues[0].strip()
+                        cleaned_revenue = clean_amount_value(revenues[0] or "")
+                        if cleaned_revenue:
+                            revenue_val = cleaned_revenue
                     if profits and not profit_val:
-                        profit_val = profits[0].strip()
+                        cleaned_profit = clean_amount_value(profits[0] or "")
+                        if cleaned_profit:
+                            profit_val = cleaned_profit
                     if fiscals and not fiscal_val:
-                        fiscal_val = clean_fiscal_month(fiscals[0])
+                        cleaned_fiscal = clean_fiscal_month(fiscals[0] or "")
+                        if cleaned_fiscal:
+                            fiscal_val = cleaned_fiscal
                     if founded_years and not founded_val:
-                        founded_val = founded_years[0].strip()
+                        cleaned_founded = clean_founded_year(founded_years[0] or "")
+                        if cleaned_founded:
+                            founded_val = cleaned_founded
 
                     need_listing = not bool(listing_val)
                     need_capital = not bool(capital_val)
@@ -1434,30 +1478,42 @@ async def process():
                     if not listing_val:
                         listing_ai = ai_result.get("listing")
                         if isinstance(listing_ai, str) and listing_ai.strip():
-                            listing_val = listing_ai.strip()
+                            cleaned_ai_listing = clean_listing_value(listing_ai)
+                            if cleaned_ai_listing:
+                                listing_val = cleaned_ai_listing
                     if not capital_val:
                         capital_ai = ai_result.get("capital")
                         if isinstance(capital_ai, str) and capital_ai.strip():
-                            capital_val = capital_ai.strip()
+                            cleaned_ai_capital = clean_amount_value(capital_ai)
+                            if cleaned_ai_capital:
+                                capital_val = cleaned_ai_capital
                     if not revenue_val:
                         revenue_ai = ai_result.get("revenue")
                         if isinstance(revenue_ai, str) and revenue_ai.strip():
-                            revenue_val = revenue_ai.strip()
+                            cleaned_ai_revenue = clean_amount_value(revenue_ai)
+                            if cleaned_ai_revenue:
+                                revenue_val = cleaned_ai_revenue
                     if not profit_val:
                         profit_ai = ai_result.get("profit")
                         if isinstance(profit_ai, str) and profit_ai.strip():
-                            profit_val = profit_ai.strip()
+                            cleaned_ai_profit = clean_amount_value(profit_ai)
+                            if cleaned_ai_profit:
+                                profit_val = cleaned_ai_profit
                     if not fiscal_val:
                         fiscal_ai = ai_result.get("fiscal_month")
                         if isinstance(fiscal_ai, str) and fiscal_ai.strip():
-                            fiscal_val = clean_fiscal_month(fiscal_ai)
+                            cleaned_ai_fiscal = clean_fiscal_month(fiscal_ai)
+                            if cleaned_ai_fiscal:
+                                fiscal_val = cleaned_ai_fiscal
                     if not founded_val:
                         founded_ai = ai_result.get("founded_year")
                         if isinstance(founded_ai, str) and founded_ai.strip():
-                            founded_val = founded_ai.strip()
+                            cleaned_ai_founded = clean_founded_year(founded_ai)
+                            if cleaned_ai_founded:
+                                founded_val = cleaned_ai_founded
                     description = ai_result.get("description")
                     if isinstance(description, str) and description.strip():
-                        description_val = clean_description_value(description)
+                        update_description_candidate(description)
                 else:
                     if ai_attempted and AI_COOLDOWN_SEC > 0:
                         await asyncio.sleep(jittered_seconds(AI_COOLDOWN_SEC, JITTER_RATIO))
@@ -1505,27 +1561,39 @@ async def process():
                                 if not listing_val:
                                     listing_ai2 = ai_result2.get("listing")
                                     if isinstance(listing_ai2, str) and listing_ai2.strip():
-                                        listing_val = listing_ai2.strip()
+                                        cleaned_ai_listing2 = clean_listing_value(listing_ai2)
+                                        if cleaned_ai_listing2:
+                                            listing_val = cleaned_ai_listing2
                                 if not capital_val:
                                     capital_ai2 = ai_result2.get("capital")
                                     if isinstance(capital_ai2, str) and capital_ai2.strip():
-                                        capital_val = capital_ai2.strip()
+                                        cleaned_ai_capital2 = clean_amount_value(capital_ai2)
+                                        if cleaned_ai_capital2:
+                                            capital_val = cleaned_ai_capital2
                                 if not revenue_val:
                                     revenue_ai2 = ai_result2.get("revenue")
                                     if isinstance(revenue_ai2, str) and revenue_ai2.strip():
-                                        revenue_val = revenue_ai2.strip()
+                                        cleaned_ai_revenue2 = clean_amount_value(revenue_ai2)
+                                        if cleaned_ai_revenue2:
+                                            revenue_val = cleaned_ai_revenue2
                                 if not profit_val:
                                     profit_ai2 = ai_result2.get("profit")
                                     if isinstance(profit_ai2, str) and profit_ai2.strip():
-                                        profit_val = profit_ai2.strip()
+                                        cleaned_ai_profit2 = clean_amount_value(profit_ai2)
+                                        if cleaned_ai_profit2:
+                                            profit_val = cleaned_ai_profit2
                                 if not fiscal_val:
                                     fiscal_ai2 = ai_result2.get("fiscal_month")
                                     if isinstance(fiscal_ai2, str) and fiscal_ai2.strip():
-                                        fiscal_val = clean_fiscal_month(fiscal_ai2)
+                                        cleaned_ai_fiscal2 = clean_fiscal_month(fiscal_ai2)
+                                        if cleaned_ai_fiscal2:
+                                            fiscal_val = cleaned_ai_fiscal2
                                 if not founded_val:
                                     founded_ai2 = ai_result2.get("founded_year")
                                     if isinstance(founded_ai2, str) and founded_ai2.strip():
-                                        founded_val = founded_ai2.strip()
+                                        cleaned_ai_founded2 = clean_founded_year(founded_ai2)
+                                        if cleaned_ai_founded2:
+                                            founded_val = cleaned_ai_founded2
                                 if ai_phone2 and not phone:
                                     phone = ai_phone2
                                     phone_source = "ai"
@@ -1537,8 +1605,8 @@ async def process():
                                 if ai_rep2 and (not rep_name_val or len(ai_rep2) > len(rep_name_val)):
                                     rep_name_val = ai_rep2
                                     src_rep = info_url
-                                if isinstance(desc2, str) and desc2.strip() and not description_val:
-                                    description_val = clean_description_value(desc2)
+                                if isinstance(desc2, str) and desc2.strip():
+                                    update_description_candidate(desc2)
 
                     missing_contact, missing_extra = refresh_need_flags()
 
@@ -1632,23 +1700,35 @@ async def process():
                                     src_rep = url
                                     need_rep = False
                             if need_listing and cc.get("listings"):
-                                listing_val = (cc["listings"][0] or "").strip()
-                                need_listing = not bool(listing_val)
+                                cleaned_listing = clean_listing_value(cc["listings"][0] or "")
+                                if cleaned_listing:
+                                    listing_val = cleaned_listing
+                                    need_listing = False
                             if need_capital and cc.get("capitals"):
-                                capital_val = (cc["capitals"][0] or "").strip()
-                                need_capital = not bool(capital_val)
+                                cleaned_capital = clean_amount_value(cc["capitals"][0] or "")
+                                if cleaned_capital:
+                                    capital_val = cleaned_capital
+                                    need_capital = False
                             if need_revenue and cc.get("revenues"):
-                                revenue_val = (cc["revenues"][0] or "").strip()
-                                need_revenue = not bool(revenue_val)
+                                cleaned_revenue = clean_amount_value(cc["revenues"][0] or "")
+                                if cleaned_revenue:
+                                    revenue_val = cleaned_revenue
+                                    need_revenue = False
                             if need_profit and cc.get("profits"):
-                                profit_val = (cc["profits"][0] or "").strip()
-                                need_profit = not bool(profit_val)
+                                cleaned_profit = clean_amount_value(cc["profits"][0] or "")
+                                if cleaned_profit:
+                                    profit_val = cleaned_profit
+                                    need_profit = False
                             if need_fiscal and cc.get("fiscal_months"):
-                                fiscal_val = clean_fiscal_month(cc["fiscal_months"][0])
-                                need_fiscal = not bool(fiscal_val)
+                                cleaned_fiscal = clean_fiscal_month(cc["fiscal_months"][0] or "")
+                                if cleaned_fiscal:
+                                    fiscal_val = cleaned_fiscal
+                                    need_fiscal = False
                             if need_founded and cc.get("founded_years"):
-                                founded_val = (cc["founded_years"][0] or "").strip()
-                                need_founded = not bool(founded_val)
+                                cleaned_founded = clean_founded_year(cc["founded_years"][0] or "")
+                                if cleaned_founded:
+                                    founded_val = cleaned_founded
+                                    need_founded = False
                             if need_description and not description_val:
                                 snippet = extract_description_snippet(text)
                                 if snippet:
@@ -1745,43 +1825,49 @@ async def process():
                     for url, data in fallback_cands:
                         values = data.get("listings") or []
                         if values:
-                            listing_val = (values[0] or "").strip()
-                            if listing_val:
+                            cleaned_fallback_listing = clean_listing_value(values[0] or "")
+                            if cleaned_fallback_listing:
+                                listing_val = cleaned_fallback_listing
                                 break
                 if not capital_val:
                     for url, data in fallback_cands:
                         values = data.get("capitals") or []
                         if values:
-                            capital_val = (values[0] or "").strip()
-                            if capital_val:
+                            cleaned_fallback_capital = clean_amount_value(values[0] or "")
+                            if cleaned_fallback_capital:
+                                capital_val = cleaned_fallback_capital
                                 break
                 if not revenue_val:
                     for url, data in fallback_cands:
                         values = data.get("revenues") or []
                         if values:
-                            revenue_val = (values[0] or "").strip()
-                            if revenue_val:
+                            cleaned_fallback_revenue = clean_amount_value(values[0] or "")
+                            if cleaned_fallback_revenue:
+                                revenue_val = cleaned_fallback_revenue
                                 break
                 if not profit_val:
                     for url, data in fallback_cands:
                         values = data.get("profits") or []
                         if values:
-                            profit_val = (values[0] or "").strip()
-                            if profit_val:
+                            cleaned_fallback_profit = clean_amount_value(values[0] or "")
+                            if cleaned_fallback_profit:
+                                profit_val = cleaned_fallback_profit
                                 break
                 if not fiscal_val:
                     for url, data in fallback_cands:
                         values = data.get("fiscal_months") or []
                         if values:
-                            fiscal_val = clean_fiscal_month(values[0] or "")
-                            if fiscal_val:
+                            cleaned_fallback_fiscal = clean_fiscal_month(values[0] or "")
+                            if cleaned_fallback_fiscal:
+                                fiscal_val = cleaned_fallback_fiscal
                                 break
                 if not founded_val:
                     for url, data in fallback_cands:
                         values = data.get("founded_years") or []
                         if values:
-                            founded_val = (values[0] or "").strip()
-                            if founded_val:
+                            cleaned_fallback_founded = clean_founded_year(values[0] or "")
+                            if cleaned_fallback_founded:
+                                founded_val = cleaned_fallback_founded
                                 break
 
                 if found_address and not looks_like_address(found_address):

@@ -715,7 +715,7 @@ class CompanyScraper:
         # HTML断片を除去
         val = re.sub(r"<[^>]+>", " ", val)
         val = val.replace("&nbsp;", " ")
-        val = val.replace("br", " ")
+        val = re.sub(r"(?i)<br\s*/?>", " ", val)
         val = val.replace("\u3000", " ")
         val = re.sub(r"[‐―－ー–—]", "-", val)
         val = re.sub(r"\s+", " ", val).strip()
@@ -727,7 +727,7 @@ class CompanyScraper:
             return ""
         cleaned = unicodedata.normalize("NFKC", val)
         cleaned = re.sub(r"<[^>]+>", " ", cleaned)
-        cleaned = cleaned.replace("&nbsp;", " ").replace("br", " ")
+        cleaned = re.sub(r"(?i)<br\s*/?>", " ", cleaned)
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
         return cleaned
 
