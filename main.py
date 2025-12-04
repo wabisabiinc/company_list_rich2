@@ -398,6 +398,37 @@ def extract_lead_description(html: str | None) -> str | None:
             candidates.append(cleaned)
     return candidates[0] if candidates else None
 
+def _sanitize_ai_text_block(text: str | None) -> str:
+    if not text:
+        return ""
+    cleaned_lines: list[str] = []
+    nav_keywords = (
+        "copyright", "all rights reserved", "privacy policy", "サイトマップ", "sitemap",
+        "recruit", "求人", "採用", "お問い合わせ", "アクセスマップ"
+    )
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        lowered = line.lower()
+        if any(keyword in lowered for keyword in nav_keywords):
+            continue
+        cleaned_lines.append(line)
+    result = " ".join(cleaned_lines)
+    result = re.sub(r"\s+", " ", result).strip()
+    if len(result) > 3500:
+        result = result[:3500]
+    return result
+
+def build_ai_text_payload(*blocks: str) -> str:
+    payloads = []
+    for block in blocks:
+        cleaned = _sanitize_ai_text_block(block)
+        if cleaned:
+            payloads.append(cleaned)
+    joined = "\n\n".join(payloads)
+    return joined[:4000]
+
 def clean_founded_year(val: str) -> str:
     text = (val or "").strip()
     if not text:
@@ -1072,7 +1103,8 @@ async def process():
                 phone = ""
                 found_address = ""
                 rep_name_val = scraper.clean_rep_name(company.get("rep_name")) or ""
-                description_val = clean_description_value(company.get("description") or "")
+                # description は常に AI に生成させるため、既存値は参照しない
+                description_val = ""
                 listing_val = clean_listing_value(company.get("listing") or "")
                 revenue_val = clean_amount_value(company.get("revenue") or "")
                 profit_val = clean_amount_value(company.get("profit") or "")
@@ -1172,28 +1204,13 @@ async def process():
                         if cleaned_founded:
                             founded_val = cleaned_founded
                             need_founded = False
-                    if need_description and not description_val:
-                        snippet = extract_description_snippet(pdata.get("text", ""))
-                        if snippet:
-                            description_val = snippet
-                            need_description = False
-                    if need_description and not description_val and pdata.get("html"):
-                        meta_desc = extract_meta_description(pdata.get("html", ""))
-                        if meta_desc:
-                            description_val = meta_desc
-                            need_description = False
-                    if need_description and not description_val and pdata.get("html"):
-                        lead_desc = extract_lead_description(pdata.get("html", ""))
-                        if lead_desc:
-                            description_val = lead_desc
-                            need_description = False
 
                 def refresh_need_flags() -> tuple[int, int]:
                     nonlocal need_phone, need_addr, need_rep
                     nonlocal need_listing, need_capital, need_revenue
                     nonlocal need_profit, need_fiscal, need_founded, need_description
                     need_phone = not bool(phone or rule_phone)
-                    need_addr = not bool(found_address or rule_address or addr)
+                    need_addr = not bool(found_address or rule_address)
                     need_rep = not bool(rep_name_val or rule_rep)
                     need_listing = not bool(listing_val)
                     need_capital = not bool(capital_val)
@@ -1216,11 +1233,34 @@ async def process():
                     cleaned = clean_description_value(candidate)
                     if not cleaned:
                         return False
-                    if not description_val or len(cleaned) > len(description_val):
-                        description_val = cleaned
-                        need_description = False
-                        return True
-                    return False
+                    banned_terms = (
+                        "お問い合わせ",
+                        "お問合せ",
+                        "採用情報",
+                        "求人",
+                        "ニュース",
+                        "お知らせ",
+                        "アクセス",
+                        "所在地",
+                        "電話番号",
+                        "メール",
+                    )
+                    if any(term in cleaned for term in banned_terms):
+                        return False
+                    lower = cleaned.lower()
+                    if lower.startswith(("contact", "recruit", "news")):
+                        return False
+                    if "http://" in lower or "https://" in lower:
+                        return False
+                    if len(cleaned) < 10:
+                        return False
+                    if len(cleaned) > 120:
+                        cleaned = cleaned[:120].rstrip()
+                    if cleaned == description_val:
+                        return False
+                    description_val = cleaned
+                    need_description = False
+                    return True
 
                 if homepage and info_dict:
                     absorb_doc_data(info_url, info_dict)
@@ -1317,17 +1357,6 @@ async def process():
                     need_founded = not bool(founded_val)
                     need_description = not bool(description_val)
 
-                    if need_description and info_dict.get("html"):
-                        meta_desc = extract_meta_description(info_dict.get("html", ""))
-                        if meta_desc:
-                            description_val = meta_desc
-                            need_description = False
-                    if need_description and info_dict.get("html"):
-                        lead_desc = extract_lead_description(info_dict.get("html", ""))
-                        if lead_desc:
-                            description_val = lead_desc
-                            need_description = False
-
                     missing_contact, missing_extra = refresh_need_flags()
 
                     if over_time_limit():
@@ -1376,13 +1405,14 @@ async def process():
                     ai_attempted = True
                     info_dict = await ensure_info_has_screenshot(scraper, info_url, info_dict, need_screenshot=OFFICIAL_AI_USE_SCREENSHOT)
                     info = info_dict
+                    ai_text_payload = build_ai_text_payload(info_dict.get("text", ""))
 
                     async def run_ai_verify():
                         nonlocal ai_time_spent
                         ai_started = time.monotonic()
                         try:
                             res = await verifier.verify_info(
-                                info_dict.get("text", "") or "",
+                                ai_text_payload,
                                 info_dict.get("screenshot"),
                                 name,
                                 addr,
@@ -1407,7 +1437,7 @@ async def process():
                         info_dict = await ensure_info_has_screenshot(scraper, info_url, info_dict, need_screenshot=OFFICIAL_AI_USE_SCREENSHOT)
                         ai_started = time.monotonic()
                         ai_result = await verifier.verify_info(
-                            info_dict.get("text", "") or "",
+                            build_ai_text_payload(info_dict.get("text", "")),
                             info_dict.get("screenshot"),
                             name,
                             addr,
@@ -1481,7 +1511,8 @@ async def process():
                     ])
                     missing_fields = (provisional_contact_missing > 0) or (missing_extra >= 2)
                     if missing_fields:
-                        combined_text = "\n\n".join(v.get("text", "") or "" for v in priority_docs.values())
+                        combined_sources = [v.get("text", "") or "" for v in priority_docs.values()]
+                        combined_text = build_ai_text_payload(*combined_sources)
                         if combined_text.strip():
                             screenshot_payload = None
                             if info_url:
@@ -1619,6 +1650,7 @@ async def process():
                                     need_fiscal=need_fiscal,
                                     need_founded=need_founded,
                                     need_description=need_description,
+                                    initial_info=info_dict if info_url == homepage else None,
                                 )
                             except Exception:
                                 related = {}
@@ -1677,11 +1709,6 @@ async def process():
                                 if cleaned_founded:
                                     founded_val = cleaned_founded
                                     need_founded = False
-                            if need_description and not description_val:
-                                snippet = extract_description_snippet(text)
-                                if snippet:
-                                    description_val = snippet
-                                    need_description = False
                             if not (
                                 need_phone or need_addr or need_rep or need_listing or need_capital
                                 or need_revenue or need_profit or need_fiscal or need_founded or need_description

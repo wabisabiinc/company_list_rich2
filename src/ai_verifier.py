@@ -243,24 +243,25 @@ class AIVerifier:
             log.warning(f"AIVerifier: failed to load system prompt from %s: %s", path, e)
             return None
 
-    def _build_prompt(self, text: str) -> str:
+    def _build_prompt(self, text: str, company_name: str = "", address: str = "") -> str:
         snippet = _shorten_text(text or "", max_len=3500)
         return (
             "あなたは企業サイトや関連資料から企業情報を抽出する専門家です。別会社を混ぜず、わからない項目は必ずnullにしてください。推測で埋めないこと。\n"
             "返すべきJSONのみを出力してください（説明やマークダウン禁止）。\n"
+            f"対象企業: {company_name or '不明'} / 住所: {address or '不明'}\n"
             "{\n"
-            '  \"phone_number\": \"03-1234-5678\" または null,\n'
-            '  \"address\": \"〒123-4567 東京都...\" または null,\n'
-            '  \"rep_name\": \"代表取締役 山田太郎\" または null,\n'
-            '  \"description\": \"50字以内の会社概要\" または null,\n'
-            '  \"listing\": \"上場/未上場/非上場/市場名\" または null,\n'
-            '  \"capital\": \"1億円\" または null,\n'
-            '  \"revenue\": \"10億円\" または null,\n'
-            '  \"profit\": \"2億円\" または null,\n'
-            '  \"fiscal_month\": \"3月\" または null,\n'
-            '  \"founded_year\": \"1987\" または null\n'
+            '  "phone_number": "03-1234-5678" または null,\n'
+            '  "address": "〒123-4567 東京都..." または null,\n'
+            '  "rep_name": "代表取締役 山田太郎" または null,\n'
+            '  "description": "60-100文字で事業内容が分かる文章（お問い合わせ/採用/アクセス/予約等は禁止）" または null,\n'
+            '  "listing": "上場/未上場/非上場/市場名" または null,\n'
+            '  "capital": "1億円" または null,\n'
+            '  "revenue": "10億円" または null,\n'
+            '  "profit": "2億円" または null,\n'
+            '  "fiscal_month": "3月" または null,\n'
+            '  "founded_year": "1987" または null\n'
             "}\n"
-            "禁止: 推測での非上場判定、見出しだけのdescription、汎用語(氏名/名前/役職/担当/選任/概要など)をrep_nameにすること。\n"
+            "禁止: 推測での非上場判定、見出しだけのdescription、descriptionにCTA/問い合わせ/採用/アクセス情報を入れること、汎用語(氏名/名前/役職/担当/選任/概要など)をrep_nameにすること。\n"
             "優先度: 電話/住所/代表者を最優先。金額系は本文の数値+単位のみ。住所は都道府県から、郵便番号があれば先頭に含める。\n"
             f"# 本文テキスト抜粋\n{snippet}\n"
         )
@@ -273,7 +274,7 @@ class AIVerifier:
         content: list[Any] = []
         if self.system_prompt:
             content.append(self.system_prompt)
-        content.append(self._build_prompt(text))
+        content.append(self._build_prompt(text, company_name, address))
         if screenshot:
             try:
                 b64 = base64.b64encode(screenshot).decode("utf-8")
@@ -308,8 +309,12 @@ class AIVerifier:
             description = result.get("description")
             if isinstance(description, str):
                 description = re.sub(r"\s+", " ", description.strip()) or None
-                if description and len(description) > 50:
-                    description = description[:50]
+                if description:
+                    banned_terms = ("お問い合わせ", "お問合せ", "採用", "求人", "アクセス", "予約")
+                    if any(term in description for term in banned_terms):
+                        description = None
+                    elif len(description) > 120:
+                        description = description[:120].rstrip()
             else:
                 description = None
 

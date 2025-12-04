@@ -2,6 +2,7 @@
 import re, urllib.parse, json, os, time, logging
 import asyncio
 import unicodedata
+from collections import deque
 from typing import List, Dict, Any, Optional, Iterable
 from urllib.parse import urlparse, parse_qs, unquote, urljoin
 from difflib import SequenceMatcher
@@ -1849,11 +1850,42 @@ class CompanyScraper:
         return fallback
 
     # ===== 同一ドメイン内を浅く探索 =====
-    def _rank_links(self, base: str, html: str) -> List[str]:
+    FOCUS_KEYWORD_MAP = {
+        "contact": {
+            "anchor": (
+                "お問い合わせ", "お問合せ", "問合せ", "contact", "アクセス", "電話", "tel", "連絡先",
+                "アクセスマップ", "map", "所在地", "recruit", "採用"
+            ),
+            "path": (
+                "/contact", "/inquiry", "/access", "/support", "/contact-us", "/recruit"
+            ),
+        },
+        "finance": {
+            "anchor": (
+                "IR", "ir", "investor", "投資家", "財務", "決算", "disclosure", "financial", "決算短信",
+                "開示", "事業報告", "annual report"
+            ),
+            "path": (
+                "/ir", "/investor", "/financial", "/disclosure", "/ir-library", ".pdf"
+            ),
+        },
+        "profile": {
+            "anchor": (
+                "会社概要", "企業情報", "法人概要", "事業紹介", "about", "profile", "corporate", "沿革",
+                "組織図", "会社案内", "overview", "company"
+            ),
+            "path": (
+                "/company", "/about", "/profile", "/corporate", "/overview", "/gaiyo", "/gaiyou"
+            ),
+        },
+    }
+
+    def _rank_links(self, base: str, html: str, *, focus: Optional[set[str]] = None) -> List[str]:
         base_host = urlparse(base).netloc
         candidates: List[tuple[int, int, int, str]] = []
         fallback_links: List[str] = []
         seen_links: set[str] = set()
+        focus = focus or set()
 
         try:
             soup = BeautifulSoup(html or "", "html.parser")
@@ -1874,6 +1906,15 @@ class CompanyScraper:
         else:
             for href in re.findall(r'href=["\']([^"\']+)["\']', html or "", flags=re.I):
                 raw_links.append((href, ""))
+
+        focus_anchor_words: set[str] = set()
+        focus_path_words: set[str] = set()
+        for key in focus:
+            mapping = self.FOCUS_KEYWORD_MAP.get(key)
+            if not mapping:
+                continue
+            focus_anchor_words.update(mapping.get("anchor", ()))
+            focus_path_words.update(mapping.get("path", ()))
 
         for href, anchor_text in raw_links:
             url = urljoin(base, href)
@@ -1903,6 +1944,19 @@ class CompanyScraper:
                 word_lower = word.lower()
                 if word and (word in anchor_text or word_lower in anchor_lower):
                     score += 8
+
+            if focus_anchor_words:
+                for word in focus_anchor_words:
+                    if not word:
+                        continue
+                    if word.lower() in anchor_lower:
+                        score += 6
+                        break
+            if focus_path_words:
+                for word in focus_path_words:
+                    if word and word in path_lower:
+                        score += 4
+                        break
 
             if score > 0:
                 path_depth = max(parsed.path.count("/"), 1)
@@ -2031,6 +2085,7 @@ class CompanyScraper:
         need_fiscal: bool = False,
         need_founded: bool = False,
         need_description: bool = False,
+        initial_info: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Dict[str, Any]]:
         results: Dict[str, Dict[str, Any]] = {}
         if not homepage:
@@ -2042,12 +2097,36 @@ class CompanyScraper:
             return results
 
         visited: set[str] = {homepage}
-        queue: List[tuple[int, str]] = [(0, homepage)]
+        concurrency = max(1, min(4, max_pages))
+        sem = asyncio.Semaphore(concurrency)
+
+        async def fetch_info(target: str) -> Optional[Dict[str, Any]]:
+            async with sem:
+                try:
+                    return await self.get_page_info(target)
+                except Exception:
+                    return None
+
+        queue: deque[tuple[int, str, Optional[Any]]] = deque()
+        if initial_info:
+            queue.append((0, homepage, initial_info))
+        else:
+            queue.append((0, homepage, None))
+
+        pending_tasks: list[asyncio.Task] = []
+
         while queue and len(results) < max_pages:
-            hop, url = queue.pop(0)
-            try:
-                info = await self.get_page_info(url)
-            except Exception:
+            hop, url, payload = queue.popleft()
+            info = payload
+            if isinstance(info, asyncio.Task):
+                pending_tasks.append(info)
+                try:
+                    info = await info
+                except Exception:
+                    info = None
+            if info is None:
+                info = await fetch_info(url)
+            if not info:
                 continue
 
             results[url] = {
@@ -2078,13 +2157,29 @@ class CompanyScraper:
             html = info.get("html", "") or ""
             if not html:
                 continue
-            for child in self._rank_links(url, html):
-                if child not in visited:
-                    visited.add(child)
-                    queue.append((hop + 1, child))
-                    if len(queue) + len(results) >= max_pages:
-                        break
+            focus_targets: set[str] = set()
+            if need_phone or need_addr or need_rep or need_description:
+                focus_targets.add("contact")
+            if need_listing or need_capital or need_revenue or need_profit or need_fiscal or need_founded:
+                focus_targets.add("finance")
+            if need_description:
+                focus_targets.add("profile")
+            ranked_links = self._rank_links(url, html, focus=focus_targets)
+            for child in ranked_links:
+                if child in visited:
+                    continue
+                visited.add(child)
+                task = asyncio.create_task(fetch_info(child))
+                queue.append((hop + 1, child, task))
+                if len(queue) + len(results) >= max_pages + concurrency:
+                    break
 
+        for _, _, payload in queue:
+            if isinstance(payload, asyncio.Task):
+                payload.cancel()
+        for task in pending_tasks:
+            if not task.done():
+                task.cancel()
         return results
 
     # ===== 抽出 =====
