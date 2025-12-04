@@ -69,15 +69,6 @@ PREFECTURE_NAMES = [
     "福岡県", "佐賀県", "長崎県", "熊本県", "大分県", "宮崎県", "鹿児島県", "沖縄県",
 ]
 PREFECTURE_NAME_RE = re.compile("|".join(re.escape(p) for p in PREFECTURE_NAMES))
-PROFILE_SEARCH_KEYWORDS = (
-    "公式サイト", "会社概要", "企業情報", "法人概要", "会社案内", "企業概要",
-    "profile", "about", "corporate"
-)
-INFO_PAGE_KEYWORDS = (
-    "会社概要", "企業情報", "法人概要", "会社案内", "会社紹介", "団体概要",
-    "施設案内", "profile", "about", "corporate"
-)
-
 REP_NAME_EXACT_BLOCKLIST = {
         "ブログ", "blog", "Blog", "BLOG",
         "ニュース", "News", "news",
@@ -416,7 +407,7 @@ class CompanyScraper:
 
     _romaji_converter = None  # lazy pykakasi converter
 
-    def __init__(self, headless: bool = True, search_engines: Optional[List[str]] = None):
+    def __init__(self, headless: bool = True):
         self.headless = headless
         self._pw = None
         self.browser: Optional[Browser] = None
@@ -426,25 +417,8 @@ class CompanyScraper:
         self.skip_slow_hosts = os.getenv("SKIP_SLOW_HOSTS", "true").lower() == "true"
         self.slow_hosts: set[str] = set()
         self.page_cache: Dict[str, Dict[str, Any]] = {}
-        self.profile_cache: Dict[tuple[str, str], List[str]] = {}
         self.use_http_first = os.getenv("USE_HTTP_FIRST", "true").lower() == "true"
         self.http_timeout_ms = int(os.getenv("HTTP_TIMEOUT_MS", "6000"))
-        env_engines = os.getenv("SEARCH_ENGINES")
-        if search_engines:
-            engines = search_engines
-        elif env_engines:
-            engines = [e.strip().lower() for e in env_engines.split(",") if e.strip()]
-        else:
-            engines = ["duckduckgo"]
-        # duckduckgo のみ利用（環境で指定があればその値を使用）
-        self.search_engines = []
-        seen_engine: set[str] = set()
-        for eng in engines:
-            if eng in ("duckduckgo", "bing") and eng not in seen_engine:
-                self.search_engines.append(eng)
-                seen_engine.add(eng)
-        if not self.search_engines:
-            self.search_engines = ["duckduckgo"]
 
     # ===== 公式判定ヘルパ =====
     @classmethod
@@ -859,62 +833,16 @@ class CompanyScraper:
 
     def _build_company_queries(self, company_name: str, address: Optional[str]) -> List[str]:
         """
-        「会社名 公式サイト」「会社名 ホームページ」「会社名 会社概要」のみに固定する。
-        社名バリアント（株式会社/有限会社を除いた形）も同じ3本だけ生成する。
+        指定された会社名に「公式」「会社概要」を付けた2本だけ生成する。
         """
         base_name = (company_name or "").strip()
         if not base_name:
             return []
-        variants = [base_name]
-        stripped = base_name.replace("株式会社", "").replace("有限会社", "").strip()
-        if stripped and stripped not in variants:
-            variants.append(stripped)
-
-        keywords = ("公式サイト", "ホームページ", "会社概要")
-        queries: List[str] = []
-
-        def add_query(text: str) -> None:
-            normalized = re.sub(r"\s+", " ", text).strip()
-            if normalized and normalized not in queries:
-                queries.append(normalized)
-
-        for variant in variants:
-            if not variant:
-                continue
-            for kw in keywords:
-                add_query(f"{variant} {kw}")
-
-        return queries[:6]
-
-    def _profile_cache_key(self, company_name: str, address: Optional[str]) -> tuple[str, str]:
-        return (
-            self._normalize_company_name(company_name or ""),
-            (address or "").strip(),
-        )
-
-    def _store_profile_candidates(
-        self,
-        company_name: str,
-        address: Optional[str],
-        urls: Iterable[str],
-    ) -> None:
-        cleaned = [url for url in urls if url]
-        if not cleaned:
-            return
-        self.profile_cache[self._profile_cache_key(company_name, address)] = cleaned
-
-    def get_cached_profile_urls(
-        self,
-        company_name: str,
-        address: Optional[str],
-        max_results: Optional[int] = None,
-    ) -> List[str]:
-        cached = self.profile_cache.get(self._profile_cache_key(company_name, address), [])
-        if not cached:
-            return []
-        if max_results is None:
-            return list(cached)
-        return list(cached[: max(0, max_results)])
+        queries = [
+            f"{base_name} 公式",
+            f"{base_name} 会社概要",
+        ]
+        return [re.sub(r"\s+", " ", q).strip() for q in queries if q.strip()]
 
     @staticmethod
     def _domain_tokens(url: str) -> List[str]:
@@ -1716,7 +1644,7 @@ class CompanyScraper:
 
     async def search_company(self, company_name: str, address: str, num_results: int = 3) -> List[str]:
         """
-        DuckDuckGoで検索し、候補URLを返す（「公式サイト」クエリを優先）。
+        DuckDuckGoで検索し、候補URLを返す（「公式」「会社概要」の2クエリのみ）。
         """
         queries = self._build_company_queries(company_name, address)
         if not queries:
@@ -1724,44 +1652,19 @@ class CompanyScraper:
 
         candidates: List[Dict[str, Any]] = []
         seen: set[str] = set()
-        max_candidates = min(5, max(num_results * 2, 6))
+        max_candidates = max(1, min(3, num_results or 3))
 
         for q_idx, query in enumerate(queries):
-            provider_hit = False
-            for provider in self.search_engines:
-                if provider == "bing":
-                    html = await self._fetch_bing(query)
-                    extractor = self._extract_bing_urls
-                else:
-                    html = await self._fetch_duckduckgo(query)
-                    extractor = self._extract_search_urls
-                if not html:
+            html = await self._fetch_duckduckgo(query)
+            if not html:
+                continue
+            for rank, url in enumerate(self._extract_search_urls(html)):
+                if url in seen:
                     continue
-                provider_hit = True
-                for rank, url in enumerate(extractor(html)):
-                    if url in seen:
-                        continue
-                    seen.add(url)
-                    candidates.append({"url": url, "query_idx": q_idx, "rank": rank, "provider": provider})
-                    if len(candidates) >= max_candidates:
-                        break
+                seen.add(url)
+                candidates.append({"url": url, "query_idx": q_idx, "rank": rank})
                 if len(candidates) >= max_candidates:
                     break
-            if len(candidates) >= max_candidates:
-                break
-
-        profile_urls: List[str] = []
-        try:
-            profile_urls = await self.search_company_info_pages(company_name, address, max_results=max(3, num_results + 2))
-        except Exception:
-            profile_urls = []
-
-        # プロフィール検索からのURLを優先的に加点しつつ統合
-        for rank, url in enumerate(profile_urls):
-            if url in seen:
-                continue
-            seen.add(url)
-            candidates.append({"url": url, "query_idx": -1, "rank": rank, "provider": "profile"})
             if len(candidates) >= max_candidates:
                 break
 
@@ -1776,10 +1679,6 @@ class CompanyScraper:
             score += max(0, 6 - item["rank"])
             if item["query_idx"] == 0:
                 score += 3
-            if item.get("provider") == "bing":
-                score -= 1  # DDG結果を僅かに優先
-            if item.get("provider") == "profile":
-                score += 6  # 会社情報ページは強く優先
             score += self._path_priority_value(url)
             scored.append((score, item["query_idx"], item["rank"], url))
 
@@ -1787,103 +1686,7 @@ class CompanyScraper:
         ordered: List[str] = []
         for _, _, _, url in scored:
             ordered.append(url)
-        return ordered[:num_results]
-
-    async def search_company_info_pages(self, company_name: str, address: str, max_results: int = 3) -> List[str]:
-        """
-        会社概要ページを優先してDuckDuckGoから取得する。
-        """
-        base_name = (company_name or "").strip()
-        if not base_name:
-            return []
-        pref = self._extract_prefecture(address or "")
-        city = self._extract_city(address or "")
-        entity_tags = self._detect_entity_tags(base_name)
-        queries: List[str] = []
-
-        def add_query(text: str) -> None:
-            normalized = re.sub(r"\s+", " ", text).strip()
-            if normalized and normalized not in queries:
-                queries.append(normalized)
-
-        info_keywords = list(INFO_PAGE_KEYWORDS)
-        if "gov" in entity_tags:
-            info_keywords.extend(["行政情報", "組織案内", "部局紹介"])
-        if "edu" in entity_tags:
-            info_keywords.extend(["学校案内", "教育情報"])
-        if "med" in entity_tags:
-            info_keywords.extend(["病院案内", "診療科", "医療情報"])
-        if "npo" in entity_tags:
-            info_keywords.extend(["事業報告", "活動報告"])
-
-        for keyword in info_keywords:
-            add_query(f"{base_name} {keyword}")
-            if pref:
-                add_query(f"{base_name} {pref} {keyword}")
-            if city:
-                add_query(f"{base_name} {city} {keyword}")
-
-        if not queries:
-            return []
-
-        candidates: List[Dict[str, Any]] = []
-        seen: set[str] = set()
-        max_candidates = max(max_results * 4, 12)
-
-        for q_idx, query in enumerate(queries):
-            html = await self._fetch_duckduckgo(query)
-            if not html:
-                continue
-            for rank, url in enumerate(self._extract_search_urls(html)):
-                if url in seen or self._is_excluded(url):
-                    continue
-                if not self.is_relevant_profile_url(company_name, url):
-                    continue
-                seen.add(url)
-                try:
-                    host = urllib.parse.urlparse(url).netloc.lower()
-                except Exception:
-                    continue
-                if any(host == domain or host.endswith(f".{domain}") for domain in self.HARD_EXCLUDE_HOSTS):
-                    continue
-                path_priority = self._path_priority_value(url)
-                keyword_bonus = 2 if any(kw in url.lower() for kw in ("about", "profile", "company", "overview", "gaiyou", "kaisya")) else 0
-                if path_priority <= 0 and keyword_bonus == 0:
-                    continue
-                candidates.append(
-                    {
-                        "url": url,
-                        "query_idx": q_idx,
-                        "rank": rank,
-                        "score": path_priority * 2 + keyword_bonus,
-                    }
-                )
-                if len(candidates) >= max_candidates:
-                    break
-            if len(candidates) >= max_candidates:
-                break
-
-        if not candidates:
-            return []
-
-        tokens = self._company_tokens(company_name)
-        scored: List[tuple[int, int, int, str]] = []
-        for item in candidates:
-            url = item["url"]
-            score = self._domain_score(tokens, url) + item["score"]
-            score += max(0, 4 - item["rank"])
-            if item["query_idx"] == 0:
-                score += 2
-            scored.append((score, item["query_idx"], item["rank"], url))
-        scored.sort(key=lambda x: (-x[0], x[1], x[2], x[3]))
-        ordered: List[str] = []
-        for _, _, _, url in scored:
-            ordered.append(url)
-            if len(ordered) >= max_results:
-                break
-        if ordered:
-            self._store_profile_candidates(company_name, address, ordered)
-        return ordered
+        return ordered[:max_candidates]
 
     # ===== ページ取得（HTTP優先＋ブラウザ再利用） =====
     async def _fetch_http_info(self, url: str) -> Dict[str, Any]:

@@ -1362,58 +1362,6 @@ async def process():
                 ai_attempted = False
                 ai_task: asyncio.Task | None = None
 
-                # 外部プロフィール検索（同一ドメインのみ最大2件）
-                need_external_profiles = (
-                    not homepage
-                    or missing_contact > 0
-                    or missing_extra > 0
-                )
-
-                if need_external_profiles and not timed_out and not fully_filled:
-                    profile_urls = scraper.get_cached_profile_urls(name, addr, max_results=2)
-                    if not profile_urls:
-                        try:
-                            profile_urls = await scraper.search_company_info_pages(name, addr, max_results=2)
-                        except Exception:
-                            profile_urls = []
-                    filtered_profile_urls: list[str] = []
-                    for profile_url in profile_urls:
-                        if homepage:
-                            try:
-                                if urlparse(profile_url).netloc.lower() != urlparse(homepage).netloc.lower():
-                                    continue
-                            except Exception:
-                                continue
-                        else:
-                            try:
-                                if not scraper.is_relevant_profile_url(name, profile_url):
-                                    continue
-                            except Exception:
-                                continue
-                        filtered_profile_urls.append(profile_url)
-
-                    if filtered_profile_urls and not timed_out:
-                        profile_sem = asyncio.Semaphore(PROFILE_FETCH_CONCURRENCY)
-
-                        async def fetch_profile(url: str):
-                            async with profile_sem:
-                                info_payload = await scraper.get_page_info(url)
-                            return url, info_payload
-
-                        fetch_tasks = [asyncio.create_task(fetch_profile(url)) for url in filtered_profile_urls]
-                        fetched_profiles = await asyncio.gather(*fetch_tasks, return_exceptions=True)
-                        for profile in fetched_profiles:
-                            if isinstance(profile, Exception) or not profile:
-                                continue
-                            profile_url, profile_info = profile
-                            pdata = {
-                                "text": profile_info.get("text", "") or "",
-                                "html": profile_info.get("html", "") or "",
-                            }
-                            priority_docs[profile_url] = pdata
-                            absorb_doc_data(profile_url, pdata)
-                        missing_contact, missing_extra = refresh_need_flags()
-
                 missing_contact, missing_extra = refresh_need_flags()
                 pre_ai_phone_ok = bool(rule_phone or phone)
                 pre_ai_addr_ok = bool(rule_address or found_address)
