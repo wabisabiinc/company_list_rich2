@@ -243,6 +243,11 @@ def clean_amount_value(val: str) -> str:
     raw = (val or "").strip()
     if not raw:
         return ""
+    # 従業員数など人員系の表記を除外
+    if re.search(r"(従業員|社員|職員|スタッフ)\s*[0-9０-９]+", raw):
+        return ""
+    if re.search(r"[0-9０-９]+\s*(名|人)\b", raw):
+        return ""
     # まず AI 側と同等の金額正規化ロジックを流用して数値＋「円」に統一を試みる
     try:
         normalized = ai_normalize_amount(raw)
@@ -273,6 +278,24 @@ def clean_description_value(val: str) -> str:
         return ""
     text = re.sub(r"\s+", " ", text)
     stripped = text.strip("・-—‐－ー")
+    if "<" in stripped or "class=" in stripped or "svg" in stripped:
+        return ""
+    policy_blocks = (
+        "方針",
+        "ポリシー",
+        "理念",
+        "ビジョン",
+        "挨拶",
+        "ご挨拶",
+        "メッセージ",
+        "品質",
+        "環境",
+        "安全",
+        "コンプライアンス",
+        "情報セキュリティ",
+    )
+    if any(word in stripped for word in policy_blocks):
+        return ""
     if stripped in GENERIC_DESCRIPTION_TERMS:
         return ""
     if len(stripped) < 6:
@@ -621,7 +644,7 @@ async def process():
                 return TIME_LIMIT_DEEP > 0 and homepage and elapsed() > TIME_LIMIT_DEEP
 
             try:
-                candidate_limit = 3
+                candidate_limit = SEARCH_CANDIDATE_LIMIT
                 company_tokens = scraper._company_tokens(name)  # type: ignore
                 urls = await scraper.search_company(name, addr, num_results=candidate_limit)
                 homepage = ""
@@ -1434,7 +1457,7 @@ async def process():
                             founded_val = founded_ai.strip()
                     description = ai_result.get("description")
                     if isinstance(description, str) and description.strip():
-                        description_val = description.strip()[:50]
+                        description_val = clean_description_value(description)
                 else:
                     if ai_attempted and AI_COOLDOWN_SEC > 0:
                         await asyncio.sleep(jittered_seconds(AI_COOLDOWN_SEC, JITTER_RATIO))
@@ -1515,7 +1538,7 @@ async def process():
                                     rep_name_val = ai_rep2
                                     src_rep = info_url
                                 if isinstance(desc2, str) and desc2.strip() and not description_val:
-                                    description_val = desc2.strip()[:50]
+                                    description_val = clean_description_value(desc2)
 
                     missing_contact, missing_extra = refresh_need_flags()
 

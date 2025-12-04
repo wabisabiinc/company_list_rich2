@@ -68,6 +68,7 @@ PREFECTURE_NAMES = [
     "徳島県", "香川県", "愛媛県", "高知県",
     "福岡県", "佐賀県", "長崎県", "熊本県", "大分県", "宮崎県", "鹿児島県", "沖縄県",
 ]
+PREFECTURE_NAME_RE = re.compile("|".join(re.escape(p) for p in PREFECTURE_NAMES))
 PROFILE_SEARCH_KEYWORDS = (
     "公式サイト", "会社概要", "企業情報", "法人概要", "会社案内", "企業概要",
     "profile", "about", "corporate"
@@ -132,7 +133,7 @@ ADDR_FALLBACK_RE = re.compile(
 CITY_RE = re.compile(r"([一-龥]{2,6}(?:市|区|町|村|郡))")
 _BINARY_EXTS = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx")
 REP_RE = re.compile(
-    r"(?:代表者|代表取締役|理事長|学長|会長|社長)"
+    r"(?:代表者|代表取締役|理事長|学長|院長|組合長|会頭|会長|社長)"
     r"\s*[:：]?\s*([^\n\r<>\|（）\(\)]{1,40})"
 )
 LISTING_RE = re.compile(r"(?:上場(?:区分|市場|先)?|株式上場|未上場|非上場|未公開|非公開)\s*[:：]?\s*([^\s、。\n]+)")
@@ -159,7 +160,25 @@ FOUNDED_RE = re.compile(
 )
 
 TABLE_LABEL_MAP = {
-    "rep_names": ("代表者", "代表取締役", "代表者名", "代表", "代表者氏名", "代表名", "会長", "社長", "理事長", "代表社員", "代表理事"),
+    "rep_names": (
+        "代表者",
+        "代表取締役",
+        "代表者名",
+        "代表",
+        "代表者氏名",
+        "代表名",
+        "会長",
+        "社長",
+        "理事長",
+        "代表社員",
+        "代表理事",
+        "会頭",
+        "組合長",
+        "院長",
+        "学長",
+        "園長",
+        "校長",
+    ),
     "capitals": ("資本金", "出資金", "資本金(百万円)", "資本金(万円)"),
     "revenues": (
         "売上高", "売上", "売上額", "売上収益", "収益", "営業収益", "営業収入", "事業収益", "年商", "売上総額", "売上金額",
@@ -693,10 +712,58 @@ class CompanyScraper:
         if not val:
             return ""
         val = unicodedata.normalize("NFKC", val)
+        # HTML断片を除去
+        val = re.sub(r"<[^>]+>", " ", val)
+        val = val.replace("&nbsp;", " ")
+        val = val.replace("br", " ")
         val = val.replace("\u3000", " ")
         val = re.sub(r"[‐―－ー–—]", "-", val)
         val = re.sub(r"\s+", " ", val).strip()
         return val
+
+    @staticmethod
+    def _clean_text_value(val: str) -> str:
+        if not val:
+            return ""
+        cleaned = unicodedata.normalize("NFKC", val)
+        cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+        cleaned = cleaned.replace("&nbsp;", " ").replace("br", " ")
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned
+
+    @staticmethod
+    def _is_amount_like(val: str) -> bool:
+        if not val:
+            return False
+        if re.search(r"(従業員|社員|職員|スタッフ)", val):
+            return False
+        if re.search(r"(名|人)\b", val):
+            return False
+        if not re.search(r"[0-9０-９]", val):
+            return False
+        return bool(re.search(r"(円|万|億|兆)", val))
+
+    @staticmethod
+    def looks_like_address(text: str) -> bool:
+        if not text:
+            return False
+        s = text.strip()
+        if not s:
+            return False
+        if ZIP_RE.search(s):
+            return True
+        try:
+            if any(pref in s for pref in PREFECTURE_NAMES):
+                return True
+        except Exception:
+            pass
+        if PREFECTURE_NAME_RE.search(s):
+            return True
+        if CITY_RE.search(s):
+            return True
+        if re.search(r"(丁目|番地|号|ビル|マンション)", s):
+            return True
+        return False
 
     @staticmethod
     def clean_rep_name(raw: Optional[str]) -> Optional[str]:
@@ -2304,7 +2371,7 @@ class CompanyScraper:
         # 追加の代表者抽出: キーワードの近傍にある漢字氏名を拾う
         if not reps:
             rep_kw_pattern = re.compile(
-                r"(代表者|代表取締役社長|代表取締役|社長|理事長)[^\n\r]{0,20}?([一-龥]{2,5}(?:\s*[一-龥]{2,5})?)"
+                r"(代表取締役社長|代表取締役会長|代表取締役|代表理事長|代表理事|代表者|社長|会長|会頭|理事長|組合長|院長|学長|園長|校長)[^\n\r]{0,20}?([一-龥]{2,5}(?:\s*[一-龥]{2,5})?)"
             )
             for m in rep_kw_pattern.finditer(text or ""):
                 name_cand = m.group(2)
@@ -2352,8 +2419,13 @@ class CompanyScraper:
                         text = block.get_text(separator=" ", strip=True)
                         text = text.replace("\u200b", "")
                         text = re.sub(r"\s+", " ", text)
-                        if text:
-                            sequential_texts.append(text)
+                        if not text:
+                            continue
+                        if "<" in text or "class=" in text or "svg" in text:
+                            continue
+                        if any(k in text.lower() for k in ("menu", "nav", "sitemap", "breadcrumb")):
+                            continue
+                        sequential_texts.append(text)
                 except Exception:
                     sequential_texts = []
 
@@ -2398,48 +2470,52 @@ class CompanyScraper:
 
                 for label, value in pair_values:
                     norm_label = label.replace("：", ":").strip()
-                    norm_value = value.strip()
-                    norm_value = self._normalize_address_candidate(norm_value)
-                    if not norm_value:
+                    raw_value = self._clean_text_value(value)
+                    if not raw_value:
                         continue
                     matched = False
                     for field, keywords in TABLE_LABEL_MAP.items():
                         if any(keyword in norm_label for keyword in keywords):
                             if field == "rep_names":
-                                cleaned = self.clean_rep_name(norm_value)
+                                cleaned = self.clean_rep_name(raw_value)
                                 if cleaned:
                                     reps.append(cleaned)
                                     matched = True
                             elif field == "phone_numbers":
-                                for p in PHONE_RE.finditer(norm_value):
+                                for p in PHONE_RE.finditer(raw_value):
                                     phones.append(f"{p.group(1)}-{p.group(2)}-{p.group(3)}")
-                                matched = True
+                                    matched = True
                             elif field == "addresses":
-                                addrs.append(norm_value)
-                                matched = True
+                                norm_addr = self._normalize_address_candidate(raw_value)
+                                if norm_addr and self.looks_like_address(norm_addr):
+                                    addrs.append(norm_addr)
+                                    matched = True
                             elif field == "listing":
-                                listings.append(norm_value)
+                                listings.append(raw_value)
                                 matched = True
                             elif field == "capitals":
-                                capitals.append(norm_value)
-                                matched = True
+                                if self._is_amount_like(raw_value):
+                                    capitals.append(raw_value)
+                                    matched = True
                             elif field == "revenues":
-                                revenues.append(norm_value)
-                                matched = True
+                                if self._is_amount_like(raw_value):
+                                    revenues.append(raw_value)
+                                    matched = True
                             elif field == "profits":
-                                profits.append(norm_value)
-                                matched = True
+                                if self._is_amount_like(raw_value):
+                                    profits.append(raw_value)
+                                    matched = True
                             elif field == "fiscal_months":
-                                fiscal_months.append(norm_value)
+                                fiscal_months.append(raw_value)
                                 matched = True
                             elif field == "founded_years":
-                                parsed = self._parse_founded_year(norm_value)
+                                parsed = self._parse_founded_year(raw_value)
                                 if parsed:
                                     founded_years.append(parsed)
                                     matched = True
                             break
                     if not matched and self._is_exec_title(norm_label):
-                        cleaned = self.clean_rep_name(norm_value)
+                        cleaned = self.clean_rep_name(raw_value)
                         if cleaned:
                             reps.append(cleaned)
 
