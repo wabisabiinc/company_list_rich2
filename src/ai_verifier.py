@@ -271,16 +271,20 @@ class AIVerifier:
             log.error(f"No model initialized for {company_name} ({address})")
             return None
 
-        content: list[Any] = []
-        if self.system_prompt:
-            content.append(self.system_prompt)
-        content.append(self._build_prompt(text, company_name, address))
-        if screenshot:
-            try:
-                b64 = base64.b64encode(screenshot).decode("utf-8")
-                content.append({"inline_data": {"mime_type": "image/png", "data": b64}})
-            except Exception:
-                log.warning("Failed to encode screenshot; proceeding text-only.")
+        def _build_content(use_image: bool) -> list[Any]:
+            payload: list[Any] = []
+            if self.system_prompt:
+                payload.append(self.system_prompt)
+            payload.append(self._build_prompt(text, company_name, address))
+            if use_image and screenshot:
+                try:
+                    b64 = base64.b64encode(screenshot).decode("utf-8")
+                    payload.append({"inline_data": {"mime_type": "image/png", "data": b64}})
+                except Exception:
+                    log.warning("Failed to encode screenshot; proceeding text-only.")
+            return payload
+
+        content: list[Any] = _build_content(True)
 
         try:
             t0 = time.time()
@@ -349,11 +353,21 @@ class AIVerifier:
             return out
 
         except GoogleAPIError as e:
-            log.error(f"Google API error for {company_name} ({address}): {e}")
-            return None
+            log.warning(f"Google API error for {company_name} ({address}) with image: {e}")
+            try:
+                resp = await self.model.generate_content_async(_build_content(False), safety_settings=None)  # type: ignore
+            except Exception:
+                return None
+            raw = _resp_text(resp)
+            return _extract_first_json(raw) or None
         except Exception as e:
-            log.error(f"Failed to verify info for {company_name} ({address}): {e}", exc_info=True)
-            return None
+            log.warning(f"Failed to verify info for {company_name} ({address}) with image: {e}", exc_info=True)
+            try:
+                resp = await self.model.generate_content_async(_build_content(False))  # type: ignore
+            except Exception:
+                return None
+            raw = _resp_text(resp)
+            return _extract_first_json(raw) or None
 
     async def judge_official_homepage(
         self,
@@ -379,16 +393,20 @@ class AIVerifier:
             "- URLが企業ドメインや自治体/学校の公式ドメインなら true に寄せる。\n"
             f"企業名: {company_name}\n住所: {address}\n候補URL: {url}\n本文抜粋:\n{snippet}\n"
         )
-        content: list[Any] = []
-        if self.system_prompt:
-            content.append(self.system_prompt)
-        content.append(prompt)
-        if screenshot:
-            try:
-                b64 = base64.b64encode(screenshot).decode("utf-8")
-                content.append({"inline_data": {"mime_type": "image/png", "data": b64}})
-            except Exception:
-                pass
+        def _build_content(use_image: bool) -> list[Any]:
+            payload: list[Any] = []
+            if self.system_prompt:
+                payload.append(self.system_prompt)
+            payload.append(prompt)
+            if use_image and screenshot:
+                try:
+                    b64 = base64.b64encode(screenshot).decode("utf-8")
+                    payload.append({"inline_data": {"mime_type": "image/png", "data": b64}})
+                except Exception:
+                    pass
+            return payload
+
+        content: list[Any] = _build_content(True)
         try:
             try:
                 resp = await self.model.generate_content_async(content, safety_settings=None)
@@ -422,5 +440,35 @@ class AIVerifier:
                 "reason": reason,
             }
         except Exception as exc:  # pylint: disable=broad-except
-            log.warning(f"judge_official_homepage failed for {company_name} ({url}): {exc}")
-            return None
+            log.warning(f"judge_official_homepage failed for {company_name} ({url}) with image: {exc}")
+            try:
+                resp = await self.model.generate_content_async(_build_content(False), safety_settings=None)  # type: ignore
+            except Exception:
+                return None
+            raw = _resp_text(resp)
+            result = _extract_first_json(raw)
+            if not isinstance(result, dict):
+                return None
+            verdict = result.get("is_official")
+            if isinstance(verdict, str):
+                verdict = verdict.strip().lower()
+                verdict = verdict in {"true", "yes", "official", "1"}
+            elif isinstance(verdict, (int, float)):
+                verdict = bool(verdict)
+            elif not isinstance(verdict, bool):
+                return None
+            confidence_val = result.get("confidence")
+            try:
+                confidence = float(confidence_val) if confidence_val is not None else None
+            except Exception:
+                confidence = None
+            reason = result.get("reason")
+            if isinstance(reason, str):
+                reason = reason.strip()
+            else:
+                reason = ""
+            return {
+                "is_official": bool(verdict),
+                "confidence": confidence,
+                "reason": reason,
+            }

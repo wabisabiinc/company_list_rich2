@@ -241,6 +241,8 @@ class CompanyScraper:
         # 介護系まとめ/紹介
         "kaigostar.net",
         "houjin.info",
+        # 重い/公式でないケースが多いドメイン
+        "biz-maps.com", "catr.jp", "data-link-plus.com", "metoree.com",
         # 海外系まとめ/掲示板
         "zhihu.com", "baidu.com", "tieba.baidu.com", "sogou.com", "sohu.com",
         "weibo.com", "bilibili.com", "douban.com", "toutiao.com", "qq.com",
@@ -340,6 +342,8 @@ class CompanyScraper:
         "toutiao.com",
         "qq.com",
         "akala.ai",
+        "catr.jp",
+        "metoree.com",
     }
 
     SUSPECT_HOSTS = {
@@ -399,8 +403,8 @@ class CompanyScraper:
         "Inc.", "Inc", "Co.", "Co", "Corporation", "Company", "Ltd.", "Ltd",
         "Holding", "Holdings", "HD", "グループ", "ホールディングス", "本社",
     ]
-    # 公式判定で許容するTLDを拡張（.net/.org/.biz/.co なども許容）
-    ALLOWED_OFFICIAL_TLDS = (".co.jp", ".jp", ".com", ".net", ".org", ".biz", ".co", ".info")
+    # 公式判定で優先的に許容するTLD（汎用TLDは追加の名称/住所一致が必須）
+    ALLOWED_OFFICIAL_TLDS = (".co.jp", ".jp", ".com", ".net")
     ALLOWED_HOST_WHITELIST = {"big-advance.site"}
 
     # 優先的に巡回したいURLのキーワード
@@ -422,13 +426,14 @@ class CompanyScraper:
         self._pw = None
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
-        self.page_timeout_ms = int(os.getenv("PAGE_TIMEOUT_MS", "9000"))
-        self.slow_page_threshold_ms = int(os.getenv("SLOW_PAGE_THRESHOLD_MS", "9000"))
+        self.page_timeout_ms = int(os.getenv("PAGE_TIMEOUT_MS", "7000"))
+        self.slow_page_threshold_ms = int(os.getenv("SLOW_PAGE_THRESHOLD_MS", "7000"))
         self.skip_slow_hosts = os.getenv("SKIP_SLOW_HOSTS", "true").lower() == "true"
         self.slow_hosts: set[str] = set()
         self.page_cache: Dict[str, Dict[str, Any]] = {}
         self.use_http_first = os.getenv("USE_HTTP_FIRST", "true").lower() == "true"
-        self.http_timeout_ms = int(os.getenv("HTTP_TIMEOUT_MS", "6000"))
+        self.http_timeout_ms = int(os.getenv("HTTP_TIMEOUT_MS", "5000"))
+        self.search_cache: Dict[tuple[str, str], List[str]] = {}
 
     # ===== 公式判定ヘルパ =====
     @classmethod
@@ -1274,6 +1279,10 @@ class CompanyScraper:
         loose_host_hit = host_token_hit or (company_has_corp and allowed_tld and domain_match_score >= 3)
         name_present_flag = bool(norm_name and norm_name in combined) or any(tok in host for tok in company_tokens) or any(tok in host_compact for tok in company_tokens) or loose_host_hit
         strong_domain_flag = company_has_corp and loose_host_hit and (domain_match_score >= 3 or whitelist_hit or is_google_sites)
+        generic_tld = (
+            host.endswith((".org", ".biz", ".info", ".co"))
+            and not host.endswith((".co.jp", ".or.jp", ".ac.jp", ".ed.jp", ".go.jp", ".lg.jp", ".gr.jp"))
+        )
 
         if norm_name and norm_name in combined:
             score += 4
@@ -1313,7 +1322,7 @@ class CompanyScraper:
                     break
 
         if generic_tld and not whitelist_hit and not is_google_sites:
-            if domain_match_score < 4 and not (address_hit or pref_hit or postal_hit) and not name_present_flag:
+            if not (name_present_flag or domain_match_score >= 4) or not (address_hit or pref_hit or postal_hit):
                 return finalize(
                     False,
                     score=score,
@@ -1329,6 +1338,19 @@ class CompanyScraper:
 
         if allowed_tld and host_token_hit and company_has_corp and score < 4:
             score = 4
+
+        if expected_address and not (address_hit or pref_hit or postal_hit):
+            return finalize(
+                False,
+                score=score,
+                name_present=name_present_flag,
+                strong_domain=strong_domain_flag,
+                address_match=address_hit,
+                prefecture_match=pref_hit,
+                postal_code_match=postal_hit,
+                domain_score=domain_match_score,
+                host_value=host,
+            )
 
         if (address_hit or pref_hit or postal_hit) and (allowed_tld or whitelist_hit or is_google_sites):
             return finalize(
@@ -1718,6 +1740,13 @@ class CompanyScraper:
         """
         DuckDuckGoで検索し、候補URLを返す（「公式」「会社概要」の2クエリのみ）。
         """
+        key = (
+            unicodedata.normalize("NFKC", company_name or "").strip(),
+            unicodedata.normalize("NFKC", address or "").strip(),
+        )
+        cached = self.search_cache.get(key)
+        if cached:
+            return list(cached)
         queries = self._build_company_queries(company_name, address)
         if not queries:
             return []
@@ -1774,7 +1803,9 @@ class CompanyScraper:
         ordered: List[str] = []
         for _, _, _, url in scored:
             ordered.append(url)
-        return ordered[:max_candidates]
+        result = ordered[:max_candidates]
+        self.search_cache[key] = list(result)
+        return result
 
     # ===== ページ取得（HTTP優先＋ブラウザ再利用） =====
     async def _fetch_http_info(self, url: str) -> Dict[str, Any]:
@@ -1786,6 +1817,8 @@ class CompanyScraper:
             host = (parsed.netloc or "").lower().split(":")[0]
         except Exception:
             host = ""
+        if host and (host in self.HARD_EXCLUDE_HOSTS or self._is_excluded(host)):
+            return {"url": url, "text": "", "html": ""}
         if host and self.skip_slow_hosts and host in self.slow_hosts:
             log.info("[http] skip slow host %s url=%s", host, url)
             return {"url": url, "text": "", "html": ""}
@@ -1852,6 +1885,8 @@ class CompanyScraper:
             host = (parsed.netloc or "").lower().split(":")[0]
         except Exception:
             host = ""
+        if host and (host in self.HARD_EXCLUDE_HOSTS or self._is_excluded(host)):
+            return {"url": url, "text": "", "html": "", "screenshot": b""}
 
         if host and self.skip_slow_hosts and host in self.slow_hosts:
             log.info("[page] skip slow host %s url=%s", host, url)
