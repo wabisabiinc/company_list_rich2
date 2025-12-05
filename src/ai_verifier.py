@@ -253,16 +253,10 @@ class AIVerifier:
             '  "phone_number": "03-1234-5678" または null,\n'
             '  "address": "〒123-4567 東京都..." または null,\n'
             '  "rep_name": "代表取締役 山田太郎" または null,\n'
-            '  "description": "60-100文字で事業内容が分かる文章（お問い合わせ/採用/アクセス/予約等は禁止）" または null,\n'
-            '  "listing": "上場/未上場/非上場/市場名" または null,\n'
-            '  "capital": "1億円" または null,\n'
-            '  "revenue": "10億円" または null,\n'
-            '  "profit": "2億円" または null,\n'
-            '  "fiscal_month": "3月" または null,\n'
-            '  "founded_year": "1987" または null\n'
+            '  "description": "60-100文字で事業内容が分かる文章（お問い合わせ/採用/アクセス/予約等は禁止）" または null\n'
             "}\n"
-            "禁止: 推測での非上場判定、見出しだけのdescription、descriptionにCTA/問い合わせ/採用/アクセス情報を入れること、汎用語(氏名/名前/役職/担当/選任/概要など)をrep_nameにすること。\n"
-            "優先度: 電話/住所/代表者を最優先。金額系は本文の数値+単位のみ。住所は都道府県から、郵便番号があれば先頭に含める。\n"
+            "禁止: 推測、問い合わせ/採用/アクセス情報をdescriptionに入れること、汎用語(氏名/名前/役職/担当/選任/概要など)をrep_nameにすること。\n"
+            "優先度: 電話/住所/代表者/description を最優先。住所は都道府県から、郵便番号があれば先頭に含める。\n"
             f"# 本文テキスト抜粋\n{snippet}\n"
         )
 
@@ -328,28 +322,6 @@ class AIVerifier:
                 "rep_name": rep_name,
                 "description": description,
             }
-            if rep_name is not None:
-                out["representative"] = rep_name
-            if "homepage_url" in result:
-                out["homepage_url"] = result.get("homepage_url")
-            listing = _normalize_listing(result.get("listing"))
-            capital = _normalize_amount(result.get("capital"))
-            revenue = _normalize_amount(result.get("revenue"))
-            profit = _normalize_amount(result.get("profit") or result.get("income"))
-            fiscal_month = _normalize_fiscal_month(result.get("fiscal_month"))
-            founded_year = _normalize_year(result.get("founded_year") or result.get("established_year"))
-            if listing is not None:
-                out["listing"] = listing
-            if capital is not None:
-                out["capital"] = capital
-            if revenue is not None:
-                out["revenue"] = revenue
-            if profit is not None:
-                out["profit"] = profit
-            if fiscal_month is not None:
-                out["fiscal_month"] = fiscal_month
-            if founded_year is not None:
-                out["founded_year"] = founded_year
             return out
 
         except GoogleAPIError as e:

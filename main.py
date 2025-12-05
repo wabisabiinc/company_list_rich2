@@ -1390,10 +1390,10 @@ async def process():
                     fully_filled = homepage and missing_contact == 0 and missing_extra == 0
 
                     try:
-                        # 深掘りは不足があるときだけ最小限に実施
-                        priority_limit = 0
+                        # 深掘りは不足があれば最大3件、欠損ゼロでも1件だけ拾う
+                        priority_limit = 1 if (not timed_out and fully_filled) else 0
                         if not timed_out and not fully_filled:
-                            priority_limit = 3 if missing_contact else (2 if missing_extra else 0)
+                            priority_limit = 3 if missing_contact else 2
                         site_docs = (
                             {}
                             if priority_limit == 0
@@ -1417,14 +1417,11 @@ async def process():
                 ai_task: asyncio.Task | None = None
 
                 missing_contact, missing_extra = refresh_need_flags()
-                pre_ai_phone_ok = bool(rule_phone or phone)
-                pre_ai_addr_ok = bool(rule_address or found_address)
-                pre_ai_rep_ok = bool(rule_rep or rep_name_val)
-                ai_needed = (
+                ai_needed = bool(
                     homepage
                     and USE_AI
                     and verifier is not None
-                    and (missing_contact > 0 or missing_extra > 0 or not pre_ai_phone_ok or not pre_ai_addr_ok or not pre_ai_rep_ok)
+                    and (missing_contact > 0 or need_description)
                 )
                 if ai_needed and not timed_out:
                     ai_attempted = True
@@ -1478,42 +1475,6 @@ async def process():
                     ai_addr = normalize_address(ai_result.get("address"))
                     ai_rep = ai_result.get("rep_name") or ai_result.get("representative")
                     ai_rep = scraper.clean_rep_name(ai_rep) if ai_rep else None
-                    if not listing_val:
-                        listing_ai = ai_result.get("listing")
-                        if isinstance(listing_ai, str) and listing_ai.strip():
-                            cleaned_ai_listing = clean_listing_value(listing_ai)
-                            if cleaned_ai_listing:
-                                listing_val = cleaned_ai_listing
-                    if not capital_val:
-                        capital_ai = ai_result.get("capital")
-                        if isinstance(capital_ai, str) and capital_ai.strip():
-                            cleaned_ai_capital = clean_amount_value(capital_ai)
-                            if cleaned_ai_capital:
-                                capital_val = cleaned_ai_capital
-                    if not revenue_val:
-                        revenue_ai = ai_result.get("revenue")
-                        if isinstance(revenue_ai, str) and revenue_ai.strip():
-                            cleaned_ai_revenue = clean_amount_value(revenue_ai)
-                            if cleaned_ai_revenue:
-                                revenue_val = cleaned_ai_revenue
-                    if not profit_val:
-                        profit_ai = ai_result.get("profit")
-                        if isinstance(profit_ai, str) and profit_ai.strip():
-                            cleaned_ai_profit = clean_amount_value(profit_ai)
-                            if cleaned_ai_profit:
-                                profit_val = cleaned_ai_profit
-                    if not fiscal_val:
-                        fiscal_ai = ai_result.get("fiscal_month")
-                        if isinstance(fiscal_ai, str) and fiscal_ai.strip():
-                            cleaned_ai_fiscal = clean_fiscal_month(fiscal_ai)
-                            if cleaned_ai_fiscal:
-                                fiscal_val = cleaned_ai_fiscal
-                    if not founded_val:
-                        founded_ai = ai_result.get("founded_year")
-                        if isinstance(founded_ai, str) and founded_ai.strip():
-                            cleaned_ai_founded = clean_founded_year(founded_ai)
-                            if cleaned_ai_founded:
-                                founded_val = cleaned_ai_founded
                     description = ai_result.get("description")
                     if isinstance(description, str) and description.strip():
                         update_description_candidate(description)
@@ -1573,42 +1534,6 @@ async def process():
                                 ai_rep2 = ai_result2.get("rep_name") or ai_result2.get("representative")
                                 ai_rep2 = scraper.clean_rep_name(ai_rep2) if ai_rep2 else None
                                 desc2 = ai_result2.get("description")
-                                if not listing_val:
-                                    listing_ai2 = ai_result2.get("listing")
-                                    if isinstance(listing_ai2, str) and listing_ai2.strip():
-                                        cleaned_ai_listing2 = clean_listing_value(listing_ai2)
-                                        if cleaned_ai_listing2:
-                                            listing_val = cleaned_ai_listing2
-                                if not capital_val:
-                                    capital_ai2 = ai_result2.get("capital")
-                                    if isinstance(capital_ai2, str) and capital_ai2.strip():
-                                        cleaned_ai_capital2 = clean_amount_value(capital_ai2)
-                                        if cleaned_ai_capital2:
-                                            capital_val = cleaned_ai_capital2
-                                if not revenue_val:
-                                    revenue_ai2 = ai_result2.get("revenue")
-                                    if isinstance(revenue_ai2, str) and revenue_ai2.strip():
-                                        cleaned_ai_revenue2 = clean_amount_value(revenue_ai2)
-                                        if cleaned_ai_revenue2:
-                                            revenue_val = cleaned_ai_revenue2
-                                if not profit_val:
-                                    profit_ai2 = ai_result2.get("profit")
-                                    if isinstance(profit_ai2, str) and profit_ai2.strip():
-                                        cleaned_ai_profit2 = clean_amount_value(profit_ai2)
-                                        if cleaned_ai_profit2:
-                                            profit_val = cleaned_ai_profit2
-                                if not fiscal_val:
-                                    fiscal_ai2 = ai_result2.get("fiscal_month")
-                                    if isinstance(fiscal_ai2, str) and fiscal_ai2.strip():
-                                        cleaned_ai_fiscal2 = clean_fiscal_month(fiscal_ai2)
-                                        if cleaned_ai_fiscal2:
-                                            fiscal_val = cleaned_ai_fiscal2
-                                if not founded_val:
-                                    founded_ai2 = ai_result2.get("founded_year")
-                                    if isinstance(founded_ai2, str) and founded_ai2.strip():
-                                        cleaned_ai_founded2 = clean_founded_year(founded_ai2)
-                                        if cleaned_ai_founded2:
-                                            founded_val = cleaned_ai_founded2
                                 if ai_phone2 and not phone:
                                     phone = ai_phone2
                                     phone_source = "ai"
