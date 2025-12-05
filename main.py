@@ -947,7 +947,8 @@ async def process():
                                 fallback_cands.append((record.get("url"), extracted))
                                 log.info("[%s] AI公式でも名称/ドメイン一致弱のためスキップ: %s", cid, record.get("url"))
                                 continue
-                            if domain_score < 3 and not strong_domain_host and not rule_details.get("strong_domain") and not address_ok:
+                            # 低ドメイン一致は name/address/host が強い場合のみ採用
+                            if domain_score < 3 and not strong_domain_host and not rule_details.get("strong_domain") and not address_ok and not name_hit and not host_token_hit:
                                 manager.upsert_url_flag(
                                     normalized_url,
                                     is_official=False,
@@ -992,7 +993,8 @@ async def process():
                             fallback_cands.append((record.get("url"), extracted))
                             log.info("[%s] 名称/ドメイン一致弱のため公式判定を除外: %s", cid, record.get("url"))
                             continue
-                        if domain_score < 3 and not strong_domain_host and not rule_details.get("strong_domain") and not address_ok:
+                        # 低ドメイン一致は name/address/host が強い場合のみ採用
+                        if domain_score < 3 and not strong_domain_host and not rule_details.get("strong_domain") and not address_ok and not name_hit and not host_token_hit:
                             manager.upsert_url_flag(
                                 normalized_url,
                                 is_official=False,

@@ -200,6 +200,12 @@ class DatabaseManager:
             self.conn.execute("ALTER TABLE companies ADD COLUMN homepage_official_source TEXT;")
         if "homepage_official_score" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN homepage_official_score REAL;")
+        if "source_url_phone" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN source_url_phone TEXT;")
+        if "source_url_address" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN source_url_address TEXT;")
+        if "source_url_rep" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN source_url_rep TEXT;")
 
         self.conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_companies_name_addr ON companies(company_name, address);"

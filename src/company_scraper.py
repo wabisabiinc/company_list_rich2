@@ -244,6 +244,11 @@ class CompanyScraper:
         # 海外系まとめ/掲示板
         "zhihu.com", "baidu.com", "tieba.baidu.com", "sogou.com", "sohu.com",
         "weibo.com", "bilibili.com", "douban.com", "toutiao.com", "qq.com",
+        # レシピ/料理/ブログ系で誤爆したドメイン
+        "mychicagosteak.com", "thepioneerwoman.com", "sipbitego.com",
+        "foodnetwork.com", "delish.com", "allrecipes.com", "tasteofhome.com",
+        # 企業DBまとめ系（公式ではない）
+        "founded-today.com",
     ]
 
     PRIORITY_PATHS = [
@@ -374,6 +379,9 @@ class CompanyScraper:
         "hotel", "travel", "tour", "booking", "reservation", "yoyaku",
         "mall", "store", "shop", "coupon", "catalog", "price",
         "seikyu", "delivery", "ranking", "review", "口コミ", "比較",
+        # 料理/ブログ/まとめ系の誤爆抑止
+        "recipe", "cooking", "food", "gourmet", "kitchen", "steak", "bbq", "grill",
+        "university", "blog", "press", "news",
     }
 
     NON_OFFICIAL_SNIPPET_KEYWORDS = (
@@ -745,6 +753,24 @@ class CompanyScraper:
         return False
 
     @staticmethod
+    def _looks_like_full_address(text: str) -> bool:
+        """
+        住所として採用するための厳しめチェック:
+        - 郵便番号がある、または
+        - 都道府県 + 市区町村 が両方含まれる
+        """
+        if not text:
+            return False
+        s = text.strip()
+        if not s:
+            return False
+        if ZIP_RE.search(s):
+            return True
+        pref = CompanyScraper._extract_prefecture(s)
+        city = CompanyScraper._extract_city(s)
+        return bool(pref and city)
+
+    @staticmethod
     def clean_rep_name(raw: Optional[str]) -> Optional[str]:
         if not raw:
             return None
@@ -837,6 +863,8 @@ class CompanyScraper:
             return None
         if re.search(r"(こと|する|される|ます|でした|いたします|いただき)", text):
             return None
+        if re.search(r"(登録されていません|未登録|準備中|編集中)", text):
+            return None
         if not re.search(r"[一-龥ぁ-んァ-ン]", text):
             return None
         return text
@@ -895,23 +923,28 @@ class CompanyScraper:
 
         domain_tokens = self._domain_tokens(url)
         for token in company_tokens:
+            if not token:
+                continue
+            token_len = len(token)
             if any(token in dt for dt in domain_tokens):
                 score += 4
-            if token and token in host:
+            if token in host:
                 score += 4
-            if token and token in host_compact:
-                score += 4
-            if token and token in path_lower:
-                score += 4
+            if token in host_compact:
+                score += 3  # ハイフン除去一致は少し弱め
+            if token in path_lower:
+                score += 3
             else:
-                for dt in domain_tokens:
-                    try:
-                        ratio = SequenceMatcher(None, token, dt).ratio()
-                    except Exception:
-                        ratio = 0
-                    if ratio >= 0.75:
-                        score += 4
-                        break
+                # 類似度加点はトークン長が4文字以上に限定し、重みを下げる
+                if token_len >= 4:
+                    for dt in domain_tokens:
+                        try:
+                            ratio = SequenceMatcher(None, token, dt).ratio()
+                        except Exception:
+                            ratio = 0
+                        if ratio >= 0.8:
+                            score += 2
+                            break
         lowered = host + urlparse(url).path.lower()
         if any(kw in lowered for kw in self.NON_OFFICIAL_KEYWORDS):
             score -= 3
@@ -940,6 +973,12 @@ class CompanyScraper:
             href = "https:" + href
         elif href.startswith("/"):
             href = urljoin("https://duckduckgo.com", href)
+        lowered_full = href.lower()
+        if self._is_excluded(lowered_full):
+            return None
+        for kw in ("recipe", "cooking", "steak", "food", "gourmet", "kitchen"):
+            if kw in lowered_full:
+                return None
         try:
             path_lower = urllib.parse.urlparse(href).path.lower()
             if any(path_lower.endswith(ext) for ext in _BINARY_EXTS):
@@ -1185,6 +1224,7 @@ class CompanyScraper:
             score += 2
         elif host.endswith('.com') or host.endswith('.net'):
             score += 1
+        generic_tld = host.endswith((".com", ".net", ".biz", ".co", ".info", ".org")) and not host.endswith((".co.jp", ".or.jp", ".ac.jp", ".ed.jp", ".go.jp", ".lg.jp", ".gr.jp"))
 
         company_tokens = self._company_tokens(company_name)
         host_compact = host.replace("-", "").replace(".", "")
@@ -1220,6 +1260,13 @@ class CompanyScraper:
         combined = f"{text_snippet}\n{meta_snippet}".strip()
         lowered = combined.lower()
         entity_tags = self._detect_entity_tags(company_name)
+        def _entity_suffix_hit(tag: str) -> bool:
+            allowed = self.ENTITY_SITE_SUFFIXES.get(tag, ())
+            return any(self._host_matches_suffix(host, suffix) for suffix in allowed)
+        if "gov" in entity_tags and not (_entity_suffix_hit("gov") or is_google_sites):
+            return finalize(False, host_value=host, blocked_host=True)
+        if "edu" in entity_tags and not (_entity_suffix_hit("edu") or is_google_sites):
+            return finalize(False, host_value=host, blocked_host=True)
         company_has_corp = any(suffix in (company_name or "") for suffix in self.CORP_SUFFIXES) or bool(entity_tags)
         host_token_hit = self._host_token_hit(company_tokens, url)
         if not company_tokens:
@@ -1264,6 +1311,21 @@ class CompanyScraper:
                     pref_hit = pref_ok
                     postal_hit = zip_ok
                     break
+
+        if generic_tld and not whitelist_hit and not is_google_sites:
+            if domain_match_score < 4 and not (address_hit or pref_hit or postal_hit) and not name_present_flag:
+                return finalize(
+                    False,
+                    score=score,
+                    name_present=name_present_flag,
+                    strong_domain=strong_domain_flag,
+                    address_match=address_hit,
+                    prefecture_match=pref_hit,
+                    postal_code_match=postal_hit,
+                    domain_score=domain_match_score,
+                    host_value=host,
+                    blocked_host=True,
+                )
 
         if allowed_tld and host_token_hit and company_has_corp and score < 4:
             score = 4
@@ -1678,6 +1740,22 @@ class CompanyScraper:
             if len(candidates) >= max_candidates:
                 break
 
+        # DDGで不足した場合、Bingも併用して補完
+        if len(candidates) < max_candidates:
+            for q_idx, query in enumerate(queries):
+                html = await self._fetch_bing(query)
+                if not html:
+                    continue
+                for rank, url in enumerate(self._extract_bing_urls(html)):
+                    if url in seen:
+                        continue
+                    seen.add(url)
+                    candidates.append({"url": url, "query_idx": q_idx, "rank": rank})
+                    if len(candidates) >= max_candidates:
+                        break
+                if len(candidates) >= max_candidates:
+                    break
+
         if not candidates:
             return []
 
@@ -1750,7 +1828,9 @@ class CompanyScraper:
         if self.use_http_first and not need_screenshot:
             http_info = await self._fetch_http_info(url)
             text_len = len((http_info.get("text") or "").strip())
-            if text_len >= 120 or http_info.get("html"):
+            html_len = len(http_info.get("html") or "")
+            # 軽量取得で十分な本文/HTMLが取れた場合のみ即返す。薄い場合はブラウザで再取得。
+            if text_len >= 120 or html_len >= 1200:
                 self.page_cache[url] = {
                     "url": url,
                     "text": http_info.get("text", "") or "",
@@ -2216,12 +2296,14 @@ class CompanyScraper:
                 if parts:
                     seg = " ".join(parts[:8]).strip()
                     if seg:
-                        addrs.append(self._normalize_address_candidate(f"{zip_code} {seg}"))
+                        norm_addr = self._normalize_address_candidate(f"{zip_code} {seg}")
+                        if norm_addr and self._looks_like_full_address(norm_addr):
+                            addrs.append(norm_addr)
 
         if not addrs:
             for cand in ADDR_FALLBACK_RE.findall(text or ""):
                 norm = self._normalize_address_candidate(cand)
-                if norm:
+                if norm and self._looks_like_full_address(norm):
                     addrs.append(norm)
 
         for rm in REP_RE.finditer(text or ""):
