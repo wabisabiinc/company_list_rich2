@@ -520,16 +520,29 @@ class DatabaseManager:
         import logging as _l; _l.info(f"DB_WRITE_OK id={company['id']} status={status}")
 
         # 住所が入力側で粗い場合に、スクレイプで得た詳細住所を address に昇格させる
+        # Promote found_address to address when it is more detailed
         try:
             if "found_address" in cols and "address" in cols:
-                raw_addr = company.get("address") or ""
+                raw_addr = (company.get("address") or "").strip()
                 found_addr = found_addr_clean or ""
-                if found_addr and (not raw_addr or len(raw_addr) <= 4):
-                    self.conn.execute(
-                        "UPDATE companies SET address=? WHERE id=?",
-                        (found_addr, company["id"]),
-                    )
-                    self._commit_with_checkpoint()
+                if found_addr:
+                    has_zip = bool(re.search(r"\d{3}-\d{4}", found_addr))
+                    has_city = bool(re.search(r"(\u5e02|\u533a|\u753a|\u6751|\u90e1)", found_addr))
+                    raw_has_zip = bool(re.search(r"\d{3}-\d{4}", raw_addr))
+                    raw_has_city = bool(re.search(r"(\u5e02|\u533a|\u753a|\u6751|\u90e1)", raw_addr))
+                    # Overwrite when address is empty/very short, found is longer, or adds zip/city info
+                    if (
+                        not raw_addr
+                        or len(raw_addr) <= 8
+                        or len(found_addr) > len(raw_addr)
+                        or (has_zip and not raw_has_zip)
+                        or (has_city and not raw_has_city)
+                    ):
+                        self.conn.execute(
+                            "UPDATE companies SET address=? WHERE id=?",
+                            (found_addr, company["id"]),
+                        )
+                        self._commit_with_checkpoint()
         except Exception:
             pass
 

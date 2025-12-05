@@ -117,6 +117,21 @@ PHONE_RE = re.compile(
     r"[-‐―－ー–—.\s]*"
     r"(\d{3,4})"
 )
+
+def _normalize_phone_strict(raw: str) -> Optional[str]:
+    if not raw:
+        return None
+    digits = re.sub(r"\D", "", raw)
+    if digits.startswith("81") and len(digits) >= 10:
+        digits = "0" + digits[2:]
+    if digits in {"0123456789", "81112345678"}:
+        return None
+    if not digits.startswith("0") or len(digits) not in (10, 11):
+        return None
+    m = re.search(r"^(0\d{1,4})(\d{2,4})(\d{3,4})$", digits)
+    if not m:
+        return None
+    return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
 ZIP_RE = re.compile(r"(〒?\s*\d{3})[-‐―－ー]?(\d{4})")
 ADDR_HINT = re.compile(r"(都|道|府|県).+?(市|区|郡|町|村)")
 ADDR_FALLBACK_RE = re.compile(
@@ -404,7 +419,11 @@ class CompanyScraper:
         "Holding", "Holdings", "HD", "グループ", "ホールディングス", "本社",
     ]
     # 公式判定で優先的に許容するTLD（汎用TLDは追加の名称/住所一致が必須）
-    ALLOWED_OFFICIAL_TLDS = (".co.jp", ".jp", ".com", ".net")
+    ALLOWED_OFFICIAL_TLDS = (
+        ".co.jp", ".or.jp", ".ac.jp", ".ed.jp", ".go.jp", ".lg.jp", ".gr.jp",
+        ".jp", ".com", ".net", ".org", ".biz", ".info", ".co",
+    )
+    GENERIC_TLDS = (".com", ".net", ".org", ".biz", ".info", ".co")
     ALLOWED_HOST_WHITELIST = {"big-advance.site"}
 
     # 優先的に巡回したいURLのキーワード
@@ -1223,13 +1242,14 @@ class CompanyScraper:
             score += 4  # 許容ホストは減点を打ち消す
         if host.startswith("www."):
             score += 2
-        if host.endswith(('.co.jp', '.or.jp', '.ac.jp', '.ed.jp', '.lg.jp', '.gr.jp', '.go.jp')):
+        jp_corp_tlds = (".co.jp", ".or.jp", ".ac.jp", ".ed.jp", ".lg.jp", ".gr.jp", ".go.jp")
+        if host.endswith(jp_corp_tlds):
             score += 4
-        elif host.endswith('.jp'):
+        elif host.endswith(".jp"):
             score += 2
-        elif host.endswith('.com') or host.endswith('.net'):
+        elif any(host.endswith(tld) for tld in self.GENERIC_TLDS):
             score += 1
-        generic_tld = host.endswith((".com", ".net", ".biz", ".co", ".info", ".org")) and not host.endswith((".co.jp", ".or.jp", ".ac.jp", ".ed.jp", ".go.jp", ".lg.jp", ".gr.jp"))
+        generic_tld = any(host.endswith(tld) for tld in self.GENERIC_TLDS) and not host.endswith(jp_corp_tlds)
 
         company_tokens = self._company_tokens(company_name)
         host_compact = host.replace("-", "").replace(".", "")
@@ -1275,14 +1295,11 @@ class CompanyScraper:
         company_has_corp = any(suffix in (company_name or "") for suffix in self.CORP_SUFFIXES) or bool(entity_tags)
         host_token_hit = self._host_token_hit(company_tokens, url)
         if not company_tokens:
-            host_token_hit = True  # ローマ字トークンが生成できない場合はドメイン一致の厳格チェックを緩和
+            host_token_hit = True  # Fallback when romaji tokens cannot be generated
         loose_host_hit = host_token_hit or (company_has_corp and allowed_tld and domain_match_score >= 3)
         name_present_flag = bool(norm_name and norm_name in combined) or any(tok in host for tok in company_tokens) or any(tok in host_compact for tok in company_tokens) or loose_host_hit
         strong_domain_flag = company_has_corp and loose_host_hit and (domain_match_score >= 3 or whitelist_hit or is_google_sites)
-        generic_tld = (
-            host.endswith((".org", ".biz", ".info", ".co"))
-            and not host.endswith((".co.jp", ".or.jp", ".ac.jp", ".ed.jp", ".go.jp", ".lg.jp", ".gr.jp"))
-        )
+        # generic_tld is computed above; generic TLDs need name/address corroboration
 
         if norm_name and norm_name in combined:
             score += 4
@@ -1322,7 +1339,21 @@ class CompanyScraper:
                     break
 
         if generic_tld and not whitelist_hit and not is_google_sites:
-            if not (name_present_flag or domain_match_score >= 4) or not (address_hit or pref_hit or postal_hit):
+            name_ok = name_present_flag or domain_match_score >= 4 or host_token_hit
+            if not name_ok:
+                return finalize(
+                    False,
+                    score=score,
+                    name_present=name_present_flag,
+                    strong_domain=strong_domain_flag,
+                    address_match=address_hit,
+                    prefecture_match=pref_hit,
+                    postal_code_match=postal_hit,
+                    domain_score=domain_match_score,
+                    host_value=host,
+                    blocked_host=True,
+                )
+            if expected_address and not (address_hit or pref_hit or postal_hit):
                 return finalize(
                     False,
                     score=score,
@@ -2313,7 +2344,9 @@ class CompanyScraper:
         reps: List[str] = []
 
         for p in PHONE_RE.finditer(text or ""):
-            phones.append(f"{p.group(1)}-{p.group(2)}-{p.group(3)}")
+            cand = _normalize_phone_strict(f"{p.group(1)}-{p.group(2)}-{p.group(3)}")
+            if cand:
+                phones.append(cand)
 
         for zm in ZIP_RE.finditer(text or ""):
             zip_code = f"〒{zm.group(1).replace('〒', '').strip()}-{zm.group(2)}"
@@ -2461,8 +2494,10 @@ class CompanyScraper:
                                     matched = True
                             elif field == "phone_numbers":
                                 for p in PHONE_RE.finditer(raw_value):
-                                    phones.append(f"{p.group(1)}-{p.group(2)}-{p.group(3)}")
-                                    matched = True
+                                    cand = _normalize_phone_strict(f"{p.group(1)}-{p.group(2)}-{p.group(3)}")
+                                    if cand:
+                                        phones.append(cand)
+                                        matched = True
                             elif field == "addresses":
                                 norm_addr = self._normalize_address_candidate(raw_value)
                                 if norm_addr and self.looks_like_address(norm_addr):
@@ -2513,7 +2548,22 @@ class CompanyScraper:
                             tel = entity.get("telephone")
                             if isinstance(tel, str):
                                 for p in PHONE_RE.finditer(tel):
-                                    phones.append(f"{p.group(1)}-{p.group(2)}-{p.group(3)}")
+                                    cand = _normalize_phone_strict(f"{p.group(1)}-{p.group(2)}-{p.group(3)}")
+                                    if cand:
+                                        phones.append(cand)
+                            contact_points = entity.get("contactPoint") or entity.get("contactPoints") or []
+                            if isinstance(contact_points, dict):
+                                contact_points = [contact_points]
+                            if isinstance(contact_points, list):
+                                for cp in contact_points:
+                                    if not isinstance(cp, dict):
+                                        continue
+                                    cp_tel = cp.get("telephone")
+                                    if isinstance(cp_tel, str):
+                                        for p in PHONE_RE.finditer(cp_tel):
+                                            cand = _normalize_phone_strict(f"{p.group(1)}-{p.group(2)}-{p.group(3)}")
+                                            if cand:
+                                                phones.append(cand)
                             addr = entity.get("address")
                             if isinstance(addr, dict):
                                 parts = [addr.get(k, "") for k in ("postalCode", "addressRegion", "addressLocality", "streetAddress")]

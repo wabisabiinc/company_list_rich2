@@ -196,6 +196,19 @@ def pick_best_address(expected_addr: str | None, candidates: list[str]) -> str |
     if not normalized_candidates:
         return None
     if not expected_addr:
+        # 郵便番号/市区町村/丁目を多く含むものを優先
+        def _score(addr: str) -> int:
+            score = 0
+            if ZIP_CODE_RE.search(addr):
+                score += 6
+            if CITY_RE.search(addr):
+                score += 4
+            if re.search(r"丁目|番地|号", addr):
+                score += 2
+            if re.search(r"(ビル|マンション)", addr):
+                score += 1
+            return score
+        normalized_candidates.sort(key=lambda a: (_score(a), len(a)), reverse=True)
         return normalized_candidates[0]
 
     expected_norm = normalize_address(expected_addr)
@@ -217,6 +230,10 @@ def pick_best_address(expected_addr: str | None, candidates: list[str]) -> str |
             score += 8
         elif not expected_zip and cand_zip_match:
             score += 1
+        if CITY_RE.search(cand):
+            score += 3
+        if re.search(r"(丁目|番地|号)", cand):
+            score += 2
         if expected_key and key:
             score += SequenceMatcher(None, expected_key, key).ratio() * 6
         for token in expected_tokens:
@@ -1597,16 +1614,18 @@ async def process():
                             if not src_rep:
                                 src_rep = info_url
 
-                    # 欠落情報があれば浅く探索して補完
+                    # 欠落情報があれば浅く探索して補完（電話が無い場合は深めに）
                     missing_contact, missing_extra = refresh_need_flags()
                     need_extra_fields = missing_extra > 0
-                    related_page_limit = 2 if missing_extra else 1
+                    # 電話が未取得なら contact まで届くようページ上限を広げる
+                    related_page_limit = 3 if need_phone else (2 if missing_extra else 1)
                     related = {}
                     if not timed_out and ((missing_contact > 0) or need_extra_fields):
                         if over_time_limit() or over_deep_limit():
                             timed_out = True
                         else:
-                            more_pages = 1 if (need_phone or need_addr or need_rep or need_description) else 0
+                            # 電話/住所/代表者/説明が欠落しているときは追加で1ページ余裕を持つ
+                            more_pages = 2 if (need_phone or need_addr or need_rep or need_description) else 0
                             try:
                                 related = await scraper.crawl_related(
                                     homepage,
@@ -1614,7 +1633,7 @@ async def process():
                                     need_addr,
                                     need_rep,
                                     max_pages=related_page_limit + more_pages,
-                                    max_hops=2,
+                                    max_hops=3 if need_phone else 2,
                                     need_listing=need_listing,
                                     need_capital=need_capital,
                                     need_revenue=need_revenue,

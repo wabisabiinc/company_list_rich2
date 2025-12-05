@@ -1,0 +1,20 @@
+1278         if "edu" in entity_tags and not (_entity_suffix_hit("edu") or is_google_sites):
+1279             return finalize(False, host_value=host, blocked_host=True)
+1280         company_has_corp = any(suffix in (company_name or "") for suffix in self.CORP_SUFFIXES) or bool(entity_tags)
+1281         host_token_hit = self._host_token_hit(company_tokens, url)
+1282         if not company_tokens:
+1283             host_token_hit = True  # ローマ字トークンが生成できない場合はドメイン一致の厳格チェックを緩和
+1284         loose_host_hit = host_token_hit or (company_has_corp and allowed_tld and domain_match_score >= 3)
+1285         name_present_flag = bool(norm_name and norm_name in combined) or any(tok in host for tok in company_tokens) or any(tok in host_compact for tok in company_tokens) or loose_host_hit
+1286         strong_domain_flag = company_has_corp and loose_host_hit and (domain_match_score >= 3 or whitelist_hit or is_google_sites)
+1287         # generic_tld は冒頭で算出済み（汎用TLDは名称/住所一致を必須にする）
+1288 
+1289         if norm_name and norm_name in combined:
+1290             score += 4
+1291         elif norm_name and len(norm_name) >= 4 and any(part in combined for part in (norm_name[:4], norm_name[-4:])):
+1292             score += 2
+1293         if "公式" in combined or "official" in lowered:
+1294             score += 2
+1295         if any(kw in lowered for kw in self.NON_OFFICIAL_SNIPPET_KEYWORDS):
+1296             score -= 2
+1297         if any(kw in host for kw in self.NON_OFFICIAL_KEYWORDS):
