@@ -52,11 +52,16 @@ REFERENCE_CSVS = [p.strip() for p in os.getenv("REFERENCE_CSVS", "").split(",") 
 FETCH_CONCURRENCY = max(1, int(os.getenv("FETCH_CONCURRENCY", "3")))
 PROFILE_FETCH_CONCURRENCY = max(1, int(os.getenv("PROFILE_FETCH_CONCURRENCY", "3")))
 SEARCH_CANDIDATE_LIMIT = max(1, int(os.getenv("SEARCH_CANDIDATE_LIMIT", "3")))
-# 全体のタイムアウトは使わず、フェーズ別で管理する
+# 深掘りページ/ホップを環境変数で制御（デフォルトは軽め）
+RELATED_BASE_PAGES = max(0, int(os.getenv("RELATED_BASE_PAGES", "1")))
+RELATED_EXTRA_PHONE = max(0, int(os.getenv("RELATED_EXTRA_PHONE", "1")))
+RELATED_MAX_HOPS_BASE = max(1, int(os.getenv("RELATED_MAX_HOPS_BASE", "2")))
+RELATED_MAX_HOPS_PHONE = max(1, int(os.getenv("RELATED_MAX_HOPS_PHONE", "2")))
+# 全体のタイムアウトは使わず、フェーズ別で管理する（デフォルトを短めにし停滞を防止）
 TIME_LIMIT_SEC = float(os.getenv("TIME_LIMIT_SEC", "0"))
-TIME_LIMIT_FETCH_ONLY = float(os.getenv("TIME_LIMIT_FETCH_ONLY", "30"))  # 公式未確定で候補取得フェーズ（0で無効）
-TIME_LIMIT_WITH_OFFICIAL = float(os.getenv("TIME_LIMIT_WITH_OFFICIAL", "45"))  # 公式確定後、主要項目未充足（0で無効）
-TIME_LIMIT_DEEP = float(os.getenv("TIME_LIMIT_DEEP", "60"))  # 深掘り専用の上限（公式確定後）（0で無効）
+TIME_LIMIT_FETCH_ONLY = float(os.getenv("TIME_LIMIT_FETCH_ONLY", "10"))  # 公式未確定で候補取得フェーズ（0で無効）
+TIME_LIMIT_WITH_OFFICIAL = float(os.getenv("TIME_LIMIT_WITH_OFFICIAL", "30"))  # 公式確定後、主要項目未充足（0で無効）
+TIME_LIMIT_DEEP = float(os.getenv("TIME_LIMIT_DEEP", "30"))  # 深掘り専用の上限（公式確定後）（0で無効）
 OFFICIAL_AI_USE_SCREENSHOT = os.getenv("OFFICIAL_AI_USE_SCREENSHOT", "true").lower() == "true"
 SECOND_PASS_ENABLED = os.getenv("SECOND_PASS_ENABLED", "false").lower() == "true"
 SECOND_PASS_RETRY_STATUSES = [s.strip() for s in os.getenv("SECOND_PASS_RETRY_STATUSES", "review,no_homepage,error").split(",") if s.strip()]
@@ -1614,37 +1619,41 @@ async def process():
                             if not src_rep:
                                 src_rep = info_url
 
-                    # 欠落情報があれば浅く探索して補完（電話が無い場合は深めに）
+                    # ???????????????????????????????
                     missing_contact, missing_extra = refresh_need_flags()
                     need_extra_fields = missing_extra > 0
-                    # 電話が未取得なら contact まで届くようページ上限を広げる
-                    related_page_limit = 3 if need_phone else (2 if missing_extra else 1)
-                    related = {}
-                    if not timed_out and ((missing_contact > 0) or need_extra_fields):
-                        if over_time_limit() or over_deep_limit():
-                            timed_out = True
-                        else:
-                            # 電話/住所/代表者/説明が欠落しているときは追加で1ページ余裕を持つ
-                            more_pages = 2 if (need_phone or need_addr or need_rep or need_description) else 0
-                            try:
-                                related = await scraper.crawl_related(
-                                    homepage,
-                                    need_phone,
-                                    need_addr,
-                                    need_rep,
-                                    max_pages=related_page_limit + more_pages,
-                                    max_hops=3 if need_phone else 2,
-                                    need_listing=need_listing,
-                                    need_capital=need_capital,
-                                    need_revenue=need_revenue,
-                                    need_profit=need_profit,
-                                    need_fiscal=need_fiscal,
-                                    need_founded=need_founded,
-                                    need_description=need_description,
-                                    initial_info=info_dict if info_url == homepage else None,
-                                )
-                            except Exception:
-                                related = {}
+                    if missing_contact == 0 and not need_extra_fields:
+                        related = {}
+                    else:
+                        related_page_limit = RELATED_BASE_PAGES + (1 if missing_extra else 0)
+                        if need_phone:
+                            related_page_limit += RELATED_EXTRA_PHONE
+                        related_page_limit = max(0, related_page_limit)
+                        related = {}
+                        if not timed_out and ((missing_contact > 0) or need_extra_fields):
+                            if over_time_limit() or over_deep_limit():
+                                timed_out = True
+                            else:
+                                max_hops = RELATED_MAX_HOPS_PHONE if need_phone else RELATED_MAX_HOPS_BASE
+                                try:
+                                    related = await scraper.crawl_related(
+                                        homepage,
+                                        need_phone,
+                                        need_addr,
+                                        need_rep,
+                                        max_pages=related_page_limit,
+                                        max_hops=max_hops,
+                                        need_listing=need_listing,
+                                        need_capital=need_capital,
+                                        need_revenue=need_revenue,
+                                        need_profit=need_profit,
+                                        need_fiscal=need_fiscal,
+                                        need_founded=need_founded,
+                                        need_description=need_description,
+                                        initial_info=info_dict if info_url == homepage else None,
+                                    )
+                                except Exception:
+                                    related = {}
                         for url, data in related.items():
                             text = data.get("text", "") or ""
                             html_content = data.get("html", "") or ""
@@ -1664,12 +1673,16 @@ async def process():
                                     src_addr = url
                                     need_addr = False
                             if need_rep and cc.get("rep_names"):
-                                cand_rep = cc["rep_names"][0]
-                                cand_rep = scraper.clean_rep_name(cand_rep) if cand_rep else None
+                                cand_rep = scraper.clean_rep_name(cc["rep_names"][0])
                                 if cand_rep:
                                     rep_name_val = cand_rep
                                     src_rep = url
                                     need_rep = False
+                            if need_description and cc.get("description"):
+                                desc = clean_description_value(cc["description"])
+                                if desc:
+                                    description_val = desc
+                                    need_description = False
                             if need_listing and cc.get("listings"):
                                 cleaned_listing = clean_listing_value(cc["listings"][0] or "")
                                 if cleaned_listing:
