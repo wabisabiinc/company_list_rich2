@@ -1,0 +1,80 @@
+                        if lead_desc:
+                            description_val = lead_desc
+                            need_description = False
+
+                    missing_contact, missing_extra = refresh_need_flags()
+
+                    if over_time_limit():
+                        timed_out = True
+
+                    fully_filled = homepage and missing_contact == 0 and missing_extra == 0
+
+                    try:
+                        # 深掘りは不足があるときだけ最小限に実施
+                        priority_limit = 0
+                        if not timed_out and not fully_filled:
+                            priority_limit = 3 if missing_contact else (2 if missing_extra else 0)
+                        site_docs = (
+                            {}
+                            if priority_limit == 0
+                            else await scraper.fetch_priority_documents(
+                                homepage,
+                                info_dict.get("html", ""),
+                                max_links=priority_limit,
+                                concurrency=FETCH_CONCURRENCY,
+                            )
+                        )
+                    except Exception:
+                        site_docs = {}
+                    for url, pdata in site_docs.items():
+                        priority_docs[url] = pdata
+                        absorb_doc_data(url, pdata)
+                    if site_docs:
+                        missing_contact, missing_extra = refresh_need_flags()
+
+                ai_result = None
+                ai_attempted = False
+                ai_task: asyncio.Task | None = None
+                pre_ai_phone_ok = bool(rule_phone or phone)
+                pre_ai_addr_ok = bool(rule_address or found_address)
+                pre_ai_rep_ok = bool(rule_rep or rep_name_val)
+                ai_needed = (
+                    homepage
+                    and USE_AI
+                    and verifier is not None
+                    and any([
+                        not pre_ai_phone_ok,
+                        not pre_ai_addr_ok,
+                        not pre_ai_rep_ok,
+                        need_listing,
+                        need_capital,
+                        need_revenue,
+                        need_profit,
+                        need_fiscal,
+                        need_founded,
+                        need_description,
+                    ])
+                )
+                if ai_needed and not timed_out:
+                    ai_attempted = True
+                    info_dict = await ensure_info_has_screenshot(scraper, info_url, info_dict, need_screenshot=OFFICIAL_AI_USE_SCREENSHOT)
+                    info = info_dict
+
+                    async def run_ai_verify():
+                        nonlocal ai_time_spent
+                        ai_started = time.monotonic()
+                        try:
+                            res = await verifier.verify_info(
+                                info_dict.get("text", "") or "",
+                                info_dict.get("screenshot"),
+                                name,
+                                addr,
+                            )
+                        except Exception:
+                            log.warning("[%s] AI検証失敁E-> ルールベ�Eスにフォールバック", cid, exc_info=True)
+                            return None
+                        finally:
+                            ai_time_spent += time.monotonic() - ai_started
+                        return res
+
+                    ai_task = asyncio.create_task(run_ai_verify())

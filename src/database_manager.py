@@ -4,6 +4,7 @@ import os
 import sqlite3
 import time
 import urllib.parse
+import re
 from typing import Optional, Dict, Any
 
 
@@ -200,6 +201,12 @@ class DatabaseManager:
             self.conn.execute("ALTER TABLE companies ADD COLUMN homepage_official_source TEXT;")
         if "homepage_official_score" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN homepage_official_score REAL;")
+        if "source_url_phone" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN source_url_phone TEXT;")
+        if "source_url_address" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN source_url_address TEXT;")
+        if "source_url_rep" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN source_url_rep TEXT;")
 
         self.conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_companies_name_addr ON companies(company_name, address);"
@@ -437,14 +444,39 @@ class DatabaseManager:
         updates: list[str] = []
         params: list[Any] = []
 
+        def _clean_phone(raw: Any) -> str:
+            s = (raw or "").strip()
+            digits = re.sub(r"\D", "", s)
+            if digits.startswith("81") and len(digits) >= 11:
+                digits = "0" + digits[2:]
+            if digits in {"81112345678", "0123456789"}:
+                return ""
+            if not digits.startswith("0") or len(digits) not in (10, 11):
+                return ""
+            m = re.search(r"^(0\d{1,4})(\d{2,4})(\d{3,4})$", digits)
+            if not m:
+                return ""
+            return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+
+        def _clean_address(raw: Any) -> str:
+            s = (raw or "").strip().replace("　", " ")
+            if not s:
+                return ""
+            s = s.translate(str.maketrans("０１２３４５６７８９－ー―‐／", "0123456789----/"))
+            s = re.sub(r"[\\s]+", " ", s)
+            s = s.replace("〒 ", "〒").replace("〒", "〒")
+            return s.strip()
+
         def set_value(column: str, value: Any) -> None:
             if column in cols:
                 updates.append(f"{column} = ?")
                 params.append(value)
 
         set_value("homepage", company.get("homepage", "") or "")
-        set_value("phone", company.get("phone", "") or "")
-        set_value("found_address", company.get("found_address", "") or "")
+        cleaned_phone = _clean_phone(company.get("phone"))
+        set_value("phone", cleaned_phone)
+        found_addr_clean = _clean_address(company.get("found_address"))
+        set_value("found_address", found_addr_clean)
         set_value("rep_name", company.get("rep_name", "") or "")
         set_value("description", company.get("description", "") or "")
         set_value("ai_used", int(company.get("ai_used", 0) or 0))
@@ -486,6 +518,33 @@ class DatabaseManager:
         self.cur.execute(sql, params)
         self._commit_with_checkpoint()
         import logging as _l; _l.info(f"DB_WRITE_OK id={company['id']} status={status}")
+
+        # 住所が入力側で粗い場合に、スクレイプで得た詳細住所を address に昇格させる
+        # Promote found_address to address when it is more detailed
+        try:
+            if "found_address" in cols and "address" in cols:
+                raw_addr = (company.get("address") or "").strip()
+                found_addr = found_addr_clean or ""
+                if found_addr:
+                    has_zip = bool(re.search(r"\d{3}-\d{4}", found_addr))
+                    has_city = bool(re.search(r"(\u5e02|\u533a|\u753a|\u6751|\u90e1)", found_addr))
+                    raw_has_zip = bool(re.search(r"\d{3}-\d{4}", raw_addr))
+                    raw_has_city = bool(re.search(r"(\u5e02|\u533a|\u753a|\u6751|\u90e1)", raw_addr))
+                    # Overwrite when address is empty/very short, found is longer, or adds zip/city info
+                    if (
+                        not raw_addr
+                        or len(raw_addr) <= 8
+                        or len(found_addr) > len(raw_addr)
+                        or (has_zip and not raw_has_zip)
+                        or (has_city and not raw_has_city)
+                    ):
+                        self.conn.execute(
+                            "UPDATE companies SET address=? WHERE id=?",
+                            (found_addr, company["id"]),
+                        )
+                        self._commit_with_checkpoint()
+        except Exception:
+            pass
 
         # 任意：CSVミラー（指定時のみ）
         if not self.csv_path:

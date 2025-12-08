@@ -155,6 +155,7 @@ cython_debug/
 
 # Visual Studio Code
 .vscode/
+.vscode/settings.json
 
 # Ruff
 .ruff_cache/

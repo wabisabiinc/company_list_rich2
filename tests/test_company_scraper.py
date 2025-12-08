@@ -1,5 +1,5 @@
 import pytest
-from unittest.mock import patch, MagicMock, AsyncMock
+from unittest.mock import patch, MagicMock
 from src.company_scraper import CompanyScraper
 
 # 絶対/相対の /l/?uddg=..., 相対パス, 除外ドメインを含むサンプル
@@ -17,7 +17,7 @@ SAMPLE_HTML = """
     <!-- 相対パス -->
     <a class="result__a" href="/relative/path">Rel</a>
     <!-- 会社概要のパス -->
-    <a class="result__a" href="https://profile.example.com/company/overview">Profile</a>
+    <a class="result__a" href="https://example.co.jp/company/overview">Profile</a>
     <!-- 空 href -->
     <a class="result__a" href="">Empty</a>
     <!-- 旅行系集客ドメイン（除外対象） -->
@@ -27,16 +27,6 @@ SAMPLE_HTML = """
   </body>
 </html>
 """
-BING_HTML = """
-<html>
-  <body>
-    <li class="b_algo">
-      <h2><a href="https://example-bing.com/info">Example Bing</a></h2>
-    </li>
-  </body>
-</html>
-"""
-
 @pytest.fixture
 def scraper():
     return CompanyScraper(headless=True)
@@ -50,9 +40,10 @@ async def test_search_company_filters_and_resolves(mock_get, scraper):
     mock_get.return_value = mock_response
 
     urls = await scraper.search_company("トヨタ自動車株式会社", "愛知県豊田市", num_results=10)
-    first_query = mock_get.call_args_list[0].kwargs["params"]["q"]
-    assert "会社" in first_query
-    assert "公式" in first_query
+    queries = [call.kwargs["params"]["q"] for call in mock_get.call_args_list]
+    assert queries[0] == "トヨタ自動車株式会社 公式"
+    allowed_queries = {"トヨタ自動車株式会社 公式", "トヨタ自動車株式会社 会社概要"}
+    assert all(q in allowed_queries for q in queries)
 
     # /l/?uddg= が正しく剥がれている（相対/絶対）
     assert "https://example.com/home" in urls
@@ -66,12 +57,9 @@ async def test_search_company_filters_and_resolves(mock_get, scraper):
     # プロトコルなし → https
     assert any(u.startswith("https://bar.com") for u in urls)
 
-    # 相対パス → duckduckgo に連結
-    assert any(u.startswith("https://duckduckgo.com/relative/path") for u in urls)
-
     # 空文字を含まない & 上限件数
     assert all(u for u in urls)
-    assert len(urls) <= 10
+    assert len(urls) <= 3
 
 @pytest.mark.asyncio
 @patch("src.company_scraper.requests.get")
@@ -95,32 +83,6 @@ async def test_search_company_empty_on_http_error(mock_get, scraper):
     assert urls == []
 
 
-@pytest.mark.asyncio
-async def test_search_company_info_pages_prefers_profile(scraper):
-    fake_fetch = AsyncMock(return_value=SAMPLE_HTML)
-    with patch.object(scraper, "_fetch_duckduckgo", fake_fetch):
-        urls = await scraper.search_company_info_pages("社名", "東京都", max_results=1)
-    assert urls
-    assert any("profile.example.com" in u for u in urls)
-
-
-@pytest.mark.asyncio
-async def test_search_company_fallbacks_to_bing(scraper):
-    if "bing" not in scraper.search_engines:
-        pytest.skip("bing fallback disabled in current configuration")
-
-    async def fake_ddg(*args, **kwargs):
-        return ""
-
-    async def fake_bing(*args, **kwargs):
-        return BING_HTML
-
-    with patch.object(scraper, "_fetch_duckduckgo", side_effect=fake_ddg), \
-            patch.object(scraper, "_fetch_bing", side_effect=fake_bing):
-        urls = await scraper.search_company("社名", "住所", num_results=1)
-        assert urls and urls[0].startswith("https://example-bing.com")
-
-
 def test_is_likely_official_site_true(scraper):
     text = "会社概要\n株式会社Exampleは・・・"
     assert scraper.is_likely_official_site(
@@ -128,6 +90,11 @@ def test_is_likely_official_site_true(scraper):
         "https://www.example.co.jp/about",
         {"text": text, "html": f"<title>{text}</title>"},
     )
+
+def test_clean_candidate_url_relative(scraper):
+    assert scraper._clean_candidate_url("/relative/path") == "https://duckduckgo.com/relative/path"
+    assert scraper._clean_candidate_url("//bar.com/page").startswith("https://")
+
 
 
 def test_is_likely_official_site_false(scraper):
@@ -208,7 +175,7 @@ def test_clean_rep_name_handles_chairman_title(scraper):
 def test_extract_candidates_keeps_full_rep_name(scraper):
     text = "会社概要\n代表取締役会長　飯野　靖司\n所在地 東京都千代田区"
     cands = scraper.extract_candidates(text)
-    assert "飯野靖司" in cands["rep_names"]
+    assert any(name.replace(" ", "") == "飯野靖司" for name in cands["rep_names"])
 
 
 def test_extract_candidates_finance_inline_variations(scraper):

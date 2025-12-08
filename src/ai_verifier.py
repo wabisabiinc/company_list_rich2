@@ -243,25 +243,20 @@ class AIVerifier:
             log.warning(f"AIVerifier: failed to load system prompt from %s: %s", path, e)
             return None
 
-    def _build_prompt(self, text: str) -> str:
+    def _build_prompt(self, text: str, company_name: str = "", address: str = "") -> str:
         snippet = _shorten_text(text or "", max_len=3500)
         return (
             "あなたは企業サイトや関連資料から企業情報を抽出する専門家です。別会社を混ぜず、わからない項目は必ずnullにしてください。推測で埋めないこと。\n"
             "返すべきJSONのみを出力してください（説明やマークダウン禁止）。\n"
+            f"対象企業: {company_name or '不明'} / 住所: {address or '不明'}\n"
             "{\n"
-            '  \"phone_number\": \"03-1234-5678\" または null,\n'
-            '  \"address\": \"〒123-4567 東京都...\" または null,\n'
-            '  \"rep_name\": \"代表取締役 山田太郎\" または null,\n'
-            '  \"description\": \"50字以内の会社概要\" または null,\n'
-            '  \"listing\": \"上場/未上場/非上場/市場名\" または null,\n'
-            '  \"capital\": \"1億円\" または null,\n'
-            '  \"revenue\": \"10億円\" または null,\n'
-            '  \"profit\": \"2億円\" または null,\n'
-            '  \"fiscal_month\": \"3月\" または null,\n'
-            '  \"founded_year\": \"1987\" または null\n'
+            '  "phone_number": "03-1234-5678" または null,\n'
+            '  "address": "〒123-4567 東京都..." または null,\n'
+            '  "rep_name": "代表取締役 山田太郎" または null,\n'
+            '  "description": "60-100文字で事業内容が分かる文章（お問い合わせ/採用/アクセス/予約等は禁止）" または null\n'
             "}\n"
-            "禁止: 推測での非上場判定、見出しだけのdescription、汎用語(氏名/名前/役職/担当/選任/概要など)をrep_nameにすること。\n"
-            "優先度: 電話/住所/代表者を最優先。金額系は本文の数値+単位のみ。住所は都道府県から、郵便番号があれば先頭に含める。\n"
+            "禁止: 推測、問い合わせ/採用/アクセス情報をdescriptionに入れること、汎用語(氏名/名前/役職/担当/選任/概要など)をrep_nameにすること。\n"
+            "優先度: 電話/住所/代表者/description を最優先。住所は都道府県から、郵便番号があれば先頭に含める。\n"
             f"# 本文テキスト抜粋\n{snippet}\n"
         )
 
@@ -270,16 +265,20 @@ class AIVerifier:
             log.error(f"No model initialized for {company_name} ({address})")
             return None
 
-        content: list[Any] = []
-        if self.system_prompt:
-            content.append(self.system_prompt)
-        content.append(self._build_prompt(text))
-        if screenshot:
-            try:
-                b64 = base64.b64encode(screenshot).decode("utf-8")
-                content.append({"inline_data": {"mime_type": "image/png", "data": b64}})
-            except Exception:
-                log.warning("Failed to encode screenshot; proceeding text-only.")
+        def _build_content(use_image: bool) -> list[Any]:
+            payload: list[Any] = []
+            if self.system_prompt:
+                payload.append(self.system_prompt)
+            payload.append(self._build_prompt(text, company_name, address))
+            if use_image and screenshot:
+                try:
+                    b64 = base64.b64encode(screenshot).decode("utf-8")
+                    payload.append({"inline_data": {"mime_type": "image/png", "data": b64}})
+                except Exception:
+                    log.warning("Failed to encode screenshot; proceeding text-only.")
+            return payload
+
+        content: list[Any] = _build_content(True)
 
         try:
             t0 = time.time()
@@ -308,8 +307,12 @@ class AIVerifier:
             description = result.get("description")
             if isinstance(description, str):
                 description = re.sub(r"\s+", " ", description.strip()) or None
-                if description and len(description) > 50:
-                    description = description[:50]
+                if description:
+                    banned_terms = ("お問い合わせ", "お問合せ", "採用", "求人", "アクセス", "予約")
+                    if any(term in description for term in banned_terms):
+                        description = None
+                    elif len(description) > 120:
+                        description = description[:120].rstrip()
             else:
                 description = None
 
@@ -319,36 +322,24 @@ class AIVerifier:
                 "rep_name": rep_name,
                 "description": description,
             }
-            if rep_name is not None:
-                out["representative"] = rep_name
-            if "homepage_url" in result:
-                out["homepage_url"] = result.get("homepage_url")
-            listing = _normalize_listing(result.get("listing"))
-            capital = _normalize_amount(result.get("capital"))
-            revenue = _normalize_amount(result.get("revenue"))
-            profit = _normalize_amount(result.get("profit") or result.get("income"))
-            fiscal_month = _normalize_fiscal_month(result.get("fiscal_month"))
-            founded_year = _normalize_year(result.get("founded_year") or result.get("established_year"))
-            if listing is not None:
-                out["listing"] = listing
-            if capital is not None:
-                out["capital"] = capital
-            if revenue is not None:
-                out["revenue"] = revenue
-            if profit is not None:
-                out["profit"] = profit
-            if fiscal_month is not None:
-                out["fiscal_month"] = fiscal_month
-            if founded_year is not None:
-                out["founded_year"] = founded_year
             return out
 
         except GoogleAPIError as e:
-            log.error(f"Google API error for {company_name} ({address}): {e}")
-            return None
+            log.warning(f"Google API error for {company_name} ({address}) with image: {e}")
+            try:
+                resp = await self.model.generate_content_async(_build_content(False), safety_settings=None)  # type: ignore
+            except Exception:
+                return None
+            raw = _resp_text(resp)
+            return _extract_first_json(raw) or None
         except Exception as e:
-            log.error(f"Failed to verify info for {company_name} ({address}): {e}", exc_info=True)
-            return None
+            log.warning(f"Failed to verify info for {company_name} ({address}) with image: {e}", exc_info=True)
+            try:
+                resp = await self.model.generate_content_async(_build_content(False))  # type: ignore
+            except Exception:
+                return None
+            raw = _resp_text(resp)
+            return _extract_first_json(raw) or None
 
     async def judge_official_homepage(
         self,
@@ -374,16 +365,20 @@ class AIVerifier:
             "- URLが企業ドメインや自治体/学校の公式ドメインなら true に寄せる。\n"
             f"企業名: {company_name}\n住所: {address}\n候補URL: {url}\n本文抜粋:\n{snippet}\n"
         )
-        content: list[Any] = []
-        if self.system_prompt:
-            content.append(self.system_prompt)
-        content.append(prompt)
-        if screenshot:
-            try:
-                b64 = base64.b64encode(screenshot).decode("utf-8")
-                content.append({"inline_data": {"mime_type": "image/png", "data": b64}})
-            except Exception:
-                pass
+        def _build_content(use_image: bool) -> list[Any]:
+            payload: list[Any] = []
+            if self.system_prompt:
+                payload.append(self.system_prompt)
+            payload.append(prompt)
+            if use_image and screenshot:
+                try:
+                    b64 = base64.b64encode(screenshot).decode("utf-8")
+                    payload.append({"inline_data": {"mime_type": "image/png", "data": b64}})
+                except Exception:
+                    pass
+            return payload
+
+        content: list[Any] = _build_content(True)
         try:
             try:
                 resp = await self.model.generate_content_async(content, safety_settings=None)
@@ -417,5 +412,35 @@ class AIVerifier:
                 "reason": reason,
             }
         except Exception as exc:  # pylint: disable=broad-except
-            log.warning(f"judge_official_homepage failed for {company_name} ({url}): {exc}")
-            return None
+            log.warning(f"judge_official_homepage failed for {company_name} ({url}) with image: {exc}")
+            try:
+                resp = await self.model.generate_content_async(_build_content(False), safety_settings=None)  # type: ignore
+            except Exception:
+                return None
+            raw = _resp_text(resp)
+            result = _extract_first_json(raw)
+            if not isinstance(result, dict):
+                return None
+            verdict = result.get("is_official")
+            if isinstance(verdict, str):
+                verdict = verdict.strip().lower()
+                verdict = verdict in {"true", "yes", "official", "1"}
+            elif isinstance(verdict, (int, float)):
+                verdict = bool(verdict)
+            elif not isinstance(verdict, bool):
+                return None
+            confidence_val = result.get("confidence")
+            try:
+                confidence = float(confidence_val) if confidence_val is not None else None
+            except Exception:
+                confidence = None
+            reason = result.get("reason")
+            if isinstance(reason, str):
+                reason = reason.strip()
+            else:
+                reason = ""
+            return {
+                "is_official": bool(verdict),
+                "confidence": confidence,
+                "reason": reason,
+            }
