@@ -316,12 +316,25 @@ class AIVerifier:
             else:
                 description = None
 
+            homepage_url = result.get("homepage_url")
+            if isinstance(homepage_url, str):
+                homepage_url = homepage_url.strip() or None
+            else:
+                homepage_url = None
+            if not homepage_url:
+                company_key = ((company_name or "").strip(), (address or "").strip())
+                ref = self.listoss_data.get(company_key)
+                if ref:
+                    homepage_url = (ref.get("hp") or "").strip() or None
+
             out: Dict[str, Any] = {
                 "phone_number": phone,
                 "address": addr,
                 "rep_name": rep_name,
                 "description": description,
             }
+            if homepage_url:
+                out["homepage_url"] = homepage_url
             return out
 
         except GoogleAPIError as e:

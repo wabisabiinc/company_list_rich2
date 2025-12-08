@@ -121,6 +121,12 @@ PHONE_RE = re.compile(
 def _normalize_phone_strict(raw: str) -> Optional[str]:
     if not raw:
         return None
+    hyphen_match = re.search(
+        r"(0\d{1,4})\D+?(\d{1,4})\D+?(\d{3,4})",
+        raw,
+    )
+    if hyphen_match:
+        return f"{hyphen_match.group(1)}-{hyphen_match.group(2)}-{hyphen_match.group(3)}"
     digits = re.sub(r"\D", "", raw)
     if digits.startswith("81") and len(digits) >= 10:
         digits = "0" + digits[2:]
@@ -2034,6 +2040,16 @@ class CompanyScraper:
                 "/company", "/about", "/profile", "/corporate", "/overview", "/gaiyo", "/gaiyou"
             ),
         },
+        "overview": {
+            "anchor": (
+                "公式サイト", "公式", "企業理念", "事業内容", "事業目的", "企業概要", "会社紹介",
+                "business", "services", "solutions", "official"
+            ),
+            "path": (
+                "/official", "/official-site", "/company-profile", "/company-overview", "/business",
+                "/services", "/about-us", "/corporate-profile", "/gaiyou", "/company"
+            ),
+        },
     }
 
     def _rank_links(self, base: str, html: str, *, focus: Optional[set[str]] = None) -> List[str]:
@@ -2320,6 +2336,16 @@ class CompanyScraper:
                 focus_targets.add("finance")
             if need_description:
                 focus_targets.add("profile")
+            if (
+                need_description
+                or need_listing
+                or need_capital
+                or need_revenue
+                or need_profit
+                or need_fiscal
+                or need_founded
+            ):
+                focus_targets.add("overview")
             ranked_links = self._rank_links(url, html, focus=focus_targets)
             for child in ranked_links:
                 if child in visited:
@@ -2345,7 +2371,7 @@ class CompanyScraper:
         reps: List[str] = []
 
         for p in PHONE_RE.finditer(text or ""):
-            cand = _normalize_phone_strict(f"{p.group(1)}-{p.group(2)}-{p.group(3)}")
+            cand = _normalize_phone_strict(p.group(0))
             if cand:
                 phones.append(cand)
 

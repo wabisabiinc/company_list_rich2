@@ -5,7 +5,7 @@ import sqlite3
 import time
 import urllib.parse
 import re
-from typing import Optional, Dict, Any
+from typing import Iterable, Optional, Dict, Any
 
 
 class DatabaseManager:
@@ -45,9 +45,11 @@ class DatabaseManager:
         self._writes_since_checkpoint = 0
         retry_statuses_env = os.getenv("RETRY_STATUSES", "review,no_homepage")
         self.retry_statuses: list[str] = [s.strip() for s in retry_statuses_env.split(",") if s.strip()]
+        self._schema_columns: set[str] = set()
 
         # ★ 初期化はロック競合が起きやすいので安全にリトライ
         self._ensure_schema_with_retry()
+        self._refresh_schema_columns()
 
         # CSV の重複書き出し防止用キャッシュ
         self._init_csv_state()
@@ -90,6 +92,12 @@ class DatabaseManager:
         self.conn.execute("PRAGMA journal_mode=WAL;")
         self.conn.execute("PRAGMA synchronous=NORMAL;")
         self.conn.execute("PRAGMA busy_timeout=60000;")  # 60秒
+
+    def _get_table_columns(self) -> set[str]:
+        return {r[1] for r in self.conn.execute("PRAGMA table_info(companies)")}
+
+    def _refresh_schema_columns(self) -> None:
+        self._schema_columns = self._get_table_columns()
 
     # ---------- 初期化（ロックに強いリトライ付） ----------
     def _ensure_schema_with_retry(self, max_retry_sec: int = 20) -> None:
@@ -138,75 +146,109 @@ class DatabaseManager:
             """
         )
 
-        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(companies)")}
+        cols = self._get_table_columns()
         if "status" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN status TEXT DEFAULT 'pending';")
+            cols.add("status")
         if "locked_by" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN locked_by TEXT;")
+            cols.add("locked_by")
         if "locked_at" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN locked_at TEXT;")
+            cols.add("locked_at")
         if "rep_name" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN rep_name TEXT;")
+            cols.add("rep_name")
         if "description" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN description TEXT;")
+            cols.add("description")
         if "listing" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN listing TEXT;")
+            cols.add("listing")
         if "revenue" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN revenue TEXT;")
+            cols.add("revenue")
         if "profit" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN profit TEXT;")
+            cols.add("profit")
         if "capital" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN capital TEXT;")
+            cols.add("capital")
         if "fiscal_month" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN fiscal_month TEXT;")
+            cols.add("fiscal_month")
         if "founded_year" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN founded_year TEXT;")
+            cols.add("founded_year")
         if "ai_used" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN ai_used INTEGER DEFAULT 0;")
+            cols.add("ai_used")
         if "ai_model" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN ai_model TEXT;")
+            cols.add("ai_model")
         if "phone_source" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN phone_source TEXT;")
+            cols.add("phone_source")
         if "address_source" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN address_source TEXT;")
+            cols.add("address_source")
         if "extract_confidence" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN extract_confidence REAL;")
+            cols.add("extract_confidence")
         if "last_checked_at" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN last_checked_at TEXT;")
+            cols.add("last_checked_at")
         if "error_code" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN error_code TEXT;")
+            cols.add("error_code")
         if "hubspot_id" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN hubspot_id TEXT;")
+            cols.add("hubspot_id")
         if "corporate_number" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN corporate_number TEXT;")
+            cols.add("corporate_number")
         if "corporate_number_norm" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN corporate_number_norm TEXT;")
+            cols.add("corporate_number_norm")
         if "source_csv" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN source_csv TEXT;")
+            cols.add("source_csv")
         if "reference_homepage" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN reference_homepage TEXT;")
+            cols.add("reference_homepage")
         if "reference_phone" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN reference_phone TEXT;")
+            cols.add("reference_phone")
         if "reference_address" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN reference_address TEXT;")
+            cols.add("reference_address")
         if "accuracy_homepage" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN accuracy_homepage TEXT;")
+            cols.add("accuracy_homepage")
         if "accuracy_phone" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN accuracy_phone TEXT;")
+            cols.add("accuracy_phone")
         if "accuracy_address" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN accuracy_address TEXT;")
+            cols.add("accuracy_address")
         if "homepage_official_flag" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN homepage_official_flag INTEGER;")
+            cols.add("homepage_official_flag")
         if "homepage_official_source" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN homepage_official_source TEXT;")
+            cols.add("homepage_official_source")
         if "homepage_official_score" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN homepage_official_score REAL;")
+            cols.add("homepage_official_score")
         if "source_url_phone" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN source_url_phone TEXT;")
+            cols.add("source_url_phone")
         if "source_url_address" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN source_url_address TEXT;")
+            cols.add("source_url_address")
         if "source_url_rep" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN source_url_rep TEXT;")
+            cols.add("source_url_rep")
 
         self.conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_companies_name_addr ON companies(company_name, address);"
@@ -235,6 +277,8 @@ class DatabaseManager:
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_url_flags_scope_host ON url_flags(scope, host)"
         )
+
+        self._schema_columns = cols
 
         self._commit_with_checkpoint()
 
@@ -292,6 +336,34 @@ class DatabaseManager:
         normalized_path = path if path == "/" else path.rstrip("/")
         normalized_url = urllib.parse.urlunparse((scheme, host, normalized_path or "/", "", "", ""))
         return normalized_url, host
+
+    def _query_url_flags(self, scope: str, values: list[str]) -> Dict[str, Dict[str, Any]]:
+        if not values:
+            return {}
+        placeholders = ",".join("?" for _ in values)
+        rows = self.conn.execute(
+            f"SELECT normalized_value, scope, is_official, judge_source, reason, confidence, host "
+            f"FROM url_flags WHERE scope=? AND normalized_value IN ({placeholders})",
+            (scope, *values),
+        ).fetchall()
+        return {row["normalized_value"]: dict(row) for row in rows}
+
+    def get_url_flags_batch(self, urls: Iterable[str]) -> tuple[Dict[str, Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+        normalized_urls: list[str] = []
+        hosts: list[str] = []
+        seen_urls: set[str] = set()
+        seen_hosts: set[str] = set()
+        for url in urls:
+            normalized, host = self._normalize_flag_target(url)
+            if normalized and normalized not in seen_urls:
+                seen_urls.add(normalized)
+                normalized_urls.append(normalized)
+            if host and host not in seen_hosts:
+                seen_hosts.add(host)
+                hosts.append(host)
+        url_flags = self._query_url_flags("url", normalized_urls)
+        host_flags = self._query_url_flags("host", hosts)
+        return url_flags, host_flags
 
     def get_url_flag(self, url: str) -> Optional[Dict[str, Any]]:
         normalized_url, host = self._normalize_flag_target(url)
@@ -440,12 +512,18 @@ class DatabaseManager:
 
     # ---------- 書き込み ----------
     def save_company_data(self, company: Dict[str, Any], status: str = "done") -> None:
-        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(companies)")}
+        cols = self._schema_columns
         updates: list[str] = []
         params: list[Any] = []
 
         def _clean_phone(raw: Any) -> str:
             s = (raw or "").strip()
+            hyphen_match = re.search(
+                r"(0\d{1,4})\D+?(\d{1,4})\D+?(\d{3,4})",
+                s,
+            )
+            if hyphen_match:
+                return f"{hyphen_match.group(1)}-{hyphen_match.group(2)}-{hyphen_match.group(3)}"
             digits = re.sub(r"\D", "", s)
             if digits.startswith("81") and len(digits) >= 11:
                 digits = "0" + digits[2:]

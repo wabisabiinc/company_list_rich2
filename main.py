@@ -725,6 +725,7 @@ async def process():
                 candidate_limit = SEARCH_CANDIDATE_LIMIT
                 company_tokens = scraper._company_tokens(name)  # type: ignore
                 urls = await scraper.search_company(name, addr, num_results=candidate_limit)
+                url_flags_map, host_flags_map = manager.get_url_flags_batch(urls)
                 homepage = ""
                 info = None
                 primary_cands: dict[str, list[str]] = {}
@@ -744,10 +745,10 @@ async def process():
                 async def prepare_candidate(idx: int, candidate: str):
                     normalized_candidate = scraper.normalize_homepage_url(candidate)
                     url_for_flag = normalized_candidate or candidate
-                    try:
-                        flag_info = manager.get_url_flag(url_for_flag)
-                    except Exception:
-                        flag_info = None
+                    normalized_flag_url, host_for_flag = manager._normalize_flag_target(candidate)
+                    flag_info = url_flags_map.get(normalized_flag_url)
+                    if not flag_info and host_for_flag:
+                        flag_info = host_flags_map.get(host_for_flag)
                     domain_score_for_flag = scraper._domain_score(company_tokens, url_for_flag)  # type: ignore
                     if flag_info and flag_info.get("is_official") is False:
                         log.info("[%s] 既知の非公式URLを除外: %s (domain_score=%s)", cid, candidate, domain_score_for_flag)
