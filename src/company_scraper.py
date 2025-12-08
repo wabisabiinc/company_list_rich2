@@ -968,7 +968,7 @@ class CompanyScraper:
             token_len = len(token)
             exact = token in host_no_port or token in host_compact
             if exact:
-                score += 5
+                score += 6
             if any(token in dt for dt in domain_tokens):
                 score += 4
             if token in path_lower:
@@ -990,7 +990,7 @@ class CompanyScraper:
         # パスが会社情報系なら底上げ
         for marker in ("/company", "/about", "/profile", "/overview", "/corporate"):
             if marker in path_lower:
-                score += 2
+                score += 3
                 break
         # 採用/ブログ等なら減点
         for marker in ("/recruit", "/careers", "/job", "/jobs", "/blog", "/news", "/ir/"):
