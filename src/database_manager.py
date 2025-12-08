@@ -329,10 +329,17 @@ class DatabaseManager:
         except Exception:
             return "", ""
         host = (parsed.netloc or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+        if ":" in host:
+            host = host.split(":")[0]
         if not host:
             return "", ""
         scheme = parsed.scheme or "https"
         path = parsed.path or "/"
+        # index.* -> /
+        if path.lower().endswith(("/index.html", "/index.htm", "/index.php", "/index.asp")):
+            path = "/"
         normalized_path = path if path == "/" else path.rstrip("/")
         normalized_url = urllib.parse.urlunparse((scheme, host, normalized_path or "/", "", "", ""))
         return normalized_url, host

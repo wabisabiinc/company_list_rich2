@@ -929,55 +929,76 @@ class CompanyScraper:
             return False
         host_compact = host.replace("-", "").replace(".", "")
         domain_tokens = self._domain_tokens(url)
+        generic_tokens = {"system", "systems", "tech", "technology", "consulting", "solution", "solutions", "soft", "software", "works", "service", "services", "info", "web"}
         for token in company_tokens:
             if not token:
                 continue
             if token in host or token in host_compact:
+                if len(token) <= 2 or token in generic_tokens:
+                    continue
                 return True
             if any(token in dt for dt in domain_tokens):
+                if len(token) <= 2 or token in generic_tokens:
+                    continue
                 return True
         return False
 
     def _domain_score(self, company_tokens: List[str], url: str) -> int:
-        host = urlparse(url).netloc.lower()
-        host_compact = host.replace("-", "").replace(".", "")
+        parsed = urlparse(url)
+        host = (parsed.netloc or "").lower()
+        host_no_port = host.split(":")[0]
+        host_compact = host_no_port.replace("-", "").replace(".", "")
+        path_lower = (parsed.path or "").lower()
         score = 0
-        try:
-            path_lower = urlparse(url).path.lower()
-        except Exception:
-            path_lower = ""
-        if re.search(r"\.(co|or|go|ac)\.jp$", host):
+
+        # 法人TLD加点
+        if re.search(r"\.(co|or|go|ac)\.jp$", host_no_port):
             score += 3
-        elif host.endswith(".jp"):
+        elif host_no_port.endswith(".jp"):
             score += 2
-        elif host.endswith(".com") or host.endswith(".net"):
+        elif host_no_port.endswith(".com") or host_no_port.endswith(".net"):
             score += 1
 
         domain_tokens = self._domain_tokens(url)
+        generic_tokens = {"system", "systems", "tech", "technology", "consulting", "solution", "solutions", "soft", "software", "works", "service", "services", "info", "web"}
+
         for token in company_tokens:
             if not token:
                 continue
             token_len = len(token)
+            exact = token in host_no_port or token in host_compact
+            if exact:
+                score += 5
             if any(token in dt for dt in domain_tokens):
                 score += 4
-            if token in host:
-                score += 4
-            if token in host_compact:
-                score += 3  # ハイフン除去一致は少し弱め
             if token in path_lower:
                 score += 3
-            else:
-                # 類似度加点はトークン長が4文字以上に限定し、重みを下げる
-                if token_len >= 4:
-                    for dt in domain_tokens:
-                        try:
-                            ratio = SequenceMatcher(None, token, dt).ratio()
-                        except Exception:
-                            ratio = 0
-                        if ratio >= 0.8:
-                            score += 2
-                            break
-        lowered = host + urlparse(url).path.lower()
+            if token_len >= 4:
+                for dt in domain_tokens:
+                    try:
+                        ratio = SequenceMatcher(None, token, dt).ratio()
+                    except Exception:
+                        ratio = 0
+                    if ratio >= 0.8:
+                        score += 2
+                        break
+
+        # 一般語ホストは減点
+        if any(dt in generic_tokens for dt in domain_tokens):
+            score -= 2
+
+        # パスが会社情報系なら底上げ
+        for marker in ("/company", "/about", "/profile", "/overview", "/corporate"):
+            if marker in path_lower:
+                score += 2
+                break
+        # 採用/ブログ等なら減点
+        for marker in ("/recruit", "/careers", "/job", "/jobs", "/blog", "/news", "/ir/"):
+            if marker in path_lower:
+                score -= 2
+                break
+
+        lowered = host_no_port + path_lower
         if any(kw in lowered for kw in self.NON_OFFICIAL_KEYWORDS):
             score -= 3
         return score
@@ -991,6 +1012,16 @@ class CompanyScraper:
         for idx, marker in enumerate(self.PRIORITY_PATHS):
             if marker.lower() in path:
                 score += max(6 - idx, 1)
+        # 公式に寄せるパスの底上げ
+        for marker in ("/company", "/about", "/profile", "/overview", "/corporate"):
+            if marker in path:
+                score += 3
+                break
+        # 非公式に寄せるパスの軽い減点
+        for marker in ("/recruit", "/careers", "/job", "/jobs", "/blog", "/news", "/store", "/shop"):
+            if marker in path:
+                score -= 2
+                break
         return score
 
     def _is_excluded(self, url: str) -> bool:
@@ -1483,9 +1514,12 @@ class CompanyScraper:
             return url
         if not parsed.scheme or not parsed.netloc:
             return url
-
-        base_root = f"{parsed.scheme}://{parsed.netloc}/"
-        normalized = parsed._replace(query="", fragment="")
+        original_host = parsed.netloc.split(":")[0]
+        host_compare = original_host.lower()
+        if host_compare.startswith("www."):
+            host_compare = host_compare[4:]
+        base_root = f"{parsed.scheme}://{original_host}/"
+        normalized = parsed._replace(netloc=original_host, query="", fragment="")
 
         html = ""
         if isinstance(page_info, dict):
@@ -1506,17 +1540,24 @@ class CompanyScraper:
                     try:
                         resolved = urllib.parse.urljoin(url, href)
                         resolved_parsed = urllib.parse.urlparse(resolved)
-                        if resolved_parsed.netloc and resolved_parsed.netloc == parsed.netloc:
+                        resolved_host = resolved_parsed.netloc.split(":")[0]
+                        resolved_host_cmp = resolved_host.lower()
+                        if resolved_host_cmp.startswith("www."):
+                            resolved_host_cmp = resolved_host_cmp[4:]
+                        if resolved_parsed.netloc and resolved_host_cmp == host_compare:
                             normalized_path = normalized.path or "/"
                             resolved_path = resolved_parsed.path or "/"
                             if not (normalized_path != "/" and resolved_path == "/"):
-                                normalized = resolved_parsed._replace(query="", fragment="")
+                                normalized = resolved_parsed._replace(netloc=original_host, query="", fragment="")
                     except Exception:
                         pass
 
         # index.* → root
         if normalized.path.lower().endswith(("/index.html", "/index.htm", "/index.php", "/index.asp")):
             normalized = normalized._replace(path="/")
+
+        # 明示的にクエリ/フラグメントを除去
+        normalized = normalized._replace(query="", fragment="")
 
         segments = [seg.lower() for seg in normalized.path.strip("/").split("/") if seg]
         suspect_segments = {

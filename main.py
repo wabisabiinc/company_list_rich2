@@ -981,7 +981,7 @@ async def process():
                                 name_hit
                                 or strong_domain_host
                                 or rule_details.get("strong_domain")
-                                or domain_score >= 5
+                                or domain_score >= 3
                             )
                             if not (name_or_domain_ok or address_ok):
                                 manager.upsert_url_flag(
