@@ -871,12 +871,14 @@ class CompanyScraper:
             return None
         if "@" in text or re.search(r"https?://", text):
             return None
-        if not re.fullmatch(r"[A-Za-z\u00C0-\u024F\u3040-\u30FF\u3400-\u9FFF\s'’・･\-ー]+", text):
+        # 氏名らしさチェック（漢字2-5文字の塊を優先）
+        name_like = re.findall(r"[一-龥]{2,5}", text)
+        if not name_like:
             return None
         tokens = [tok for tok in re.split(r"\s+", text) if tok]
-        if len(tokens) > 6:
+        if len(tokens) > 4:
             return None
-        if any(len(tok) > 15 for tok in tokens if re.search(r"[一-龥]", tok)):
+        if any(len(tok) > 8 for tok in tokens if re.search(r"[一-龥]", tok)):
             return None
         policy_words = (
             "方針",
@@ -2267,6 +2269,21 @@ class CompanyScraper:
             or need_revenue or need_profit or need_fiscal or need_founded or need_description
         ):
             return results
+        # 欠損が少ない場合は探索幅を縮小する
+        missing_contact = int(need_phone) + int(need_addr) + int(need_rep)
+        missing_extra = int(need_listing) + int(need_capital) + int(need_revenue) + int(need_profit) + int(need_fiscal) + int(need_founded) + int(need_description)
+        if missing_contact == 0 and missing_extra == 0:
+            return results
+        # 必要最低限のページ/ホップに調整
+        if missing_contact == 0 and missing_extra <= 2:
+            max_pages = min(max_pages, 1)
+            max_hops = min(max_hops, 1)
+        elif missing_contact == 0 and missing_extra <= 4:
+            max_pages = min(max_pages, 2)
+            max_hops = min(max_hops, 1)
+        else:
+            max_pages = max_pages
+            max_hops = max_hops
 
         visited: set[str] = {homepage}
         concurrency = max(1, min(4, max_pages))
@@ -2330,21 +2347,13 @@ class CompanyScraper:
             if not html:
                 continue
             focus_targets: set[str] = set()
-            if need_phone or need_addr or need_rep or need_description:
+            if need_phone or need_addr or need_rep:
                 focus_targets.add("contact")
             if need_listing or need_capital or need_revenue or need_profit or need_fiscal or need_founded:
                 focus_targets.add("finance")
             if need_description:
-                focus_targets.add("profile")
-            if (
-                need_description
-                or need_listing
-                or need_capital
-                or need_revenue
-                or need_profit
-                or need_fiscal
-                or need_founded
-            ):
+                focus_targets.update({"profile", "overview"})
+            elif (need_listing or need_capital or need_revenue or need_profit or need_fiscal or need_founded):
                 focus_targets.add("overview")
             ranked_links = self._rank_links(url, html, focus=focus_targets)
             for child in ranked_links:

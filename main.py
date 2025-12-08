@@ -105,6 +105,24 @@ GENERIC_DESCRIPTION_TERMS = {
     "会社概要", "企業情報", "事業概要", "法人概要", "団体概要",
     "トップメッセージ", "ご挨拶", "メッセージ", "沿革", "理念",
 }
+DESCRIPTION_MIN_LEN = max(6, int(os.getenv("DESCRIPTION_MIN_LEN", "10")))
+DESCRIPTION_MAX_LEN = max(DESCRIPTION_MIN_LEN, int(os.getenv("DESCRIPTION_MAX_LEN", "200")))
+DESCRIPTION_BIZ_KEYWORDS = (
+    "事業", "製造", "開発", "販売", "提供", "サービス", "運営", "支援", "施工", "設計", "製作",
+    "物流", "建設", "工事", "コンサル", "consulting", "solution", "ソリューション",
+    "product", "製品", "プロダクト", "システム", "プラント", "加工", "レンタル", "運送",
+    "IT", "デジタル", "ITソリューション", "プロジェクト", "アウトソーシング", "研究", "技術",
+    "人材", "教育", "ヘルスケア", "医療", "食品", "エネルギー", "不動産", "金融", "EC", "通販",
+)
+DESCRIPTION_MIN_LEN = max(6, int(os.getenv("DESCRIPTION_MIN_LEN", "10")))
+DESCRIPTION_MAX_LEN = max(DESCRIPTION_MIN_LEN, int(os.getenv("DESCRIPTION_MAX_LEN", "200")))
+DESCRIPTION_BIZ_KEYWORDS = (
+    "事業", "製造", "開発", "販売", "提供", "サービス", "運営", "支援", "施工", "設計", "製作",
+    "物流", "建設", "工事", "コンサル", "consulting", "solution", "ソリューション",
+    "product", "製品", "プロダクト", "システム", "プラント", "加工", "レンタル", "運送",
+    "IT", "デジタル", "ITソリューション", "プロジェクト", "アウトソーシング", "研究", "技術",
+    "人材", "教育", "ヘルスケア", "医療", "食品", "エネルギー", "不動産", "金融", "EC", "通販",
+)
 
 # --------------------------------------------------
 # 正規化 & 一致判定
@@ -300,6 +318,16 @@ def clean_amount_value(val: str) -> str:
         text = text[:40]
     return text
 
+
+def _truncate_description(text: str) -> str:
+    if len(text) <= DESCRIPTION_MAX_LEN:
+        return text
+    truncated = text[:DESCRIPTION_MAX_LEN]
+    truncated = re.sub(r"[、。．,;]+$", "", truncated)
+    trimmed = re.sub(r"\s+\S*$", "", truncated).strip()
+    return trimmed if len(trimmed) >= DESCRIPTION_MIN_LEN else truncated.rstrip()
+
+
 def clean_description_value(val: str) -> str:
     text = html_mod.unescape((val or "").strip())
     text = re.sub(r"<[^>]+>", " ", text)
@@ -327,19 +355,14 @@ def clean_description_value(val: str) -> str:
         return ""
     if stripped in GENERIC_DESCRIPTION_TERMS:
         return ""
-    if len(stripped) < 6:
+    if len(stripped) < DESCRIPTION_MIN_LEN:
         return ""
     if re.fullmatch(r"(会社概要|事業概要|法人概要|沿革|会社案内|企業情報)", stripped):
         return ""
     # 事業内容を示すキーワードが全く無い場合だけ除外
-    biz_keywords = (
-        "事業", "製造", "開発", "販売", "提供", "サービス", "運営", "支援", "施工", "設計", "製作",
-        "物流", "建設", "工事", "コンサル", "consulting", "solution", "ソリューション",
-        "product", "製品", "プロダクト", "システム", "プラント", "加工", "レンタル", "運送",
-    )
-    if not any(k in stripped for k in biz_keywords):
+    if not any(k in stripped for k in DESCRIPTION_BIZ_KEYWORDS):
         return ""
-    return stripped[:80]
+    return _truncate_description(stripped)
 
 def clean_fiscal_month(val: str) -> str:
     text = (val or "").strip().replace("　", " ")
