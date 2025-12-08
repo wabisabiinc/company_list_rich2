@@ -29,7 +29,9 @@ SAMPLE_HTML = """
 """
 @pytest.fixture
 def scraper():
-    return CompanyScraper(headless=True)
+    sc = CompanyScraper(headless=True)
+    sc.http_session = None  # テストでは requests.get のモックを使う
+    return sc
 
 @pytest.mark.asyncio
 @patch("src.company_scraper.requests.get")
@@ -40,10 +42,14 @@ async def test_search_company_filters_and_resolves(mock_get, scraper):
     mock_get.return_value = mock_response
 
     urls = await scraper.search_company("トヨタ自動車株式会社", "愛知県豊田市", num_results=10)
-    queries = [call.kwargs["params"]["q"] for call in mock_get.call_args_list]
-    assert queries[0] == "トヨタ自動車株式会社 公式"
-    allowed_queries = {"トヨタ自動車株式会社 公式", "トヨタ自動車株式会社 会社概要"}
-    assert all(q in allowed_queries for q in queries)
+    queries = {call.kwargs["params"]["q"] for call in mock_get.call_args_list}
+    allowed_queries = {
+        "トヨタ自動車株式会社 会社概要 公式",
+        "トヨタ自動車株式会社 企業情報 公式",
+        "トヨタ自動車株式会社 会社情報 公式",
+    }
+    assert queries.issubset(allowed_queries)
+    assert allowed_queries & queries
 
     # /l/?uddg= が正しく剥がれている（相対/絶対）
     assert "https://example.com/home" in urls

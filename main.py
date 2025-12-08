@@ -154,17 +154,23 @@ def normalize_address(s: str | None) -> str | None:
     # 漢数字を簡易的に算用数字へ
     def convert_kanji_numbers(text: str) -> str:
         digit_map = {"〇": 0, "零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+        unit_map = {"十": 10, "百": 100, "千": 1000}
+
         def repl(match: re.Match) -> str:
             chars = match.group(0)
             total = 0
             current = 0
             for ch in chars:
-                if ch == "十":
-                    current = max(current, 1) * 10
+                if ch in unit_map:
+                    base = current if current > 0 else 1
+                    total += base * unit_map[ch]
+                    current = 0
                 else:
                     current = current * 10 + digit_map.get(ch, 0)
-            return str(total + current)
-        return re.sub(r"[〇零一二三四五六七八九十]+", repl, text)
+            total += current
+            return str(total)
+
+        return re.sub(r"[〇零一二三四五六七八九十百千]+", repl, text)
     s = convert_kanji_numbers(s)
     s = re.sub(r"[‐―－ー]+", "-", s)
     s = re.sub(r"\s+", " ", s)
@@ -1436,8 +1442,8 @@ async def process():
                     fully_filled = homepage and missing_contact == 0 and missing_extra == 0
 
                     try:
-                        # 深掘りは不足があれば最大3件、欠損ゼロでも1件だけ拾う
-                        priority_limit = 1 if (not timed_out and fully_filled) else 0
+                        # 深掘りは不足がある場合のみ。揃っていれば追加巡回しない。
+                        priority_limit = 0
                         if not timed_out and not fully_filled:
                             priority_limit = 3 if missing_contact else 2
                         site_docs = (

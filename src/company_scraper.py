@@ -37,13 +37,13 @@ PRIORITY_PATHS = [
     "/窓口案内", "/お問い合わせ", "/アクセス", "/沿革", "/組織図", "/決算", "/ディスクロージャー",
 ]
 PRIO_WORDS = [
-    "会社概要", "企業情報", "企業概要", "法人案内", "法人概要", "会社案内",
+    "会社概要", "企業情報", "企業概要", "会社情報", "法人案内", "法人概要", "会社案内",
     "団体概要", "施設案内", "法人情報", "事業案内", "事業紹介", "組織図",
     "代表者", "代表挨拶", "沿革", "お問い合わせ", "アクセス", "連絡先", "窓口"
 ]
 ANCHOR_PRIORITY_WORDS = [
     "会社概要", "企業情報", "法人案内", "法人概要", "会社案内", "団体概要",
-    "施設案内", "施設情報", "法人情報", "事業案内", "事業紹介", "会社紹介",
+    "施設案内", "施設情報", "法人情報", "事業案内", "事業紹介", "会社紹介", "会社情報",
     "法人紹介", "組織図", "組織紹介", "沿革", "代表者", "代表挨拶",
     "理事長", "院長", "園長", "校長", "about", "corporate", "profile",
     "overview", "information", "ご案内"
@@ -455,10 +455,32 @@ class CompanyScraper:
         self.slow_page_threshold_ms = int(os.getenv("SLOW_PAGE_THRESHOLD_MS", "7000"))
         self.skip_slow_hosts = os.getenv("SKIP_SLOW_HOSTS", "true").lower() == "true"
         self.slow_hosts: set[str] = set()
+        self.slow_hosts_path = os.getenv("SLOW_HOSTS_PATH", "logs/slow_hosts.txt")
         self.page_cache: Dict[str, Dict[str, Any]] = {}
         self.use_http_first = os.getenv("USE_HTTP_FIRST", "true").lower() == "true"
         self.http_timeout_ms = int(os.getenv("HTTP_TIMEOUT_MS", "5000"))
         self.search_cache: Dict[tuple[str, str], List[str]] = {}
+        # 共有 HTTP セッションでコネクションを再利用し、検索/HTTP取得のレイテンシを抑える
+        self.http_session: Optional[requests.Session] = requests.Session()
+        # 検索エンジンは DuckDuckGo に固定（Bing は使わない）
+        self.search_engines: list[str] = ["ddg"]
+        # ブラウザ操作専用セマフォ（HTTPとは別枠で制御し渋滞を防ぐ）
+        self.browser_concurrency = max(1, int(os.getenv("BROWSER_CONCURRENCY", "1")))
+        self._browser_sem: asyncio.Semaphore | None = None
+        self._load_slow_hosts()
+
+    def _get_browser_sem(self) -> asyncio.Semaphore:
+        if self._browser_sem is None:
+            self._browser_sem = asyncio.Semaphore(self.browser_concurrency)
+        return self._browser_sem
+
+    def _session_get(self, url: str, **kwargs: Any):
+        """
+        requests.Session を優先的に使いつつ、None 設定時は requests.get にフォールバック。
+        """
+        if self.http_session:
+            return self.http_session.get(url, **kwargs)
+        return requests.get(url, **kwargs)
 
     # ===== 公式判定ヘルパ =====
     @classmethod
@@ -903,14 +925,15 @@ class CompanyScraper:
 
     def _build_company_queries(self, company_name: str, address: Optional[str]) -> List[str]:
         """
-        指定された会社名に「公式」「会社概要」を付けた2本だけ生成する。
+        会社名に公式+情報系キーワードを付けたクエリを生成する。
         """
         base_name = (company_name or "").strip()
         if not base_name:
             return []
         queries = [
-            f"{base_name} 公式",
-            f"{base_name} 会社概要",
+            f"{base_name} 会社概要 公式",
+            f"{base_name} 企業情報 公式",
+            f"{base_name} 会社情報 公式",
         ]
         return [re.sub(r"\s+", " ", q).strip() for q in queries if q.strip()]
 
@@ -1065,7 +1088,7 @@ class CompanyScraper:
         try:
             proxy_url = "https://r.jina.ai/https://duckduckgo.com/html/"
             resp = await asyncio.to_thread(
-                requests.get,
+                self._session_get,
                 proxy_url,
                 params={"q": query, "kl": "jp-jp"},
                 headers={"User-Agent": "Mozilla/5.0"},
@@ -1134,7 +1157,7 @@ class CompanyScraper:
         for attempt in range(3):
             try:
                 resp = await asyncio.to_thread(
-                    requests.get,
+                    self._session_get,
                     "https://html.duckduckgo.com/html",
                     params={"q": query, "kl": "jp-jp"},
                     headers=headers,
@@ -1168,7 +1191,7 @@ class CompanyScraper:
         for attempt in range(3):
             try:
                 resp = await asyncio.to_thread(
-                    requests.get,
+                    self._session_get,
                     "https://www.bing.com/search",
                     params=params,
                     headers=headers,
@@ -1621,9 +1644,39 @@ class CompanyScraper:
             finally:
                 if self._pw:
                     await self._pw.stop()
+        if self.http_session:
+            try:
+                self.http_session.close()
+            except Exception:
+                pass
         self._pw = None
         self.browser = None
         self.context = None
+        self.http_session = None
+
+    def _load_slow_hosts(self) -> None:
+        try:
+            path = self.slow_hosts_path
+            if not path or not os.path.exists(path):
+                return
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    host = line.strip().split(",")[0]
+                    if host:
+                        self.slow_hosts.add(host)
+        except Exception:
+            log.warning("failed to load slow hosts", exc_info=True)
+
+    def _add_slow_host(self, host: str) -> None:
+        if not host or host in self.slow_hosts:
+            return
+        self.slow_hosts.add(host)
+        try:
+            os.makedirs(os.path.dirname(self.slow_hosts_path) or ".", exist_ok=True)
+            with open(self.slow_hosts_path, "a", encoding="utf-8") as f:
+                f.write(f"{host},{int(time.time())}\n")
+        except Exception:
+            log.debug("failed to persist slow host: %s", host, exc_info=True)
 
     async def _handle_route(self, route: Route):
         rtype = route.request.resource_type
@@ -1836,35 +1889,33 @@ class CompanyScraper:
         seen: set[str] = set()
         max_candidates = max(1, min(3, num_results or 3))
 
+        async def run_engine(engine: str, q_idx: int, query: str) -> tuple[str, int, str]:
+            # 現状 ddg 固定だが、引数はスコアリングのために残す
+            return engine, q_idx, await self._fetch_duckduckgo(query)
+
+        tasks: list[asyncio.Task] = []
+        engines = self.search_engines or ["ddg"]
         for q_idx, query in enumerate(queries):
-            html = await self._fetch_duckduckgo(query)
+            for eng in engines:
+                tasks.append(asyncio.create_task(run_engine(eng, q_idx, query)))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True) if tasks else []
+        for result in results:
+            if isinstance(result, Exception):
+                continue
+            engine, q_idx, html = result
             if not html:
                 continue
-            for rank, url in enumerate(self._extract_search_urls(html)):
+            extractor = self._extract_search_urls
+            for rank, url in enumerate(extractor(html)):
                 if url in seen:
                     continue
                 seen.add(url)
-                candidates.append({"url": url, "query_idx": q_idx, "rank": rank})
+                candidates.append({"url": url, "query_idx": q_idx, "rank": rank, "engine": engine})
                 if len(candidates) >= max_candidates:
                     break
             if len(candidates) >= max_candidates:
                 break
-
-        # DDGで不足した場合、Bingも併用して補完
-        if len(candidates) < max_candidates:
-            for q_idx, query in enumerate(queries):
-                html = await self._fetch_bing(query)
-                if not html:
-                    continue
-                for rank, url in enumerate(self._extract_bing_urls(html)):
-                    if url in seen:
-                        continue
-                    seen.add(url)
-                    candidates.append({"url": url, "query_idx": q_idx, "rank": rank})
-                    if len(candidates) >= max_candidates:
-                        break
-                if len(candidates) >= max_candidates:
-                    break
 
         if not candidates:
             return []
@@ -1908,7 +1959,7 @@ class CompanyScraper:
         started = time.monotonic()
         try:
             resp = await asyncio.to_thread(
-                requests.get,
+                self._session_get,
                 url,
                 timeout=(timeout_sec, timeout_sec),
                 headers={"User-Agent": "Mozilla/5.0"},
@@ -1918,13 +1969,13 @@ class CompanyScraper:
             html = resp.text or ""
             elapsed_ms = (time.monotonic() - started) * 1000
             if self.slow_page_threshold_ms > 0 and elapsed_ms > self.slow_page_threshold_ms and host:
-                self.slow_hosts.add(host)
+                self._add_slow_host(host)
                 log.info("[http] mark slow host (%.0f ms) %s", elapsed_ms, host)
             return {"url": url, "text": text, "html": html}
         except Exception:
             elapsed_ms = (time.monotonic() - started) * 1000
             if self.slow_page_threshold_ms > 0 and elapsed_ms > self.slow_page_threshold_ms and host:
-                self.slow_hosts.add(host)
+                self._add_slow_host(host)
                 log.warning("[http] timeout/slow (%.0f ms) -> skip host next time: %s", elapsed_ms, host or "")
             return {"url": url, "text": "", "html": ""}
 
@@ -1978,41 +2029,44 @@ class CompanyScraper:
                 fallback["screenshot"] = cached.get("screenshot", b"") or b""
             return fallback
 
+        browser_sem = self._get_browser_sem()
         for attempt in range(2):
             remaining_ms = int((total_deadline - time.monotonic()) * 1000)
             if remaining_ms <= 0:
                 break
             attempt_timeout = min(eff_timeout, remaining_ms)
-            page: Page = await self.context.new_page()
-            page.set_default_timeout(attempt_timeout)
             started = time.monotonic()
+            page: Page | None = None
             try:
-                await page.goto(url, timeout=attempt_timeout, wait_until="domcontentloaded")
-                try:
-                    await page.wait_for_load_state("networkidle", timeout=attempt_timeout)
-                except Exception:
-                    pass
-                try:
-                    text = await page.inner_text("body", timeout=5000)
-                except Exception:
+                async with browser_sem:
+                    page = await self.context.new_page()
+                    page.set_default_timeout(attempt_timeout)
+                    await page.goto(url, timeout=attempt_timeout, wait_until="domcontentloaded")
                     try:
-                        await page.wait_for_load_state("load", timeout=attempt_timeout)
+                        await page.wait_for_load_state("networkidle", timeout=attempt_timeout)
                     except Exception:
                         pass
-                    text = await page.inner_text("body") if await page.locator("body").count() else ""
-                if text and len(text.strip()) < 40:
                     try:
-                        await page.wait_for_timeout(1200)
-                        text = await page.inner_text("body")
+                        text = await page.inner_text("body", timeout=5000)
                     except Exception:
-                        pass
-                try:
-                    html = await page.content()
-                except Exception:
-                    html = ""
-                screenshot: bytes = b""
-                if need_screenshot:
-                    screenshot = await page.screenshot(full_page=True)
+                        try:
+                            await page.wait_for_load_state("load", timeout=attempt_timeout)
+                        except Exception:
+                            pass
+                        text = await page.inner_text("body") if await page.locator("body").count() else ""
+                    if text and len(text.strip()) < 40:
+                        try:
+                            await page.wait_for_timeout(1200)
+                            text = await page.inner_text("body")
+                        except Exception:
+                            pass
+                    try:
+                        html = await page.content()
+                    except Exception:
+                        html = ""
+                    screenshot: bytes = b""
+                    if need_screenshot:
+                        screenshot = await page.screenshot(full_page=True)
                 result = {"url": url, "text": text, "html": html, "screenshot": screenshot}
                 if cached and not screenshot:
                     # 再訪時にスクショなしなら旧データを活かす
@@ -2027,7 +2081,7 @@ class CompanyScraper:
                     log.info("[page] slow fetch (%.0f ms) -> host=%s url=%s", elapsed_ms, host, url)
                 if self.slow_page_threshold_ms > 0 and elapsed_ms > self.slow_page_threshold_ms:
                     if host:
-                        self.slow_hosts.add(host)
+                        self._add_slow_host(host)
                     log.info("[page] mark slow host (%.0f ms) %s", elapsed_ms, host or "")
                 self.page_cache[url] = result
                 return result
@@ -2042,9 +2096,10 @@ class CompanyScraper:
                 elapsed_ms = (time.monotonic() - started) * 1000
                 if self.slow_page_threshold_ms > 0 and elapsed_ms > self.slow_page_threshold_ms:
                     if host:
-                        self.slow_hosts.add(host)
+                        self._add_slow_host(host)
                     log.warning("[page] timeout/slow (%.0f ms) -> skip host next time: %s", elapsed_ms, host or "")
-                await page.close()
+                if page:
+                    await page.close()
 
         fallback = {"url": url, "text": "", "html": "", "screenshot": b""}
         if cached:
