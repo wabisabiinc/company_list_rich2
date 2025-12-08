@@ -1223,6 +1223,7 @@ class CompanyScraper:
             return finalize(False, host_value=host, blocked_host=True)
         if not (allowed_tld or whitelist_hit or is_google_sites):
             return finalize(False, host_value=host, blocked_host=True)
+        parsed = urllib.parse.urlparse(url)
         base_name = (company_name or "").strip()
         is_prefecture_exact = base_name in PREFECTURE_NAMES
         expected_pref = self._extract_prefecture(expected_address or "")
