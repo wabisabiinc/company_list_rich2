@@ -62,6 +62,8 @@ TIME_LIMIT_SEC = float(os.getenv("TIME_LIMIT_SEC", "0"))
 TIME_LIMIT_FETCH_ONLY = float(os.getenv("TIME_LIMIT_FETCH_ONLY", "10"))  # 公式未確定で候補取得フェーズ（0で無効）
 TIME_LIMIT_WITH_OFFICIAL = float(os.getenv("TIME_LIMIT_WITH_OFFICIAL", "30"))  # 公式確定後、主要項目未充足（0で無効）
 TIME_LIMIT_DEEP = float(os.getenv("TIME_LIMIT_DEEP", "30"))  # 深掘り専用の上限（公式確定後）（0で無効）
+# 全体のハード上限（分単位でスキップしたい場合に使用、0で無効）
+GLOBAL_HARD_TIMEOUT_SEC = float(os.getenv("GLOBAL_HARD_TIMEOUT_SEC", "0"))
 OFFICIAL_AI_USE_SCREENSHOT = os.getenv("OFFICIAL_AI_USE_SCREENSHOT", "true").lower() == "true"
 SECOND_PASS_ENABLED = os.getenv("SECOND_PASS_ENABLED", "false").lower() == "true"
 SECOND_PASS_RETRY_STATUSES = [s.strip() for s in os.getenv("SECOND_PASS_RETRY_STATUSES", "review,no_homepage,error").split(",") if s.strip()]
@@ -738,7 +740,11 @@ async def process():
                 return time.monotonic() - started_at
 
             def over_time_limit() -> bool:
-                return TIME_LIMIT_SEC > 0 and elapsed() > TIME_LIMIT_SEC
+                if TIME_LIMIT_SEC > 0 and elapsed() > TIME_LIMIT_SEC:
+                    return True
+                if GLOBAL_HARD_TIMEOUT_SEC > 0 and elapsed() > GLOBAL_HARD_TIMEOUT_SEC:
+                    return True
+                return False
 
             def over_fetch_limit() -> bool:
                 return TIME_LIMIT_FETCH_ONLY > 0 and not homepage and elapsed() > TIME_LIMIT_FETCH_ONLY
@@ -829,7 +835,8 @@ async def process():
                         host_token_hit = scraper._host_token_hit(company_tokens, normalized_url)  # type: ignore
                         record["domain_score"] = domain_score_val
                         record["host_token_hit"] = host_token_hit
-                        record["strong_domain_host"] = company_has_corp and domain_score_val >= 4 and host_token_hit
+                        # 公式候補の強さを上げる: 社名トークンがホストに入りドメインスコアが高ければ AI 否定を上書きできるようにする
+                        record["strong_domain_host"] = (domain_score_val >= 5 or (company_has_corp and domain_score_val >= 4)) and host_token_hit
                         record.setdefault("order_idx", 0)
                         record.setdefault("search_rank", 0)
                     candidate_records.sort(
@@ -864,9 +871,10 @@ async def process():
                         "homepage_official_flag": 0,
                         "homepage_official_source": "",
                         "homepage_official_score": 0.0,
+                        "error_code": "search_timeout",
                     })
-                    manager.save_company_data(company, status="no_homepage")
-                    log.info("[%s] 候補ゼロ -> no_homepage で保存", cid)
+                    manager.save_company_data(company, status="review")
+                    log.info("[%s] 候補ゼロ -> review/search_timeout で保存", cid)
                     if csv_writer:
                         csv_writer.writerow({k: company.get(k, "") for k in CSV_FIELDNAMES})
                         csv_file.flush()
@@ -968,6 +976,7 @@ async def process():
                                 strong_domain_host
                                 or rule_details.get("name_present")
                                 or address_ok
+                                or (domain_score >= 5 and host_token_hit)
                             )
                             if ai_override:
                                 log.info("[%s] AI非公式だが強ドメイン/名称/住所一致のためAI否定を無視: %s", cid, record.get("url"))
@@ -983,6 +992,17 @@ async def process():
                                 log.info("[%s] AIが非公式判定: %s", cid, record.get("url"))
                                 continue
                         if ai_judge.get("is_official") is True:
+                            # ドメイン/住所/名称一致が弱い公式判定は採用しない
+                            if (not host_token_hit) and domain_score < 3 and not address_ok:
+                                manager.upsert_url_flag(
+                                    normalized_url,
+                                    is_official=False,
+                                    source="rule",
+                                    reason="weak_domain_no_address",
+                                )
+                                fallback_cands.append((record.get("url"), extracted))
+                                log.info("[%s] AI公式でもドメイン/住所一致なしのためスキップ: %s", cid, record.get("url"))
+                                continue
                             name_or_domain_ok = (
                                 name_hit
                                 or strong_domain_host
@@ -1444,8 +1464,18 @@ async def process():
                     try:
                         # 深掘りは不足がある場合のみ。揃っていれば追加巡回しない。
                         priority_limit = 0
+                        # 不足項目に応じて深掘り対象リンクを絞り込む
+                        target_types: list[str] = []
                         if not timed_out and not fully_filled:
-                            priority_limit = 3 if missing_contact else 2
+                            if missing_contact > 0:
+                                priority_limit = 3
+                                target_types.append("contact")
+                            if need_description or need_founded or need_listing:
+                                priority_limit = max(priority_limit, 2)
+                                target_types.append("about")
+                            if need_revenue or need_profit or need_capital or need_fiscal:
+                                priority_limit = max(priority_limit, 2)
+                                target_types.append("finance")
                         site_docs = (
                             {}
                             if priority_limit == 0
@@ -1454,6 +1484,7 @@ async def process():
                                 info_dict.get("html", ""),
                                 max_links=priority_limit,
                                 concurrency=FETCH_CONCURRENCY,
+                                target_types=target_types or None,
                             )
                         )
                     except Exception:

@@ -1161,7 +1161,7 @@ class CompanyScraper:
                     "https://html.duckduckgo.com/html",
                     params={"q": query, "kl": "jp-jp"},
                     headers=headers,
-                    timeout=(5, 30),
+                    timeout=(3, 10),
                 )
                 if resp.status_code in (429, 500, 502, 503, 504):
                     await asyncio.sleep(0.8 * (2 ** attempt))
@@ -1176,7 +1176,7 @@ class CompanyScraper:
                     continue
                 return text
             except Exception:
-                if attempt == 2:
+                if attempt == 1:
                     return await self._fetch_duckduckgo_via_proxy(query)
                 await asyncio.sleep(0.8 * (2 ** attempt))
         return ""
@@ -1375,6 +1375,21 @@ class CompanyScraper:
         if any(kw in host for kw in self.NON_OFFICIAL_KEYWORDS):
             score -= 3
 
+        # ドメインに社名トークンが強く含まれる場合は即公式とみなす
+        if host_token_hit and domain_match_score >= 4:
+            return finalize(
+                True,
+                score=max(score, 4),
+                name_present=name_present_flag,
+                strong_domain=True,
+                address_match=False,
+                prefecture_match=False,
+                postal_code_match=False,
+                domain_score=domain_match_score,
+                host_value=host,
+                blocked_host=False,
+            )
+
         address_hit = False
         pref_hit = False
         postal_hit = False
@@ -1400,9 +1415,17 @@ class CompanyScraper:
                     pref_hit = pref_ok
                     postal_hit = zip_ok
                     break
+                # 都道府県レベルしか合致しない場合も公式寄りに扱う
+                if pref_ok and not address_hit:
+                    score += 1
+                    pref_hit = True
+        # ドメインに社名トークンが強く含まれる場合、住所シグナルがなくても公式寄りに扱う
+        if not address_hit and host_token_hit and domain_match_score >= 4:
+            address_hit = True
 
         if generic_tld and not whitelist_hit and not is_google_sites:
             name_ok = name_present_flag or domain_match_score >= 4 or host_token_hit
+            strong_generic_ok = strong_domain_flag or (host_token_hit and domain_match_score >= 4)
             if not name_ok:
                 return finalize(
                     False,
@@ -1414,9 +1437,9 @@ class CompanyScraper:
                     postal_code_match=postal_hit,
                     domain_score=domain_match_score,
                     host_value=host,
-                    blocked_host=True,
+                    blocked_host=False,
                 )
-            if expected_address and not (address_hit or pref_hit or postal_hit):
+            if expected_address and not (address_hit or pref_hit or postal_hit) and not strong_generic_ok:
                 return finalize(
                     False,
                     score=score,
@@ -1427,7 +1450,7 @@ class CompanyScraper:
                     postal_code_match=postal_hit,
                     domain_score=domain_match_score,
                     host_value=host,
-                    blocked_host=True,
+                    blocked_host=False,
                 )
 
         if allowed_tld and host_token_hit and company_has_corp and score < 4:
@@ -2251,7 +2274,7 @@ class CompanyScraper:
                 break
         return ordered
 
-    def _find_priority_links(self, base: str, html: str, max_links: int = 4) -> List[str]:
+    def _find_priority_links(self, base: str, html: str, max_links: int = 4, target_types: Optional[list[str]] = None) -> List[str]:
         if not html:
             return []
         try:
@@ -2276,12 +2299,22 @@ class CompanyScraper:
                 href or "",
             ]).lower()
             score = 0
-            for kw in PRIORITY_SECTION_KEYWORDS:
-                if kw in token:
-                    score += 6
-            for kw in PRIORITY_CONTACT_KEYWORDS:
-                if kw in token:
-                    score += 4
+            # 欠損フィールドに応じて対象カテゴリを限定（Noneなら全部）
+            include_contact = (not target_types) or ("contact" in target_types)
+            include_about = (not target_types) or ("about" in target_types)
+            include_finance = (not target_types) or ("finance" in target_types)
+
+            if include_about:
+                for kw in PRIORITY_SECTION_KEYWORDS:
+                    if kw in token:
+                        score += 6
+            if include_contact:
+                for kw in PRIORITY_CONTACT_KEYWORDS:
+                    if kw in token:
+                        score += 4
+            if include_finance:
+                if any(kw in token for kw in ("ir", "investor", "financial", "決算", "ディスクロージャー")):
+                    score += 5
             if not score:
                 continue
             for path_kw in PRIORITY_PATHS:
@@ -2303,6 +2336,7 @@ class CompanyScraper:
         base_html: Optional[str] = None,
         max_links: int = 4,
         concurrency: int = 3,
+        target_types: Optional[list[str]] = None,
     ) -> Dict[str, Dict[str, Any]]:
         docs: Dict[str, Dict[str, Any]] = {}
         if not base_url:
@@ -2316,7 +2350,7 @@ class CompanyScraper:
                 html = initial_info.get("html", "")
             except Exception:
                 html = ""
-        links = self._find_priority_links(base_url, html, max_links=max_links)
+        links = self._find_priority_links(base_url, html, max_links=max_links, target_types=target_types)
         if not links:
             return docs
 
