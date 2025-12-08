@@ -964,6 +964,15 @@ class CompanyScraper:
                 if len(token) <= 2 or token in generic_tokens:
                     continue
                 return True
+            # ローマ字表記揺れ（echo/eiko/eiko-sha等）を許容するゆるい類似判定
+            for dt in domain_tokens:
+                if len(token) >= 3 and len(dt) >= 3:
+                    try:
+                        ratio = SequenceMatcher(None, token, dt).ratio()
+                    except Exception:
+                        ratio = 0.0
+                    if ratio >= 0.75:
+                        return True
         return False
 
     def _domain_score(self, company_tokens: List[str], url: str) -> int:
@@ -1419,6 +1428,22 @@ class CompanyScraper:
                 if pref_ok and not address_hit:
                     score += 1
                     pref_hit = True
+
+        # 住所シグナルがあり、法人TLD (.co.jp 等) ならドメイントークンが弱くても公式として許容する
+        if allowed_tld and (address_hit or pref_hit or postal_hit):
+            if domain_match_score >= 2 or host_token_hit:
+                return finalize(
+                    True,
+                    score=max(score, 4),
+                    name_present=name_present_flag,
+                    strong_domain=bool(domain_match_score >= 3 or host_token_hit),
+                    address_match=address_hit,
+                    prefecture_match=pref_hit,
+                    postal_code_match=postal_hit,
+                    domain_score=domain_match_score,
+                    host_value=host,
+                    blocked_host=False,
+                )
         # ドメインに社名トークンが強く含まれる場合、住所シグナルがなくても公式寄りに扱う
         if not address_hit and host_token_hit and domain_match_score >= 4:
             address_hit = True
