@@ -154,6 +154,8 @@ def normalize_address(s: str | None) -> str | None:
         return None
     s = s.strip().replace("　", " ")
     s = re.sub(r"<[^>]+>", " ", s)
+    # CSSスタイル断片の除去（スクレイプ時に混入する background: などを落とす）
+    s = re.sub(r"(background|color|font-family|font-size|display|position)\s*:\s*[^;]+;?", " ", s, flags=re.I)
     # JSやトラッキング断片をカット（window.dataLayer 等が混入するケース対策）
     m_noise = ADDRESS_JS_NOISE_RE.search(s)
     if m_noise:
@@ -179,7 +181,9 @@ def normalize_address(s: str | None) -> str | None:
             total += current
             return str(total)
 
-        return re.sub(r"[〇零一二三四五六七八九十百千]+", repl, text)
+        # 丁目/番地/号などの直前に現れる数のみ変換し、地名（千代田/三郷など）を壊さない
+        pattern = re.compile(r"[〇零一二三四五六七八九十百千]+(?=(丁目|番地|番|号|条|[-‐―ー−/0-9]))")
+        return pattern.sub(repl, text)
     s = convert_kanji_numbers(s)
     s = re.sub(r"[‐―－ー]+", "-", s)
     s = re.sub(r"\s+", " ", s)
@@ -886,6 +890,10 @@ async def process():
             cid = company.get("id")
             name = (company.get("company_name") or "").strip()
             addr = (company.get("address") or "").strip()
+            input_addr_has_zip = bool(ZIP_CODE_RE.search(addr))
+            input_addr_has_city = bool(CITY_RE.search(addr))
+            input_addr_has_pref = any(pref in addr for pref in CompanyScraper.PREFECTURE_NAMES) if addr else False
+            input_addr_pref_only = bool(input_addr_has_pref and not input_addr_has_city and not input_addr_has_zip)
 
             if (ID_MIN and cid < ID_MIN) or (ID_MAX and cid > ID_MAX):
                 log.info("[skip] id=%s はレンジ外 -> skipped (worker=%s)", cid, WORKER_ID)
@@ -901,6 +909,9 @@ async def process():
             started_at = time.monotonic()
             timed_out = False
             company_has_corp = any(suffix in name for suffix in CompanyScraper.CORP_SUFFIXES)
+            hard_timeout_candidates = [t for t in (GLOBAL_HARD_TIMEOUT_SEC, COMPANY_HARD_TIMEOUT_SEC, TIME_LIMIT_SEC) if t > 0]
+            hard_timeout_sec = min(hard_timeout_candidates) if hard_timeout_candidates else 60.0
+            hard_deadline = started_at + hard_timeout_sec
 
             def elapsed() -> float:
                 return time.monotonic() - started_at
@@ -913,6 +924,9 @@ async def process():
                 if GLOBAL_HARD_TIMEOUT_SEC > 0 and elapsed() > GLOBAL_HARD_TIMEOUT_SEC:
                     return True
                 return False
+
+            def over_hard_deadline() -> bool:
+                return time.monotonic() > hard_deadline
 
             def over_fetch_limit() -> bool:
                 return TIME_LIMIT_FETCH_ONLY > 0 and not homepage and elapsed() > TIME_LIMIT_FETCH_ONLY
@@ -1264,6 +1278,26 @@ async def process():
                                 log.info("[%s] AIが非公式判定: %s", cid, record.get("url"))
                                 continue
                         if ai_judge.get("is_official") is True:
+                            if input_addr_pref_only and not (host_token_hit or name_hit or strong_domain_host or domain_score >= 4):
+                                manager.upsert_url_flag(
+                                    normalized_url,
+                                    is_official=False,
+                                    source="rule",
+                                    reason="pref_only_input_no_name_host",
+                                )
+                                fallback_cands.append((record.get("url"), extracted))
+                                log.info("[%s] AI公式だが都道府県だけの入力で社名/ホスト根拠なしのため除外: %s", cid, record.get("url"))
+                                continue
+                            if addr and not address_ok:
+                                manager.upsert_url_flag(
+                                    normalized_url,
+                                    is_official=False,
+                                    source="rule",
+                                    reason="address_mismatch_input",
+                                )
+                                fallback_cands.append((record.get("url"), extracted))
+                                log.info("[%s] AI公式でも入力住所と一致せず除外: %s", cid, record.get("url"))
+                                continue
                             # ホストに社名トークンも名称ヒットも無ければ公式にしない
                             if not host_token_hit and not name_hit:
                                 manager.upsert_url_flag(
@@ -1332,6 +1366,26 @@ async def process():
                             break
                     # キャッシュ公式は採用しない（参考のみ）
                     if rule_details.get("is_official"):
+                        if input_addr_pref_only and not (host_token_hit or name_hit or strong_domain_host or domain_score >= 4):
+                            manager.upsert_url_flag(
+                                normalized_url,
+                                is_official=False,
+                                source="rule",
+                                reason="pref_only_input_no_name_host",
+                            )
+                            fallback_cands.append((record.get("url"), extracted))
+                            log.info("[%s] 公式判定だが都道府県だけの入力で社名/ホスト根拠なしのため除外: %s", cid, record.get("url"))
+                            continue
+                        if addr and not address_ok:
+                            manager.upsert_url_flag(
+                                normalized_url,
+                                is_official=False,
+                                source="rule",
+                                reason="address_mismatch_input",
+                            )
+                            fallback_cands.append((record.get("url"), extracted))
+                            log.info("[%s] 公式判定だが入力住所と一致せず除外: %s", cid, record.get("url"))
+                            continue
                         if not host_token_hit and not name_hit:
                             manager.upsert_url_flag(
                                 normalized_url,
@@ -1482,13 +1536,27 @@ async def process():
 
                 # 暫定URLは深掘りにのみ使用し、保存は公式昇格条件を満たした場合に限定
                 if not homepage and provisional_homepage:
-                    homepage = provisional_homepage
-                    info = provisional_info
-                    primary_cands = provisional_cands
-                    homepage_official_flag = 0
-                    homepage_official_source = homepage_official_source or "provisional"
-                    homepage_official_score = 0.0
-                    chosen_domain_score = provisional_domain_score
+                    weak_provisional = (
+                        provisional_domain_score < 3
+                        and not provisional_host_token
+                        and not provisional_name_present
+                        and not provisional_address_ok
+                    )
+                    if weak_provisional:
+                        homepage = ""
+                        primary_cands = {}
+                        provisional_info = None
+                        provisional_cands = {}
+                        force_review = True
+                        provisional_homepage = ""
+                    else:
+                        homepage = provisional_homepage
+                        info = provisional_info
+                        primary_cands = provisional_cands
+                        homepage_official_flag = 0
+                        homepage_official_source = homepage_official_source or "provisional"
+                        homepage_official_score = 0.0
+                        chosen_domain_score = provisional_domain_score
 
                 if not homepage and timed_out and best_record:
                     normalized_url = best_record.get("normalized_url") or best_record.get("url") or ""
@@ -1725,22 +1793,45 @@ async def process():
                     info_dict = info or {}
                     info_url = info_dict.get("url") or homepage
                     # まず「会社概要/企業情報/会社情報」系の優先リンクを先に巡回して主要情報を拾う
-                    try:
-                        early_priority_docs = await asyncio.wait_for(
-                            scraper.fetch_priority_documents(
-                                homepage,
-                                info_dict.get("html", ""),
-                                max_links=3,
-                                concurrency=FETCH_CONCURRENCY,
-                                target_types=["about", "contact", "finance"],
-                            ),
-                            timeout=PAGE_FETCH_TIMEOUT_SEC,
+                    if over_hard_deadline() or over_time_limit():
+                        timed_out = True
+                        priority_docs = {}
+                    else:
+                        should_fetch_priority = (
+                            missing_contact > 0
+                            or need_description
+                            or need_founded
+                            or need_listing
+                            or need_revenue
+                            or need_profit
+                            or need_capital
+                            or need_fiscal
                         )
-                    except Exception:
-                        early_priority_docs = {}
-                    for url, pdata in early_priority_docs.items():
-                        priority_docs[url] = pdata
-                        absorb_doc_data(url, pdata)
+                        try:
+                            early_priority_docs = await asyncio.wait_for(
+                                scraper.fetch_priority_documents(
+                                    homepage,
+                                    info_dict.get("html", ""),
+                                    max_links=3 if should_fetch_priority else 0,
+                                    concurrency=FETCH_CONCURRENCY,
+                                    target_types=["about", "contact", "finance"] if should_fetch_priority else None,
+                                ),
+                                timeout=PAGE_FETCH_TIMEOUT_SEC,
+                            ) if should_fetch_priority else {}
+                        except Exception:
+                            early_priority_docs = {}
+                        for url, pdata in early_priority_docs.items():
+                            priority_docs[url] = pdata
+                            absorb_doc_data(url, pdata)
+                        if site_docs := {}:
+                            priority_docs.update(site_docs)
+                    if timed_out:
+                        missing_contact, missing_extra = refresh_need_flags()
+                        fully_filled = False
+                        related = {}
+                        goto_finalize = True
+                    else:
+                        goto_finalize = False
 
                     cands = primary_cands or {}
                     phones = cands.get("phone_numbers") or []
@@ -1851,6 +1942,16 @@ async def process():
                     homepage
                     and USE_AI
                     and verifier is not None
+                    and (
+                        missing_contact > 0
+                        or need_description
+                        or need_listing
+                        or need_capital
+                        or need_revenue
+                        or need_profit
+                        or need_fiscal
+                        or need_founded
+                    )
                 )
                 if ai_needed and not timed_out:
                     ai_attempted = True
@@ -1882,8 +1983,34 @@ async def process():
                 ai_addr: str | None = None
                 ai_rep: str | None = None
                 ai_desc: str | None = None
+                def consume_ai_result(res: dict[str, Any] | None) -> None:
+                    nonlocal ai_used, ai_model, ai_phone, ai_addr, ai_rep
+                    if not res:
+                        return
+                    ai_used = 1
+                    ai_model = AI_MODEL_NAME
+                    phone_candidate = normalize_phone(res.get("phone_number"))
+                    if phone_candidate:
+                        ai_phone = phone_candidate
+                    if AI_ADDRESS_ENABLED:
+                        addr_candidate = normalize_address(res.get("address"))
+                        if addr_candidate:
+                            ai_addr = addr_candidate
+                    rep_candidate = res.get("rep_name") or res.get("representative")
+                    rep_candidate = scraper.clean_rep_name(rep_candidate) if rep_candidate else None
+                    if rep_candidate:
+                        ai_rep = rep_candidate
+                    desc_candidate = res.get("description")
+                    if isinstance(desc_candidate, str) and desc_candidate.strip():
+                        update_description_candidate(desc_candidate)
                 if ai_task:
                     ai_result = await ai_task
+                    consume_ai_result(ai_result)
+                    if ai_desc and not description_val:
+                        cleaned_ai_desc = clean_description_value(ai_desc)
+                        if cleaned_ai_desc:
+                            description_val = cleaned_ai_desc
+                            need_description = False
                 elif ai_needed and info_url and verifier is not None and USE_AI and not timed_out:
                     # 公式候補はあるがテキストが乏しい場合のフォールバック: 再取得してでもAIを1回回す
                     try:
@@ -1899,17 +2026,7 @@ async def process():
                         ai_attempted = True
                     except Exception:
                         ai_result = None
-                    if ai_result:
-                        ai_used = 1
-                        ai_model = AI_MODEL_NAME
-                        ai_phone = normalize_phone(ai_result.get("phone_number"))
-                        if AI_ADDRESS_ENABLED:
-                            ai_addr = normalize_address(ai_result.get("address"))
-                        ai_rep = ai_result.get("rep_name") or ai_result.get("representative")
-                        ai_rep = scraper.clean_rep_name(ai_rep) if ai_rep else None
-                        description = ai_result.get("description")
-                        if isinstance(description, str) and description.strip():
-                            update_description_candidate(description)
+                    consume_ai_result(ai_result)
                 else:
                     if ai_attempted and AI_COOLDOWN_SEC > 0:
                         await asyncio.sleep(jittered_seconds(AI_COOLDOWN_SEC, JITTER_RATIO))
@@ -2052,8 +2169,16 @@ async def process():
                             related_page_limit += RELATED_EXTRA_PHONE
                         related_page_limit = max(0, related_page_limit)
                         related = {}
-                        if not timed_out and ((missing_contact > 0) or need_extra_fields):
-                            if over_time_limit() or over_deep_limit():
+                        weak_provisional_target = (
+                            homepage_official_flag == 0
+                            and homepage_official_source.startswith("provisional")
+                            and chosen_domain_score < 3
+                            and not provisional_host_token
+                            and not provisional_name_present
+                            and not provisional_address_ok
+                        )
+                        if not weak_provisional_target and not timed_out and ((missing_contact > 0) or need_extra_fields):
+                            if over_time_limit() or over_deep_limit() or over_hard_deadline():
                                 timed_out = True
                             else:
                                 max_hops = RELATED_MAX_HOPS_PHONE if need_phone else RELATED_MAX_HOPS_BASE
@@ -2284,11 +2409,13 @@ async def process():
                     found_address = ""
                 if not found_address and rule_address:
                     found_address = rule_address
+                if found_address and not looks_like_address(found_address):
+                    found_address = ""
                 normalized_found_address = normalize_address(found_address) if found_address else ""
                 if not normalized_found_address and addr:
                     normalized_found_address = normalize_address(addr) or ""
                 rep_name_val = scraper.clean_rep_name(rep_name_val) or ""
-                description_val = clean_description_value(description_val)
+                description_val = clean_description_value(sanitize_text_block(description_val))
                 listing_val = clean_listing_value(listing_val)
                 capital_val = ai_normalize_amount(capital_val) or clean_amount_value(capital_val)
                 revenue_val = ai_normalize_amount(revenue_val) or clean_amount_value(revenue_val)
