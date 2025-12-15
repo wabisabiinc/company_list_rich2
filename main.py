@@ -1102,6 +1102,9 @@ async def process():
                 provisional_info = None
                 provisional_cands: dict[str, list[str]] = {}
                 provisional_domain_score = 0
+                provisional_host_token = False
+                provisional_name_present = False
+                provisional_address_ok = False
                 best_record: dict[str, Any] | None = None
                 if not homepage and candidate_records:
                     best_score = float("-inf")
@@ -1140,28 +1143,27 @@ async def process():
                         pref_hit = bool(rule_details.get("prefecture_match"))
                         zip_hit = bool(rule_details.get("postal_code_match"))
                         address_ok = addr_hit or pref_hit or zip_hit
-                        safe_pick = strong_domain_host or domain_score >= 2 or name_present or strong_domain or address_ok
+                        # 公式昇格の予備候補だが保存はしない。強条件のみ後で昇格。
                         provisional_homepage = normalized_url
                         provisional_info = best_record.get("info")
                         provisional_cands = best_record.get("extracted") or {}
                         provisional_domain_score = domain_score
-                        if safe_pick:
-                            log.info("[%s] 公式未確定のため暫定ホームページで深掘り: %s", cid, provisional_homepage)
-                        else:
-                            force_review = True
-                            homepage_official_source = "provisional_unsafe"
-                            log.info("[%s] 公式未確定だが深掘りターゲットとして暫定採用(要レビュー): %s", cid, provisional_homepage)
+                        provisional_host_token = bool(best_record.get("host_token_hit"))
+                        provisional_name_present = name_present
+                        provisional_address_ok = address_ok
+                        # ログだけ出して深掘りターゲットとする
+                        log.info("[%s] 公式未確定のため暫定URLで深掘り: %s (domain_score=%s name=%s addr=%s host_token=%s)",
+                                 cid, provisional_homepage, domain_score, name_present, address_ok, strong_domain_host)
 
+                # 暫定URLは深掘りにのみ使用し、保存は公式昇格条件を満たした場合に限定
                 if not homepage and provisional_homepage:
                     homepage = provisional_homepage
                     info = provisional_info
                     primary_cands = provisional_cands
                     homepage_official_flag = 0
-                    if not homepage_official_source:
-                        homepage_official_source = "provisional"
+                    homepage_official_source = homepage_official_source or "provisional"
                     homepage_official_score = 0.0
                     chosen_domain_score = provisional_domain_score
-                    force_review = True
 
                 if not homepage and timed_out and best_record:
                     normalized_url = best_record.get("normalized_url") or best_record.get("url") or ""
@@ -1964,6 +1966,33 @@ async def process():
                     accuracy_payload = REFERENCE_CHECKER.evaluate(company)
                     if accuracy_payload:
                         company.update(accuracy_payload)
+
+                # 暫定URLは強いドメイン/社名ヒットが無ければ保存しない
+                if (
+                    homepage
+                    and homepage_official_flag == 0
+                    and homepage_official_source.startswith("provisional")
+                ):
+                    strong_provisional = (
+                        (chosen_domain_score >= 4)
+                        or (provisional_host_token and chosen_domain_score >= 3)
+                        or (provisional_name_present and chosen_domain_score >= 3)
+                        or (provisional_address_ok and chosen_domain_score >= 4)
+                    )
+                    if not strong_provisional:
+                        log.info(
+                            "[%s] 暫定URLを保存しません (domain_score=%s host_token=%s name=%s addr=%s): %s",
+                            cid,
+                            chosen_domain_score,
+                            provisional_host_token,
+                            provisional_name_present,
+                            provisional_address_ok,
+                            homepage,
+                        )
+                        homepage = ""
+                        homepage_official_source = ""
+                        homepage_official_score = 0.0
+                        chosen_domain_score = 0
 
                 status = "done" if homepage else "no_homepage"
                 if timed_out:
