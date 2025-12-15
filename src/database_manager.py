@@ -153,6 +153,7 @@ class DatabaseManager:
         )
 
         cols = self._get_table_columns()
+        # 既存データベースとの互換を保つため、後から増えた列を順に追加する
         if "status" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN status TEXT DEFAULT 'pending';")
             cols.add("status")
@@ -192,6 +193,18 @@ class DatabaseManager:
         if "ai_model" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN ai_model TEXT;")
             cols.add("ai_model")
+        if "hubspot_id" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN hubspot_id TEXT;")
+            cols.add("hubspot_id")
+        if "corporate_number" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN corporate_number TEXT;")
+            cols.add("corporate_number")
+        if "corporate_number_norm" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN corporate_number_norm TEXT;")
+            cols.add("corporate_number_norm")
+        if "source_csv" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN source_csv TEXT;")
+            cols.add("source_csv")
         if "phone_source" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN phone_source TEXT;")
             cols.add("phone_source")
@@ -204,6 +217,24 @@ class DatabaseManager:
         if "last_checked_at" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN last_checked_at TEXT;")
             cols.add("last_checked_at")
+        if "reference_homepage" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN reference_homepage TEXT;")
+            cols.add("reference_homepage")
+        if "reference_phone" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN reference_phone TEXT;")
+            cols.add("reference_phone")
+        if "reference_address" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN reference_address TEXT;")
+            cols.add("reference_address")
+        if "accuracy_homepage" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN accuracy_homepage TEXT;")
+            cols.add("accuracy_homepage")
+        if "accuracy_phone" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN accuracy_phone TEXT;")
+            cols.add("accuracy_phone")
+        if "accuracy_address" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN accuracy_address TEXT;")
+            cols.add("accuracy_address")
 
     def _ensure_indexes(self) -> None:
         cols = self._get_table_columns()

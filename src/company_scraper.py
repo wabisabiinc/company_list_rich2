@@ -778,6 +778,12 @@ class CompanyScraper:
         val = re.sub(r"(?i)<br\s*/?>", " ", val)
         val = val.replace("\u3000", " ")
         val = re.sub(r"[‐―－ー–—]", "-", val)
+        # JS/トラッキング断片が混入するケースを早めにカット
+        val = re.split(
+            r"(window\.\w+|dataLayer\s*=|gtm\.|googletagmanager|nr-data\.net|newrelic|bam\.nr-data\.net|function\s*\(|<script|</script>)",
+            val,
+            maxsplit=1,
+        )[0]
         # 以降の余計な部分（TELやリンクの残骸）をカット
         val = re.split(r"(?:TEL|Tel|tel|電話|☎|℡)[:：]?\s*", val)[0]
         val = re.split(r"https?://|href=|HREF=", val)[0]

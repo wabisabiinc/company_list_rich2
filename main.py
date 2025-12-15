@@ -96,6 +96,10 @@ if REFERENCE_CSVS:
         log.exception("Reference data loading failed")
 
 ZIP_CODE_RE = re.compile(r"(\d{3}-\d{4})")
+ADDRESS_JS_NOISE_RE = re.compile(
+    r"(window\.\w+|dataLayer\s*=|gtm\.|googletagmanager|nr-data\.net|newrelic|bam\.nr-data\.net|function\s*\(|<script|</script>)",
+    re.IGNORECASE,
+)
 KANJI_TOKEN_RE = re.compile(r"[一-龥]{2,}")
 LISTING_ALLOWED_KEYWORDS = [
     "上場", "未上場", "非上場", "東証", "名証", "札証", "福証", "JASDAQ",
@@ -150,6 +154,10 @@ def normalize_address(s: str | None) -> str | None:
         return None
     s = s.strip().replace("　", " ")
     s = re.sub(r"<[^>]+>", " ", s)
+    # JSやトラッキング断片をカット（window.dataLayer 等が混入するケース対策）
+    m_noise = ADDRESS_JS_NOISE_RE.search(s)
+    if m_noise:
+        s = s[: m_noise.start()]
     # 全角英数字・記号を半角に寄せる
     s = s.translate(str.maketrans("０１２３４５６７８９－ー―‐／", "0123456789----/"))
     # 漢数字を簡易的に算用数字へ

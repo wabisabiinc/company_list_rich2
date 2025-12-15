@@ -14,6 +14,10 @@ def ensure_table(conn: sqlite3.Connection, reset: bool = False) -> None:
         cur.executescript("""
             DROP TABLE IF EXISTS companies;
             DROP INDEX  IF EXISTS uniq_company;
+            DROP INDEX  IF EXISTS idx_companies_status;
+            DROP INDEX  IF EXISTS idx_companies_emp;
+            DROP INDEX  IF EXISTS idx_companies_corporate_number_norm;
+            DROP INDEX  IF EXISTS idx_companies_hubspot_id;
         """)
     # AUTO INCREMENT + UNIQUE(company_name,address)
     cur.executescript("""
@@ -25,10 +29,46 @@ def ensure_table(conn: sqlite3.Connection, reset: bool = False) -> None:
             homepage       TEXT,
             phone          TEXT,
             found_address  TEXT,
-            status         TEXT    DEFAULT 'pending'
+            status         TEXT    DEFAULT 'pending',
+            locked_by      TEXT,
+            locked_at      TEXT,
+            rep_name       TEXT,
+            description    TEXT,
+            listing        TEXT,
+            revenue        TEXT,
+            profit         TEXT,
+            capital        TEXT,
+            fiscal_month   TEXT,
+            founded_year   TEXT,
+            ai_used        INTEGER DEFAULT 0,
+            ai_model       TEXT,
+            phone_source   TEXT,
+            address_source TEXT,
+            extract_confidence REAL,
+            last_checked_at TEXT,
+            hubspot_id     TEXT,
+            corporate_number     TEXT,
+            corporate_number_norm TEXT,
+            source_csv     TEXT,
+            reference_homepage TEXT,
+            reference_phone TEXT,
+            reference_address TEXT,
+            accuracy_homepage TEXT,
+            accuracy_phone TEXT,
+            accuracy_address TEXT,
+            homepage_official_flag INTEGER,
+            homepage_official_source TEXT,
+            homepage_official_score REAL,
+            source_url_phone TEXT,
+            source_url_address TEXT,
+            source_url_rep TEXT
         );
         CREATE UNIQUE INDEX IF NOT EXISTS uniq_company
           ON companies(company_name, address);
+        CREATE INDEX IF NOT EXISTS idx_companies_status ON companies(status);
+        CREATE INDEX IF NOT EXISTS idx_companies_emp ON companies(employee_count);
+        CREATE INDEX IF NOT EXISTS idx_companies_corporate_number_norm ON companies(corporate_number_norm);
+        CREATE INDEX IF NOT EXISTS idx_companies_hubspot_id ON companies(hubspot_id);
     """)
     conn.commit()
 
