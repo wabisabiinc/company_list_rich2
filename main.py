@@ -60,7 +60,7 @@ RELATED_EXTRA_PHONE = max(0, int(os.getenv("RELATED_EXTRA_PHONE", "1")))
 RELATED_MAX_HOPS_BASE = max(1, int(os.getenv("RELATED_MAX_HOPS_BASE", "2")))
 RELATED_MAX_HOPS_PHONE = max(1, int(os.getenv("RELATED_MAX_HOPS_PHONE", "2")))
 # 全体のタイムアウトは使わず、フェーズ別で管理する（デフォルトを短めにし停滞を防止）
-TIME_LIMIT_SEC = float(os.getenv("TIME_LIMIT_SEC", "0"))
+TIME_LIMIT_SEC = float(os.getenv("TIME_LIMIT_SEC", "60"))
 TIME_LIMIT_FETCH_ONLY = float(os.getenv("TIME_LIMIT_FETCH_ONLY", "10"))  # 公式未確定で候補取得フェーズ（0で無効）
 TIME_LIMIT_WITH_OFFICIAL = float(os.getenv("TIME_LIMIT_WITH_OFFICIAL", "40"))  # 公式確定後、主要項目未充足（0で無効）
 TIME_LIMIT_DEEP = float(os.getenv("TIME_LIMIT_DEEP", "45"))  # 深掘り専用の上限（公式確定後）（0で無効）
@@ -896,6 +896,8 @@ async def process():
 
             def over_time_limit() -> bool:
                 if TIME_LIMIT_SEC > 0 and elapsed() > TIME_LIMIT_SEC:
+                    return True
+                if COMPANY_HARD_TIMEOUT_SEC > 0 and elapsed() > COMPANY_HARD_TIMEOUT_SEC:
                     return True
                 if GLOBAL_HARD_TIMEOUT_SEC > 0 and elapsed() > GLOBAL_HARD_TIMEOUT_SEC:
                     return True
