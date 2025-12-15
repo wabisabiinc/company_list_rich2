@@ -62,8 +62,8 @@ TIME_LIMIT_SEC = float(os.getenv("TIME_LIMIT_SEC", "0"))
 TIME_LIMIT_FETCH_ONLY = float(os.getenv("TIME_LIMIT_FETCH_ONLY", "10"))  # 公式未確定で候補取得フェーズ（0で無効）
 TIME_LIMIT_WITH_OFFICIAL = float(os.getenv("TIME_LIMIT_WITH_OFFICIAL", "30"))  # 公式確定後、主要項目未充足（0で無効）
 TIME_LIMIT_DEEP = float(os.getenv("TIME_LIMIT_DEEP", "30"))  # 深掘り専用の上限（公式確定後）（0で無効）
-# 全体のハード上限（分単位でスキップしたい場合に使用、0で無効）
-GLOBAL_HARD_TIMEOUT_SEC = float(os.getenv("GLOBAL_HARD_TIMEOUT_SEC", "0"))
+# 全体のハード上限（デフォルト60秒で次ジョブへスキップ）
+GLOBAL_HARD_TIMEOUT_SEC = float(os.getenv("GLOBAL_HARD_TIMEOUT_SEC", "60"))
 OFFICIAL_AI_USE_SCREENSHOT = os.getenv("OFFICIAL_AI_USE_SCREENSHOT", "true").lower() == "true"
 SECOND_PASS_ENABLED = os.getenv("SECOND_PASS_ENABLED", "false").lower() == "true"
 SECOND_PASS_RETRY_STATUSES = [s.strip() for s in os.getenv("SECOND_PASS_RETRY_STATUSES", "review,no_homepage,error").split(",") if s.strip()]
@@ -107,15 +107,6 @@ GENERIC_DESCRIPTION_TERMS = {
     "会社概要", "企業情報", "事業概要", "法人概要", "団体概要",
     "トップメッセージ", "ご挨拶", "メッセージ", "沿革", "理念",
 }
-DESCRIPTION_MIN_LEN = max(6, int(os.getenv("DESCRIPTION_MIN_LEN", "10")))
-DESCRIPTION_MAX_LEN = max(DESCRIPTION_MIN_LEN, int(os.getenv("DESCRIPTION_MAX_LEN", "200")))
-DESCRIPTION_BIZ_KEYWORDS = (
-    "事業", "製造", "開発", "販売", "提供", "サービス", "運営", "支援", "施工", "設計", "製作",
-    "物流", "建設", "工事", "コンサル", "consulting", "solution", "ソリューション",
-    "product", "製品", "プロダクト", "システム", "プラント", "加工", "レンタル", "運送",
-    "IT", "デジタル", "ITソリューション", "プロジェクト", "アウトソーシング", "研究", "技術",
-    "人材", "教育", "ヘルスケア", "医療", "食品", "エネルギー", "不動産", "金融", "EC", "通販",
-)
 DESCRIPTION_MIN_LEN = max(6, int(os.getenv("DESCRIPTION_MIN_LEN", "10")))
 DESCRIPTION_MAX_LEN = max(DESCRIPTION_MIN_LEN, int(os.getenv("DESCRIPTION_MAX_LEN", "200")))
 DESCRIPTION_BIZ_KEYWORDS = (
@@ -942,6 +933,9 @@ async def process():
                     for record in candidate_records[:3]:
                         _attach_ai_task(record)
 
+                    if ai_tasks:
+                        await asyncio.gather(*ai_tasks, return_exceptions=True)
+
                 for record in candidate_records:
                     normalized_url = record.get("normalized_url") or record.get("url")
                     extracted = record.get("extracted") or {}
@@ -1397,6 +1391,21 @@ async def process():
                 if homepage:
                     info_dict = info or {}
                     info_url = info_dict.get("url") or homepage
+                    # まず「会社概要/企業情報/会社情報」系の優先リンクを先に巡回して主要情報を拾う
+                    try:
+                        early_priority_docs = await scraper.fetch_priority_documents(
+                            homepage,
+                            info_dict.get("html", ""),
+                            max_links=3,
+                            concurrency=FETCH_CONCURRENCY,
+                            target_types=["about", "contact", "finance"],
+                        )
+                    except Exception:
+                        early_priority_docs = {}
+                    for url, pdata in early_priority_docs.items():
+                        priority_docs[url] = pdata
+                        absorb_doc_data(url, pdata)
+
                     cands = primary_cands or {}
                     phones = cands.get("phone_numbers") or []
                     addrs = cands.get("addresses") or []
@@ -1476,17 +1485,16 @@ async def process():
                             if need_revenue or need_profit or need_capital or need_fiscal:
                                 priority_limit = max(priority_limit, 2)
                                 target_types.append("finance")
-                        site_docs = (
-                            {}
-                            if priority_limit == 0
-                            else await scraper.fetch_priority_documents(
+                        site_docs = {}
+                        # early_priority_docs で取得済みの場合は重複を避ける
+                        if priority_limit > 0 and not priority_docs:
+                            site_docs = await scraper.fetch_priority_documents(
                                 homepage,
                                 info_dict.get("html", ""),
                                 max_links=priority_limit,
                                 concurrency=FETCH_CONCURRENCY,
                                 target_types=target_types or None,
                             )
-                        )
                     except Exception:
                         site_docs = {}
                     for url, pdata in site_docs.items():
@@ -1780,7 +1788,7 @@ async def process():
                             ):
                                 break
 
-                    if homepage and (need_addr or not found_address) and not timed_out:
+                    if homepage and (need_addr or not found_address) and not timed_out and not priority_docs:
                         try:
                             extra_docs = await scraper.fetch_priority_documents(
                                 homepage,

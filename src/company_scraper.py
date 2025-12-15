@@ -28,25 +28,31 @@ log = logging.getLogger(__name__)
 
 # 深掘り時に優先して辿るパス（日本語含む）
 PRIORITY_PATHS = [
-    "/company", "/about", "/profile", "/corporate", "/overview",
-    "/contact", "/inquiry", "/access", "/info", "/information",
-    "/ir", "/investor", "/investor-relations", "/financial", "/disclosure",
-    "/gaiyou", "/gaiyo", "/gaiyou.html",
-    "/会社概要", "/企業情報", "/企業概要", "/会社情報", "/会社案内", "/法人案内", "/法人概要",
-    "/団体概要", "/施設案内", "/施設情報", "/法人情報", "/事業案内", "/事業紹介",
-    "/窓口案内", "/お問い合わせ", "/アクセス", "/沿革", "/組織図", "/決算", "/ディスクロージャー",
+    # 概要系（最優先）
+    "/company", "/about", "/corporate", "/会社概要", "/企業情報", "/企業概要",
+    "/会社情報", "/会社案内", "/法人案内", "/法人概要",
+    # 連絡先系
+    "/contact", "/お問い合わせ", "/アクセス",
+    # IR/決算系
+    "/ir", "/investor", "/investor-relations", "/financial", "/disclosure", "/決算",
 ]
 PRIO_WORDS = [
+    # 概要系（最優先）
     "会社概要", "企業情報", "企業概要", "会社情報", "法人案内", "法人概要", "会社案内",
-    "団体概要", "施設案内", "法人情報", "事業案内", "事業紹介", "組織図",
-    "代表者", "代表挨拶", "沿革", "お問い合わせ", "アクセス", "連絡先", "窓口"
+    # 連絡先系
+    "お問い合わせ", "アクセス", "連絡先", "窓口",
+    # IR/決算系
+    "IR", "ir", "investor", "financial", "ディスクロージャー", "決算",
 ]
 ANCHOR_PRIORITY_WORDS = [
-    "会社概要", "企業情報", "法人案内", "法人概要", "会社案内", "団体概要",
-    "施設案内", "施設情報", "法人情報", "事業案内", "事業紹介", "会社紹介", "会社情報",
-    "法人紹介", "組織図", "組織紹介", "沿革", "代表者", "代表挨拶",
-    "理事長", "院長", "園長", "校長", "about", "corporate", "profile",
-    "overview", "information", "ご案内"
+    # 概要系
+    "会社概要", "企業情報", "法人案内", "法人概要", "会社案内", "会社紹介", "会社情報", "法人紹介",
+    # 連絡先系
+    "お問い合わせ", "連絡先", "アクセス", "窓口",
+    # IR/決算系
+    "IR", "ir", "investor", "financial", "ディスクロージャー", "決算",
+    # 英語系
+    "about", "corporate",
 ]
 PRIORITY_SECTION_KEYWORDS = (
     "contact", "contacts", "inquiry", "support", "contact-us",

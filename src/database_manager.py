@@ -548,7 +548,7 @@ class DatabaseManager:
             if not s:
                 return ""
             s = s.translate(str.maketrans("０１２３４５６７８９－ー―‐／", "0123456789----/"))
-            s = re.sub(r"[\\s]+", " ", s)
+            s = re.sub(r"\s+", " ", s)
             s = s.replace("〒 ", "〒").replace("〒", "〒")
             return s.strip()
 
