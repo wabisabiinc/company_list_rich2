@@ -340,7 +340,7 @@ def pick_best_phone(candidates: list[str]) -> str | None:
 
 def pick_best_rep(names: list[str], source_url: str | None = None) -> str | None:
     role_keywords = ("代表", "取締役", "社長", "理事長", "会長", "院長", "学長", "園長", "代表社員", "CEO", "COO")
-    blocked = ("スタッフ", "紹介", "求人", "採用", "ニュース", "退任", "就任", "人事", "異動", "お知らせ", "プレス")
+    blocked = ("スタッフ", "紹介", "求人", "採用", "ニュース", "退任", "就任", "人事", "異動", "お知らせ", "プレス", "取引")
     url_bonus = 3 if source_url and any(seg in source_url for seg in ("/company", "/about", "/corporate")) else 0
     best = None
     best_score = float("-inf")

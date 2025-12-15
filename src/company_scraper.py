@@ -924,7 +924,7 @@ class CompanyScraper:
             return None
         if any(word in text for word in ("株式会社", "有限会社", "合名会社", "合資会社", "合同会社")):
             return None
-        for stop in ("創業", "創立", "創設", "メッセージ", "ご挨拶", "からの", "決裁", "沿革", "代表挨拶", "お問い合わせ", "お問合せ", "問合せ"):
+        for stop in ("創業", "創立", "創設", "メッセージ", "ご挨拶", "からの", "決裁", "沿革", "代表挨拶", "お問い合わせ", "お問合せ", "問合せ", "取引先", "主な取引"):
             if stop in text:
                 return None
         for stop in ("就任", "あいさつ", "ごあいさつ", "挨拶", "あいさつ文", "就任のご挨拶"):
@@ -2746,22 +2746,35 @@ class CompanyScraper:
                     return True, cleaned
             return False, ""
 
+        # 1行内のラベル:値（コロン/スペース区切り）を優先して抽出
+        for text in sequential_texts:
+            cleaned_line = text.replace("\u200b", "").strip()
+            if not cleaned_line or len(cleaned_line) > 80:
+                continue
+            m = re.match(r"^(.{1,20}?)[\s：:・…]+(.{1,80})$", cleaned_line)
+            if not m:
+                continue
+            label_candidate = m.group(1).strip()
+            value_candidate = m.group(2).strip()
+            is_label, normalized_label = _looks_like_label(label_candidate)
+            if not is_label:
+                continue
+            if not value_candidate or len(value_candidate) > 120:
+                continue
+            pair_values.append((normalized_label, value_candidate, False))
+
         for idx in range(len(sequential_texts) - 1):
             is_label, normalized = _looks_like_label(sequential_texts[idx])
             if not is_label:
                 continue
             value_text = ""
-            for j in range(idx + 1, len(sequential_texts)):
-                candidate = sequential_texts[j].replace("\u200b", "").strip()
-                if not candidate:
-                    continue
-                if candidate.startswith("・"):
-                    continue
-                looks_like_next, _ = _looks_like_label(candidate)
-                if looks_like_next:
-                    break
-                value_text = candidate
-                break
+            next_idx = idx + 1
+            if next_idx < len(sequential_texts):
+                candidate = sequential_texts[next_idx].replace("\u200b", "").strip()
+                if candidate and not candidate.startswith("・"):
+                    looks_like_next, _ = _looks_like_label(candidate)
+                    if not looks_like_next:
+                        value_text = candidate
             if not value_text or len(value_text) > 120:
                 continue
             pair_values.append((normalized, value_text, False))
