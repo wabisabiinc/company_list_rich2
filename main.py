@@ -267,6 +267,110 @@ def pick_best_address(expected_addr: str | None, candidates: list[str]) -> str |
             best = cand
     return best
 
+def pick_best_phone(candidates: list[str]) -> str | None:
+    best = None
+    for cand in candidates:
+        norm = normalize_phone(cand)
+        if not norm:
+            continue
+        # prefer standard 12-13 chars (including hyphens)
+        if best is None:
+            best = norm
+            continue
+        if len(norm) == len(best):
+            continue
+        # closer to 12 chars (e.g., 03-1234-5678) wins
+        if abs(len(norm) - 12) < abs(len(best) - 12):
+            best = norm
+    return best
+
+def pick_best_rep(names: list[str]) -> str | None:
+    role_keywords = ("代表", "取締役", "社長", "理事長", "会長", "院長", "学長", "園長", "代表社員")
+    blocked = ("スタッフ", "紹介", "求人", "採用", "ニュース")
+    best = None
+    best_score = float("-inf")
+    for raw in names:
+        if not raw:
+            continue
+        cleaned = str(raw).strip()
+        if not cleaned:
+            continue
+        score = len(cleaned)
+        if any(b in cleaned for b in blocked):
+            score -= 5
+        if any(k in cleaned for k in role_keywords):
+            score += 5
+        if score > best_score:
+            best_score = score
+            best = cleaned
+    return best
+
+def _score_amount_for_choice(val: str) -> int:
+    if not val:
+        return -10
+    # prefer larger units/longer numbers up to 20 chars
+    score = min(len(val), 20)
+    if "兆" in val:
+        score += 6
+    if "億" in val:
+        score += 4
+    if "万" in val:
+        score += 2
+    return score
+
+def pick_best_amount(candidates: list[str]) -> str | None:
+    best = None
+    best_score = float("-inf")
+    for cand in candidates:
+        cleaned = clean_amount_value(cand)
+        if not cleaned:
+            continue
+        score = _score_amount_for_choice(cleaned)
+        if score > best_score:
+            best_score = score
+            best = cleaned
+    return best
+
+def pick_best_listing(candidates: list[str]) -> str | None:
+    best = None
+    best_len = -1
+    for cand in candidates:
+        cleaned = clean_listing_value(cand)
+        if not cleaned:
+            continue
+        # prefer shorter market labels / 4-digit codes
+        if best is None or len(cleaned) < best_len:
+            best = cleaned
+            best_len = len(cleaned)
+    return best
+
+def select_relevant_paragraphs(text: str, limit: int = 3) -> str:
+    """
+    説明抽出用に、事業系キーワードを含む上位段落を抽出する。
+    入力テキスト全体をAIに渡さずに短縮し、時間を抑える。
+    """
+    if not text:
+        return ""
+    paragraphs = [p.strip() for p in re.split(r"[\r\n]+", text) if p.strip()]
+    if not paragraphs:
+        return ""
+    biz_keywords = (
+        "事業", "サービス", "製造", "開発", "販売", "提供", "運営", "支援",
+        "ソリューション", "product", "製品", "システム", "物流", "建設", "工事",
+        "コンサル", "研究", "技術", "教育", "医療", "食品", "エネルギー", "不動産",
+    )
+    scored: list[tuple[int, str]] = []
+    for para in paragraphs:
+        score = 0
+        for kw in biz_keywords:
+            if kw.lower() in para.lower():
+                score += 2
+        score += min(len(para), 200) // 50  # 長さで軽くスコア
+        scored.append((score, para))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top = [p for _, p in scored[:limit]]
+    return "\n".join(top)
+
 def clean_listing_value(val: str) -> str:
     text = (val or "").strip().replace("　", " ")
     if not text:
@@ -953,6 +1057,17 @@ async def process():
                     name_hit = bool(rule_details.get("name_present")) or domain_score >= 5
                     ai_judge = record.get("ai_judge")
                     flag_info = record.get("flag_info")
+                    # 社名トークンなし＆住所一致だけの候補は公式扱いしない
+                    if not host_token_hit and not name_hit and address_ok:
+                        manager.upsert_url_flag(
+                            normalized_url,
+                            is_official=False,
+                            source="rule",
+                            reason="address_only_no_name_host",
+                        )
+                        fallback_cands.append((record.get("url"), extracted))
+                        log.info("[%s] ホスト社名なし・名称一致なし・住所一致のみのため非公式扱い: %s", cid, record.get("url"))
+                        continue
                     if rule_details.get("blocked_host"):
                         manager.upsert_url_flag(
                             normalized_url,
@@ -1247,55 +1362,55 @@ async def process():
                     nonlocal description_val, need_description
 
                     cc = scraper.extract_candidates(pdata.get("text", ""), pdata.get("html", ""))
-                    if not rule_phone and cc.get("phone_numbers"):
-                        cand = normalize_phone(cc["phone_numbers"][0])
-                        if cand:
+                    if cc.get("phone_numbers"):
+                        cand = pick_best_phone(cc["phone_numbers"])
+                        if cand and not rule_phone:
                             rule_phone = cand
                             src_phone = url
-                    if not rule_address and cc.get("addresses"):
+                    if cc.get("addresses"):
                         cand_addr = pick_best_address(addr, cc["addresses"])
-                        if cand_addr:
+                        if cand_addr and not rule_address:
                             rule_address = cand_addr
                             src_addr = url
-                    if not rule_rep and cc.get("rep_names"):
-                        cand_rep = scraper.clean_rep_name(cc["rep_names"][0])
+                    if cc.get("rep_names"):
+                        cand_rep = pick_best_rep(cc["rep_names"])
+                        cand_rep = scraper.clean_rep_name(cand_rep) if cand_rep else None
                         if cand_rep:
-                            rule_rep = cand_rep
-                            src_rep = url
-                    if not listing_val and cc.get("listings"):
-                        candidate = (cc["listings"][0] or "").strip()
-                        cleaned_listing = clean_listing_value(candidate)
-                        if cleaned_listing:
-                            listing_val = cleaned_listing
+                            if not rule_rep or len(cand_rep) > len(rule_rep):
+                                rule_rep = cand_rep
+                                src_rep = url
+                    if cc.get("listings"):
+                        candidate = pick_best_listing(cc["listings"])
+                        if candidate and not listing_val:
+                            listing_val = candidate
                             need_listing = False
-                    if not capital_val and cc.get("capitals"):
-                        candidate = (cc["capitals"][0] or "").strip()
-                        cleaned_capital = clean_amount_value(candidate)
-                        if cleaned_capital:
-                            capital_val = cleaned_capital
+                    if cc.get("capitals"):
+                        candidate = pick_best_amount(cc["capitals"])
+                        if candidate and (not capital_val or len(candidate) > len(capital_val)):
+                            capital_val = candidate
                             need_capital = False
-                    if not revenue_val and cc.get("revenues"):
-                        candidate = (cc["revenues"][0] or "").strip()
-                        cleaned_revenue = clean_amount_value(candidate)
-                        if cleaned_revenue:
-                            revenue_val = cleaned_revenue
+                    if cc.get("revenues"):
+                        candidate = pick_best_amount(cc["revenues"])
+                        if candidate and (not revenue_val or len(candidate) > len(revenue_val)):
+                            revenue_val = candidate
                             need_revenue = False
-                    if not profit_val and cc.get("profits"):
-                        candidate = (cc["profits"][0] or "").strip()
-                        cleaned_profit = clean_amount_value(candidate)
-                        if cleaned_profit:
-                            profit_val = cleaned_profit
+                    if cc.get("profits"):
+                        candidate = pick_best_amount(cc["profits"])
+                        if candidate and (not profit_val or len(candidate) > len(profit_val)):
+                            profit_val = candidate
                             need_profit = False
-                    if not fiscal_val and cc.get("fiscal_months"):
+                    if cc.get("fiscal_months"):
                         cleaned_fiscal = clean_fiscal_month(cc["fiscal_months"][0] or "")
-                        if cleaned_fiscal:
+                        if cleaned_fiscal and not fiscal_val:
                             fiscal_val = cleaned_fiscal
                             need_fiscal = False
-                    if not founded_val and cc.get("founded_years"):
-                        cleaned_founded = clean_founded_year(cc["founded_years"][0] or "")
-                        if cleaned_founded:
-                            founded_val = cleaned_founded
-                            need_founded = False
+                    if cc.get("founded_years"):
+                        for cand in cc["founded_years"]:
+                            cleaned_founded = clean_founded_year(cand or "")
+                            if cleaned_founded and not founded_val:
+                                founded_val = cleaned_founded
+                                need_founded = False
+                                break
 
                 def refresh_need_flags() -> tuple[int, int]:
                     nonlocal need_phone, need_addr, need_rep
@@ -1419,9 +1534,9 @@ async def process():
                     fiscals = cands.get("fiscal_months") or []
                     founded_years = cands.get("founded_years") or []
 
-                    rule_phone = normalize_phone(phones[0]) if phones else None
+                    rule_phone = pick_best_phone(phones) if phones else None
                     rule_address = pick_best_address(addr, addrs) if addrs else None
-                    rule_rep = reps[0] if reps else None
+                    rule_rep = pick_best_rep(reps) if reps else None
                     rule_rep = scraper.clean_rep_name(rule_rep) if rule_rep else None
                     if rule_phone and not src_phone:
                         src_phone = info_url
@@ -1433,21 +1548,21 @@ async def process():
                         if not src_rep:
                             src_rep = info_url
                     if listings and not listing_val:
-                        cleaned_listing = clean_listing_value(listings[0] or "")
-                        if cleaned_listing:
-                            listing_val = cleaned_listing
+                        candidate = pick_best_listing(listings)
+                        if candidate:
+                            listing_val = candidate
                     if capitals and not capital_val:
-                        cleaned_capital = clean_amount_value(capitals[0] or "")
-                        if cleaned_capital:
-                            capital_val = cleaned_capital
+                        candidate = pick_best_amount(capitals)
+                        if candidate:
+                            capital_val = candidate
                     if revenues and not revenue_val:
-                        cleaned_revenue = clean_amount_value(revenues[0] or "")
-                        if cleaned_revenue:
-                            revenue_val = cleaned_revenue
+                        candidate = pick_best_amount(revenues)
+                        if candidate:
+                            revenue_val = candidate
                     if profits and not profit_val:
-                        cleaned_profit = clean_amount_value(profits[0] or "")
-                        if cleaned_profit:
-                            profit_val = cleaned_profit
+                        candidate = pick_best_amount(profits)
+                        if candidate:
+                            profit_val = candidate
                     if fiscals and not fiscal_val:
                         cleaned_fiscal = clean_fiscal_month(fiscals[0] or "")
                         if cleaned_fiscal:
@@ -1514,13 +1629,13 @@ async def process():
                     homepage
                     and USE_AI
                     and verifier is not None
-                    and (missing_contact > 0 or need_description)
                 )
                 if ai_needed and not timed_out:
                     ai_attempted = True
                     info_dict = await ensure_info_has_screenshot(scraper, info_url, info_dict, need_screenshot=OFFICIAL_AI_USE_SCREENSHOT)
                     info = info_dict
-                    ai_text_payload = build_ai_text_payload(info_dict.get("text", ""))
+                    desc_source_text = select_relevant_paragraphs(info_dict.get("text", ""))
+                    ai_text_payload = build_ai_text_payload(desc_source_text)
 
                     async def run_ai_verify():
                         nonlocal ai_time_spent
@@ -1601,7 +1716,7 @@ async def process():
                     ])
                     missing_fields = (provisional_contact_missing > 0) or (missing_extra >= 2)
                     if missing_fields:
-                        combined_sources = [v.get("text", "") or "" for v in priority_docs.values()]
+                        combined_sources = [select_relevant_paragraphs(v.get("text", "") or "") for v in priority_docs.values()]
                         combined_text = build_ai_text_payload(*combined_sources)
                         if combined_text.strip():
                             screenshot_payload = None
@@ -1730,7 +1845,7 @@ async def process():
                             html_content = data.get("html", "") or ""
                             cc = scraper.extract_candidates(text, html_content)
                             if need_phone and cc.get("phone_numbers"):
-                                cand = normalize_phone(cc["phone_numbers"][0])
+                                cand = pick_best_phone(cc["phone_numbers"])
                                 if cand:
                                     phone = cand
                                     phone_source = "rule"
@@ -1744,7 +1859,8 @@ async def process():
                                     src_addr = url
                                     need_addr = False
                             if need_rep and cc.get("rep_names"):
-                                cand_rep = scraper.clean_rep_name(cc["rep_names"][0])
+                                cand_rep = pick_best_rep(cc["rep_names"])
+                                cand_rep = scraper.clean_rep_name(cand_rep) if cand_rep else None
                                 if cand_rep:
                                     rep_name_val = cand_rep
                                     src_rep = url
@@ -1852,7 +1968,7 @@ async def process():
                 if not homepage and (not phone or not found_address or not rep_name_val):
                     for url, data in fallback_cands:
                         if not phone and data.get("phone_numbers"):
-                            cand = normalize_phone(data["phone_numbers"][0])
+                            cand = pick_best_phone(data["phone_numbers"])
                             if cand:
                                 phone = cand
                                 phone_source = "rule"
@@ -1864,7 +1980,8 @@ async def process():
                                 address_source = "rule"
                                 src_addr = url
                         if not rep_name_val and data.get("rep_names"):
-                            cand_rep = scraper.clean_rep_name(data["rep_names"][0])
+                            cand_rep = pick_best_rep(data["rep_names"])
+                            cand_rep = scraper.clean_rep_name(cand_rep) if cand_rep else None
                             if cand_rep:
                                 rep_name_val = cand_rep
                                 src_rep = url
@@ -1874,35 +1991,31 @@ async def process():
                 if not listing_val:
                     for url, data in fallback_cands:
                         values = data.get("listings") or []
-                        if values:
-                            cleaned_fallback_listing = clean_listing_value(values[0] or "")
-                            if cleaned_fallback_listing:
-                                listing_val = cleaned_fallback_listing
-                                break
+                        candidate = pick_best_listing(values)
+                        if candidate:
+                            listing_val = candidate
+                            break
                 if not capital_val:
                     for url, data in fallback_cands:
                         values = data.get("capitals") or []
-                        if values:
-                            cleaned_fallback_capital = clean_amount_value(values[0] or "")
-                            if cleaned_fallback_capital:
-                                capital_val = cleaned_fallback_capital
-                                break
+                        candidate = pick_best_amount(values)
+                        if candidate:
+                            capital_val = candidate
+                            break
                 if not revenue_val:
                     for url, data in fallback_cands:
                         values = data.get("revenues") or []
-                        if values:
-                            cleaned_fallback_revenue = clean_amount_value(values[0] or "")
-                            if cleaned_fallback_revenue:
-                                revenue_val = cleaned_fallback_revenue
-                                break
+                        candidate = pick_best_amount(values)
+                        if candidate:
+                            revenue_val = candidate
+                            break
                 if not profit_val:
                     for url, data in fallback_cands:
                         values = data.get("profits") or []
-                        if values:
-                            cleaned_fallback_profit = clean_amount_value(values[0] or "")
-                            if cleaned_fallback_profit:
-                                profit_val = cleaned_fallback_profit
-                                break
+                        candidate = pick_best_amount(values)
+                        if candidate:
+                            profit_val = candidate
+                            break
                 if not fiscal_val:
                     for url, data in fallback_cands:
                         values = data.get("fiscal_months") or []
@@ -1923,6 +2036,9 @@ async def process():
                 if found_address and not looks_like_address(found_address):
                     found_address = ""
                 normalized_found_address = normalize_address(found_address) if found_address else ""
+                if normalized_found_address and addr and not addr_compatible(addr, normalized_found_address):
+                    log.info("[%s] 住所不一致のため found_address を破棄: %s vs %s", cid, addr, normalized_found_address)
+                    normalized_found_address = ""
                 if not normalized_found_address and addr:
                     normalized_found_address = normalize_address(addr) or ""
                 rep_name_val = scraper.clean_rep_name(rep_name_val) or ""
