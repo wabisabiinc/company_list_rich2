@@ -273,33 +273,50 @@ def pick_best_phone(candidates: list[str]) -> str | None:
         norm = normalize_phone(cand)
         if not norm:
             continue
-        # prefer standard 12-13 chars (including hyphens)
+        is_table = isinstance(cand, str) and cand.startswith("[TABLE]")
+        norm_val = norm
+        # prefer non-navi numbers over 0120/0570
         if best is None:
-            best = norm
+            best = norm_val
             continue
-        if len(norm) == len(best):
+        if re.match(r"^(0120|0570)", norm_val) and not re.match(r"^(0120|0570)", best):
             continue
-        # closer to 12 chars (e.g., 03-1234-5678) wins
-        if abs(len(norm) - 12) < abs(len(best) - 12):
-            best = norm
+        if re.match(r"^(0120|0570)", best) and not re.match(r"^(0120|0570)", norm_val):
+            best = norm_val
+            continue
+        # prefer table-derived
+        if is_table and not (isinstance(best, str) and best.startswith("[TABLE]")):
+            best = norm_val
+            continue
+        # prefer standard 12-13 chars (including hyphens)
+        if len(norm_val) == len(best):
+            continue
+        if abs(len(norm_val) - 12) < abs(len(best) - 12):
+            best = norm_val
     return best
 
-def pick_best_rep(names: list[str]) -> str | None:
-    role_keywords = ("代表", "取締役", "社長", "理事長", "会長", "院長", "学長", "園長", "代表社員")
-    blocked = ("スタッフ", "紹介", "求人", "採用", "ニュース")
+def pick_best_rep(names: list[str], source_url: str | None = None) -> str | None:
+    role_keywords = ("代表", "取締役", "社長", "理事長", "会長", "院長", "学長", "園長", "代表社員", "CEO", "COO")
+    blocked = ("スタッフ", "紹介", "求人", "採用", "ニュース", "退任", "就任", "人事", "異動", "お知らせ", "プレス")
+    url_bonus = 3 if source_url and any(seg in source_url for seg in ("/company", "/about", "/corporate")) else 0
     best = None
     best_score = float("-inf")
     for raw in names:
         if not raw:
             continue
         cleaned = str(raw).strip()
+        is_table = cleaned.startswith("[TABLE]")
+        if is_table:
+            cleaned = cleaned.replace("[TABLE]", "", 1).strip()
         if not cleaned:
             continue
-        score = len(cleaned)
         if any(b in cleaned for b in blocked):
-            score -= 5
-        if any(k in cleaned for k in role_keywords):
+            continue
+        score = len(cleaned) + url_bonus
+        if is_table:
             score += 5
+        if any(k in cleaned for k in role_keywords):
+            score += 8
         if score > best_score:
             best_score = score
             best = cleaned
@@ -322,10 +339,17 @@ def pick_best_amount(candidates: list[str]) -> str | None:
     best = None
     best_score = float("-inf")
     for cand in candidates:
-        cleaned = clean_amount_value(cand)
+        is_table = False
+        value = cand
+        if isinstance(cand, str) and cand.startswith("[TABLE]"):
+            is_table = True
+            value = cand.replace("[TABLE]", "", 1)
+        cleaned = clean_amount_value(value)
         if not cleaned:
             continue
         score = _score_amount_for_choice(cleaned)
+        if is_table:
+            score += 3
         if score > best_score:
             best_score = score
             best = cleaned
@@ -335,13 +359,19 @@ def pick_best_listing(candidates: list[str]) -> str | None:
     best = None
     best_len = -1
     for cand in candidates:
-        cleaned = clean_listing_value(cand)
+        is_table = False
+        value = cand
+        if isinstance(cand, str) and cand.startswith("[TABLE]"):
+            is_table = True
+            value = cand.replace("[TABLE]", "", 1)
+        cleaned = clean_listing_value(value)
         if not cleaned:
             continue
         # prefer shorter market labels / 4-digit codes
-        if best is None or len(cleaned) < best_len:
+        effective_len = len(cleaned) - (2 if is_table else 0)
+        if best is None or effective_len < best_len:
             best = cleaned
-            best_len = len(cleaned)
+            best_len = effective_len
     return best
 
 def select_relevant_paragraphs(text: str, limit: int = 3) -> str:
@@ -1373,7 +1403,7 @@ async def process():
                             rule_address = cand_addr
                             src_addr = url
                     if cc.get("rep_names"):
-                        cand_rep = pick_best_rep(cc["rep_names"])
+                        cand_rep = pick_best_rep(cc["rep_names"], url)
                         cand_rep = scraper.clean_rep_name(cand_rep) if cand_rep else None
                         if cand_rep:
                             if not rule_rep or len(cand_rep) > len(rule_rep):
@@ -1536,7 +1566,7 @@ async def process():
 
                     rule_phone = pick_best_phone(phones) if phones else None
                     rule_address = pick_best_address(addr, addrs) if addrs else None
-                    rule_rep = pick_best_rep(reps) if reps else None
+                    rule_rep = pick_best_rep(reps, info_url) if reps else None
                     rule_rep = scraper.clean_rep_name(rule_rep) if rule_rep else None
                     if rule_phone and not src_phone:
                         src_phone = info_url
@@ -1858,13 +1888,13 @@ async def process():
                                     address_source = "rule"
                                     src_addr = url
                                     need_addr = False
-                            if need_rep and cc.get("rep_names"):
-                                cand_rep = pick_best_rep(cc["rep_names"])
-                                cand_rep = scraper.clean_rep_name(cand_rep) if cand_rep else None
-                                if cand_rep:
-                                    rep_name_val = cand_rep
-                                    src_rep = url
-                                    need_rep = False
+                    if need_rep and cc.get("rep_names"):
+                        cand_rep = pick_best_rep(cc["rep_names"], url)
+                        cand_rep = scraper.clean_rep_name(cand_rep) if cand_rep else None
+                        if cand_rep:
+                            rep_name_val = cand_rep
+                            src_rep = url
+                            need_rep = False
                             if need_description and cc.get("description"):
                                 desc = clean_description_value(cc["description"])
                                 if desc:
@@ -1980,7 +2010,7 @@ async def process():
                                 address_source = "rule"
                                 src_addr = url
                         if not rep_name_val and data.get("rep_names"):
-                            cand_rep = pick_best_rep(data["rep_names"])
+                            cand_rep = pick_best_rep(data["rep_names"], url)
                             cand_rep = scraper.clean_rep_name(cand_rep) if cand_rep else None
                             if cand_rep:
                                 rep_name_val = cand_rep

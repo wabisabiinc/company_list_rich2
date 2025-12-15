@@ -457,8 +457,9 @@ class CompanyScraper:
         self._pw = None
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
-        self.page_timeout_ms = int(os.getenv("PAGE_TIMEOUT_MS", "7000"))
-        self.slow_page_threshold_ms = int(os.getenv("SLOW_PAGE_THRESHOLD_MS", "7000"))
+        # ページ単位のタイムアウトを短めに（デフォルト6秒）
+        self.page_timeout_ms = int(os.getenv("PAGE_TIMEOUT_MS", "6000"))
+        self.slow_page_threshold_ms = int(os.getenv("SLOW_PAGE_THRESHOLD_MS", "6000"))
         self.skip_slow_hosts = os.getenv("SKIP_SLOW_HOSTS", "true").lower() == "true"
         self.slow_hosts: set[str] = set()
         self.slow_hosts_path = os.getenv("SLOW_HOSTS_PATH", "logs/slow_hosts.txt")
@@ -834,6 +835,9 @@ class CompanyScraper:
             return None
         text = str(raw).replace("\u200b", "").strip()
         if not text:
+            return None
+        news_words = ("退任", "就任", "人事", "異動", "お知らせ", "ニュース", "プレスリリース")
+        if any(w in text for w in news_words):
             return None
         # remove parentheses content
         text = re.sub(r"[（(][^）)]*[）)]", "", text)
@@ -2600,7 +2604,7 @@ class CompanyScraper:
             except Exception:
                 soup = None
             if soup:
-                pair_values: List[tuple[str, str]] = []
+                pair_values: List[tuple[str, str, bool]] = []  # (label, value, is_table_pair)
 
                 for table in soup.find_all("table"):
                     for row in table.find_all("tr"):
@@ -2610,7 +2614,7 @@ class CompanyScraper:
                         label = cells[0].get_text(separator=" ", strip=True)
                         value = cells[1].get_text(separator=" ", strip=True)
                         if label and value:
-                            pair_values.append((label, value))
+                            pair_values.append((label, value, True))
 
                 for dl in soup.find_all("dl"):
                     dts = dl.find_all("dt")
@@ -2619,7 +2623,7 @@ class CompanyScraper:
                         label = dt.get_text(separator=" ", strip=True)
                         value = dd.get_text(separator=" ", strip=True)
                         if label and value:
-                            pair_values.append((label, value))
+                            pair_values.append((label, value, True))
 
                 sequential_texts: List[str] = []
                 try:
@@ -2672,14 +2676,18 @@ class CompanyScraper:
                             break
                         value_text = candidate
                         break
-                    if not value_text or len(value_text) > 120:
-                        continue
-                    pair_values.append((normalized, value_text))
+                        if not value_text or len(value_text) > 120:
+                            continue
+                        pair_values.append((normalized, value_text, False))
 
-                for label, value in pair_values:
+                for label, value, is_table_pair in pair_values:
                     norm_label = label.replace("：", ":").strip()
                     raw_value = self._clean_text_value(value)
                     if not raw_value:
+                        continue
+                    # ニュース/人事系のラベルはスキップ
+                    label_block = ("退任", "就任", "人事", "異動", "お知らせ", "ニュース", "採用")
+                    if any(b in norm_label for b in label_block):
                         continue
                     matched = False
                     for field, keywords in TABLE_LABEL_MAP.items():
@@ -2687,36 +2695,36 @@ class CompanyScraper:
                             if field == "rep_names":
                                 cleaned = self.clean_rep_name(raw_value)
                                 if cleaned:
-                                    reps.append(cleaned)
+                                    reps.append(cleaned if not is_table_pair else f"[TABLE]{cleaned}")
                                     matched = True
                             elif field == "phone_numbers":
                                 for p in PHONE_RE.finditer(raw_value):
                                     cand = _normalize_phone_strict(f"{p.group(1)}-{p.group(2)}-{p.group(3)}")
                                     if cand:
-                                        phones.append(cand)
+                                        phones.append(cand if not is_table_pair else f"[TABLE]{cand}")
                                         matched = True
                             elif field == "addresses":
                                 norm_addr = self._normalize_address_candidate(raw_value)
                                 if norm_addr and self.looks_like_address(norm_addr):
-                                    addrs.append(norm_addr)
+                                    addrs.append(norm_addr if not is_table_pair else f"[TABLE]{norm_addr}")
                                     matched = True
                             elif field == "listing":
-                                listings.append(raw_value)
+                                listings.append(raw_value if not is_table_pair else f"[TABLE]{raw_value}")
                                 matched = True
                             elif field == "capitals":
                                 if self._is_amount_like(raw_value):
-                                    capitals.append(raw_value)
+                                    capitals.append(raw_value if not is_table_pair else f"[TABLE]{raw_value}")
                                     matched = True
                             elif field == "revenues":
                                 if self._is_amount_like(raw_value):
-                                    revenues.append(raw_value)
+                                    revenues.append(raw_value if not is_table_pair else f"[TABLE]{raw_value}")
                                     matched = True
                             elif field == "profits":
                                 if self._is_amount_like(raw_value):
-                                    profits.append(raw_value)
+                                    profits.append(raw_value if not is_table_pair else f"[TABLE]{raw_value}")
                                     matched = True
                             elif field == "fiscal_months":
-                                fiscal_months.append(raw_value)
+                                fiscal_months.append(raw_value if not is_table_pair else f"[TABLE]{raw_value}")
                                 matched = True
                             elif field == "founded_years":
                                 parsed = self._parse_founded_year(raw_value)
