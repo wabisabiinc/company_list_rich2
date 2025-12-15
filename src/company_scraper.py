@@ -161,7 +161,7 @@ def _normalize_phone_strict(raw: str) -> Optional[str]:
 ZIP_RE = re.compile(r"(〒?\s*\d{3})[-‐―－ー]?(\d{4})")
 ADDR_HINT = re.compile(r"(都|道|府|県).+?(市|区|郡|町|村)")
 ADDR_FALLBACK_RE = re.compile(
-    r"(〒\d{3}-\d{4}[^。\n]*|[一-龥]{2,3}[都道府県][^。\n]{0,120}[市区町村郡][^。\n]{0,140})"
+    r"(〒\d{3}-\d{4}[^\n。]{1,}|[一-龥]{2,3}[都道府県][^。\n]{0,120}[市区町村郡][^。\n]{0,140})"
 )
 CITY_RE = re.compile(r"([一-龥]{2,6}(?:市|区|町|村|郡))")
 _BINARY_EXTS = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx")
@@ -861,8 +861,12 @@ class CompanyScraper:
         s = text.strip()
         if not s:
             return False
-        if ZIP_RE.search(s):
-            return True
+        m = ZIP_RE.search(s)
+        if m:
+            # 郵便番号以外の本体が十分あるか確認
+            body = s[m.end():].strip()
+            if len(body) >= 1:
+                return True
         pref = CompanyScraper._extract_prefecture(s)
         city = CompanyScraper._extract_city(s)
         return bool(pref and city)
@@ -1021,6 +1025,14 @@ class CompanyScraper:
                         ratio = 0.0
                     if ratio >= 0.75:
                         return True
+                # 会社名ローマ字に施設種別が付いているだけのケースを許容（例: umezono + ryokan）
+                if (
+                    len(token) >= 4
+                    and len(dt) >= 4
+                    and dt not in generic_tokens
+                    and (token.startswith(dt) or dt.startswith(token))
+                ):
+                    return True
         return False
 
     def _domain_score(self, company_tokens: List[str], url: str) -> int:
@@ -2641,6 +2653,8 @@ class CompanyScraper:
                 if not body_parts and idx > 0:
                     body_parts.append(lines[idx - 1])  # 前行も一応参照
                 body = " ".join(body_parts).strip()
+                if not body:
+                    continue
                 cand_addr = f"{zip_code} {body}".strip()
                 norm = self._normalize_address_candidate(cand_addr)
                 if norm and self._looks_like_full_address(norm):

@@ -187,6 +187,9 @@ def normalize_address(s: str | None) -> str | None:
     m = re.search(r"(\d{3}-\d{4})\s*(.*)", s)
     if m:
         body = m.group(2).strip()
+        # 郵便番号だけの場合は住所とみなさない
+        if not body:
+            return None
         return f"〒{m.group(1)} {body}"
     return s if s else None
 
@@ -1411,11 +1414,21 @@ async def process():
                         if normalized_url and domain_score == 0:
                             domain_score = scraper._domain_score(company_tokens, normalized_url)  # type: ignore
                             record["domain_score"] = domain_score
+                        host_token_hit = bool(record.get("host_token_hit"))
+                        name_present = bool(rule_details.get("name_present"))
                         strong_domain_host = bool(record.get("strong_domain_host"))
                         addr_hit = bool(rule_details.get("address_match"))
                         pref_hit = bool(rule_details.get("prefecture_match"))
                         zip_hit = bool(rule_details.get("postal_code_match"))
                         address_ok = (not addr) or addr_hit or pref_hit or zip_hit
+                        allow_without_host = (
+                            strong_domain_host
+                            or name_present
+                            or domain_score >= 4
+                            or (address_ok and domain_score >= 3)
+                        )
+                        if not host_token_hit and not allow_without_host:
+                            continue
                         score = (
                             domain_score * 2
                             + (3 if address_ok else 0)
@@ -1439,13 +1452,29 @@ async def process():
                         pref_hit = bool(rule_details.get("prefecture_match"))
                         zip_hit = bool(rule_details.get("postal_code_match"))
                         address_ok = addr_hit or pref_hit or zip_hit
+                        provisional_host_token = bool(best_record.get("host_token_hit"))
+                        provisional_name_present = name_present
+                        allow_without_host = (
+                            provisional_name_present
+                            or strong_domain_host
+                            or domain_score >= 4
+                            or (address_ok and domain_score >= 3)
+                        )
+                        # 完全に根拠が無い暫定URLのみ破棄
+                        if not provisional_host_token and not allow_without_host:
+                            log.info("[%s] 社名トークン/名称/強ドメイン/住所一致なしのため暫定URL候補を破棄: %s", cid, normalized_url)
+                            best_record = None
+                            provisional_homepage = ""
+                            provisional_info = None
+                            provisional_cands = {}
+                            provisional_domain_score = 0
+                            provisional_address_ok = False
+                            break
                         # 公式昇格の予備候補だが保存はしない。強条件のみ後で昇格。
                         provisional_homepage = normalized_url
                         provisional_info = best_record.get("info")
                         provisional_cands = best_record.get("extracted") or {}
                         provisional_domain_score = domain_score
-                        provisional_host_token = bool(best_record.get("host_token_hit"))
-                        provisional_name_present = name_present
                         provisional_address_ok = address_ok
                         # ログだけ出して深掘りターゲットとする
                         log.info("[%s] 公式未確定のため暫定URLで深掘り: %s (domain_score=%s name=%s addr=%s host_token=%s)",
@@ -1474,7 +1503,13 @@ async def process():
                         pref_hit = bool(rule_details.get("prefecture_match"))
                         zip_hit = bool(rule_details.get("postal_code_match"))
                         address_ok = addr_hit or pref_hit or zip_hit
-                        if host_token_hit or domain_score >= 2 or name_present or strong_domain or address_ok:
+                        allow_without_host = (
+                            name_present
+                            or strong_domain_host
+                            or domain_score >= 4
+                            or (address_ok and domain_score >= 3)
+                        )
+                        if (host_token_hit or allow_without_host) and (host_token_hit or domain_score >= 2 or name_present or strong_domain or address_ok):
                             log.info("[%s] タイムアウトで暫定公式として保存: %s", cid, normalized_url)
                             homepage = normalized_url
                             info = best_record.get("info")
