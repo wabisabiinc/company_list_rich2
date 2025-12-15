@@ -5,7 +5,10 @@ import sqlite3
 import time
 import urllib.parse
 import re
+import logging
 from typing import Iterable, Optional, Dict, Any
+
+log = logging.getLogger(__name__)
 
 
 class DatabaseManager:
@@ -18,7 +21,7 @@ class DatabaseManager:
         * WAL + synchronous=NORMAL
         * 古い running を TTL で自動回収（RUNNING_TTL_MIN, 既定30分）
     """
-    def __init__(self, db_path: str = "data/companies.db", csv_path: Optional[str] = None, claim_order: Optional[str] = None):
+    def __init__(self, db_path: str = "data/companies.db", csv_path: Optional[str] = None, claim_order: Optional[str] = None, worker_id: Optional[str] = None):
         os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
         if csv_path:
             os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
@@ -32,6 +35,7 @@ class DatabaseManager:
         )
         self.conn.row_factory = sqlite3.Row
         self.cur = self.conn.cursor()
+        self.worker_id = worker_id
 
         # PRAGMA は接続毎に適用
         self._configure_pragmas()
@@ -46,9 +50,11 @@ class DatabaseManager:
         retry_statuses_env = os.getenv("RETRY_STATUSES", "review,no_homepage")
         self.retry_statuses: list[str] = [s.strip() for s in retry_statuses_env.split(",") if s.strip()]
         self._schema_columns: set[str] = set()
+        self.lock_mismatch_count = 0
 
         # ★ 初期化はロック競合が起きやすいので安全にリトライ
         self._ensure_schema_with_retry()
+        self._ensure_indexes()
         self._refresh_schema_columns()
 
         # CSV の重複書き出し防止用キャッシュ
@@ -198,39 +204,19 @@ class DatabaseManager:
         if "last_checked_at" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN last_checked_at TEXT;")
             cols.add("last_checked_at")
-        if "error_code" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN error_code TEXT;")
-            cols.add("error_code")
-        if "hubspot_id" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN hubspot_id TEXT;")
-            cols.add("hubspot_id")
-        if "corporate_number" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN corporate_number TEXT;")
-            cols.add("corporate_number")
-        if "corporate_number_norm" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN corporate_number_norm TEXT;")
-            cols.add("corporate_number_norm")
-        if "source_csv" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN source_csv TEXT;")
-            cols.add("source_csv")
-        if "reference_homepage" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN reference_homepage TEXT;")
-            cols.add("reference_homepage")
-        if "reference_phone" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN reference_phone TEXT;")
-            cols.add("reference_phone")
-        if "reference_address" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN reference_address TEXT;")
-            cols.add("reference_address")
-        if "accuracy_homepage" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN accuracy_homepage TEXT;")
-            cols.add("accuracy_homepage")
-        if "accuracy_phone" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN accuracy_phone TEXT;")
-            cols.add("accuracy_phone")
-        if "accuracy_address" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN accuracy_address TEXT;")
-            cols.add("accuracy_address")
+
+    def _ensure_indexes(self) -> None:
+        cols = self._get_table_columns()
+        try:
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_companies_status_locked_at ON companies(status, locked_at);"
+            )
+            self.conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_companies_locked_by ON companies(locked_by);"
+            )
+        except sqlite3.DatabaseError:
+            # 古いSQLiteなどで失敗しても致命ではない
+            pass
         if "homepage_official_flag" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN homepage_official_flag INTEGER;")
             cols.add("homepage_official_flag")
@@ -547,6 +533,8 @@ class DatabaseManager:
             s = (raw or "").strip().replace("　", " ")
             if not s:
                 return ""
+            s = re.sub(r"<[^>]+>", " ", s)
+            s = re.sub(r"[\x00-\x1f\x7f]", " ", s)
             s = s.translate(str.maketrans("０１２３４５６７８９－ー―‐／", "0123456789----/"))
             s = re.sub(r"\s+", " ", s)
             s = s.replace("〒 ", "〒").replace("〒", "〒")
@@ -598,16 +586,41 @@ class DatabaseManager:
         if "locked_at" in cols:
             updates.append("locked_at = NULL")
 
-        sql = f"UPDATE companies SET {', '.join(updates)} WHERE id = ?"
-        params.append(company["id"])
+        where_clause = "id = ?"
+        where_params: list[Any] = [company["id"]]
+        if self.worker_id:
+            where_clause += " AND (locked_by IS NULL OR locked_by = ?)"
+            where_params.append(self.worker_id)
+
+        sql = f"UPDATE companies SET {', '.join(updates)} WHERE {where_clause}"
+        params.extend(where_params)
         self.cur.execute(sql, params)
+        if self.cur.rowcount == 0:
+            self.lock_mismatch_count += 1
+            log.warning("DB update skipped (lock mismatch?) id=%s worker=%s", company["id"], self.worker_id)
+            try:
+                self.conn.execute(
+                    "UPDATE companies SET status='review', locked_by=NULL, locked_at=NULL WHERE id=?",
+                    (company["id"],),
+                )
+                self._commit_with_checkpoint()
+            except Exception:
+                pass
+            return
         self._commit_with_checkpoint()
         import logging as _l; _l.info(f"DB_WRITE_OK id={company['id']} status={status}")
 
-        # 住所が入力側で粗い場合に、スクレイプで得た詳細住所を address に昇格させる
-        # Promote found_address to address when it is more detailed
+        # 住所が入力側で粗い場合に、スクレイプで得た詳細住所を address に昇格させる（公式度が高い場合のみ）
+        # Promote found_address to address when it is more detailed and official enough
         try:
             if "found_address" in cols and "address" in cols:
+                strong_official = bool(
+                    (company.get("homepage_official_flag") == 1)
+                    and float(company.get("homepage_official_score") or 0.0) >= 4.0
+                )
+                addr_source = (company.get("address_source") or "").lower()
+                if not strong_official and addr_source not in {"official", "rule"}:
+                    return
                 raw_addr = (company.get("address") or "").strip()
                 found_addr = found_addr_clean or ""
                 if found_addr:
@@ -661,20 +674,48 @@ class DatabaseManager:
         self._csv_written_ids.add(cid)
 
     def update_status(self, company_id: int, status: str) -> None:
-        self.cur.execute(
-            "UPDATE companies SET status=?, locked_by=NULL, locked_at=NULL WHERE id=?",
-            (status, company_id),
-        )
+        sql = "UPDATE companies SET status=?, locked_by=NULL, locked_at=NULL WHERE id=?"
+        params: list[Any] = [status, company_id]
+        if self.worker_id:
+            sql += " AND (locked_by IS NULL OR locked_by = ?)"
+            params.append(self.worker_id)
+        self.cur.execute(sql, params)
+        if self.cur.rowcount == 0:
+            self.lock_mismatch_count += 1
+            log.warning("update_status skipped (lock mismatch?) id=%s worker=%s", company_id, self.worker_id)
+            try:
+                self.conn.execute(
+                    "UPDATE companies SET status='review', locked_by=NULL, locked_at=NULL WHERE id=?",
+                    (company_id,),
+                )
+                self._commit_with_checkpoint()
+            except Exception:
+                pass
+            return
         self._commit_with_checkpoint()
 
     def mark_error(self, company_id: int, error_code: str = "") -> None:
         """
         status を error に更新するヘルパー（既存呼び出し互換のため任意利用）。
         """
-        self.cur.execute(
-            "UPDATE companies SET status='error', error_code=?, locked_by=NULL, locked_at=NULL WHERE id=?",
-            (error_code, company_id),
-        )
+        sql = "UPDATE companies SET status='error', error_code=?, locked_by=NULL, locked_at=NULL WHERE id=?"
+        params: list[Any] = [error_code, company_id]
+        if self.worker_id:
+            sql += " AND (locked_by IS NULL OR locked_by = ?)"
+            params.append(self.worker_id)
+        self.cur.execute(sql, params)
+        if self.cur.rowcount == 0:
+            self.lock_mismatch_count += 1
+            log.warning("mark_error skipped (lock mismatch?) id=%s worker=%s", company_id, self.worker_id)
+            try:
+                self.conn.execute(
+                    "UPDATE companies SET status='review', error_code=?, locked_by=NULL, locked_at=NULL WHERE id=?",
+                    (error_code, company_id),
+                )
+                self._commit_with_checkpoint()
+            except Exception:
+                pass
+            return
         self._commit_with_checkpoint()
 
     def insert_company(self, company_data: Dict[str, Any]) -> None:
@@ -706,3 +747,5 @@ class DatabaseManager:
             self.cur.close()
         finally:
             self.conn.close()
+        if self.lock_mismatch_count > 0:
+            log.info("lock_mismatch_count=%s", self.lock_mismatch_count)

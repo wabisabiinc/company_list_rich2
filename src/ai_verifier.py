@@ -23,6 +23,7 @@ USE_AI: bool = _getenv_bool("USE_AI", False)
 API_KEY: str = (os.getenv("GEMINI_API_KEY") or "").strip()
 DEFAULT_MODEL: str = (os.getenv("GEMINI_MODEL") or "gemini-2.5-flash-lite").strip()
 AI_CONTEXT_PATH: str = os.getenv("AI_CONTEXT_PATH", "docs/ai_context.md")
+AI_DESCRIPTION_MAX_LEN = int(os.getenv("AI_DESCRIPTION_MAX_LEN", "140"))
 
 # ---- deps -------------------------------------------------------
 try:
@@ -261,6 +262,33 @@ class AIVerifier:
             f"# 本文テキスト抜粋\n{snippet}\n"
         )
 
+    def _build_description_prompt(self, text: str, company_name: str = "", address: str = "") -> str:
+        snippet = _shorten_text(text or "", max_len=3500)
+        return (
+            "あなたは企業サイトから事業内容だけを1文で要約する専門家です。問い合わせ・採用・アクセス・代表者情報は除外し、事業内容のみを60〜120文字で日本語1文にまとめてください。JSONのみ返してください。\n"
+            "{\n"
+            '  "description": "〇〇を行う企業です" または null\n'
+            "}\n"
+            f"対象企業: {company_name or '不明'} / 入力住所: {address or '不明'}\n"
+            "禁止: URL, メール, 電話番号, 住所, 募集/採用/問い合わせ/アクセス情報, 記号の羅列。\n"
+            f"# 本文テキスト抜粋\n{snippet}\n"
+        )
+
+    @staticmethod
+    def _validate_description(desc: Optional[str]) -> Optional[str]:
+        if not desc:
+            return None
+        if "http://" in desc or "https://" in desc or "＠" in desc or "@" in desc:
+            return None
+        desc = re.sub(r"\s+", " ", desc.strip())
+        if len(desc) < 20 or len(desc) > AI_DESCRIPTION_MAX_LEN:
+            return None
+        if not re.search(r"[ぁ-んァ-ン一-龥]", desc):
+            return None
+        if re.search(r"[\x00-\x1f\x7f]", desc):
+            return None
+        return desc
+
     async def verify_info(self, text: str, screenshot: bytes, company_name: str, address: str) -> Optional[Dict[str, Any]]:
         if not self.model:
             log.error(f"No model initialized for {company_name} ({address})")
@@ -317,6 +345,35 @@ class AIVerifier:
             else:
                 description = None
 
+            # -------- AI結果バリデーション --------
+            def _looks_like_address(a: str) -> bool:
+                if not a:
+                    return False
+                if "<" in a or ">" in a:
+                    return False
+                has_zip = bool(re.search(r"\d{3}-\d{4}", a))
+                has_pref_city = bool(re.search(r"(都|道|府|県).+?(市|区|郡|町|村)", a))
+                return has_zip or has_pref_city
+
+            def _clean_desc(desc: Optional[str]) -> Optional[str]:
+                if not desc:
+                    return None
+                if "http://" in desc or "https://" in desc:
+                    return None
+                if not re.search(r"[ぁ-んァ-ン一-龥a-zA-Z]", desc):
+                    return None
+                if len(desc) < 12:
+                    return None
+                return desc
+
+            if addr and not _looks_like_address(addr):
+                addr = None
+            description = _clean_desc(description)
+            if rep_name:
+                rep_name = re.sub(r"[\x00-\x1f\x7f]", " ", rep_name).strip()
+                if not re.search(r"[ぁ-んァ-ン一-龥a-zA-Z]", rep_name):
+                    rep_name = None
+
             homepage_url = result.get("homepage_url")
             if isinstance(homepage_url, str):
                 homepage_url = homepage_url.strip() or None
@@ -327,6 +384,10 @@ class AIVerifier:
                 ref = self.listoss_data.get(company_key)
                 if ref:
                     homepage_url = (ref.get("hp") or "").strip() or None
+
+            if not any([phone, addr, rep_name, description, homepage_url]):
+                log.warning("AI result rejected: no valid fields after validation")
+                return None
 
             out: Dict[str, Any] = {
                 "phone_number": phone,
@@ -354,6 +415,37 @@ class AIVerifier:
                 return None
             raw = _resp_text(resp)
             return _extract_first_json(raw) or None
+
+    async def generate_description(self, text: str, screenshot: bytes, company_name: str, address: str) -> Optional[str]:
+        if not self.model:
+            return None
+
+        prompt = self._build_description_prompt(text, company_name, address)
+        payload: list[Any] = [prompt]
+        if screenshot:
+            try:
+                b64 = base64.b64encode(screenshot).decode("utf-8")
+                payload.append({"inline_data": {"mime_type": "image/png", "data": b64}})
+            except Exception:
+                pass
+
+        try:
+            resp = await self.model.generate_content_async(payload, safety_settings=None)  # type: ignore
+        except TypeError:
+            resp = await self.model.generate_content_async(payload)  # type: ignore
+        except Exception:
+            return None
+
+        raw = _resp_text(resp)
+        data = _extract_first_json(raw)
+        if not isinstance(data, dict):
+            return None
+        desc = data.get("description")
+        if isinstance(desc, str):
+            desc = self._validate_description(desc)
+        else:
+            desc = None
+        return desc
 
     async def judge_official_homepage(
         self,

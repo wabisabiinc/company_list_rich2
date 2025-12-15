@@ -52,6 +52,8 @@ REFERENCE_CSVS = [p.strip() for p in os.getenv("REFERENCE_CSVS", "").split(",") 
 FETCH_CONCURRENCY = max(1, int(os.getenv("FETCH_CONCURRENCY", "3")))
 PROFILE_FETCH_CONCURRENCY = max(1, int(os.getenv("PROFILE_FETCH_CONCURRENCY", "3")))
 SEARCH_CANDIDATE_LIMIT = max(1, int(os.getenv("SEARCH_CANDIDATE_LIMIT", "3")))
+# 検索フェーズ全体の早期タイムアウト（0で無効）
+SEARCH_PHASE_TIMEOUT_SEC = float(os.getenv("SEARCH_PHASE_TIMEOUT_SEC", "30"))
 # 深掘りページ/ホップを環境変数で制御（デフォルトは軽め）
 RELATED_BASE_PAGES = max(0, int(os.getenv("RELATED_BASE_PAGES", "1")))
 RELATED_EXTRA_PHONE = max(0, int(os.getenv("RELATED_EXTRA_PHONE", "1")))
@@ -64,7 +66,10 @@ TIME_LIMIT_WITH_OFFICIAL = float(os.getenv("TIME_LIMIT_WITH_OFFICIAL", "30"))  #
 TIME_LIMIT_DEEP = float(os.getenv("TIME_LIMIT_DEEP", "30"))  # 深掘り専用の上限（公式確定後）（0で無効）
 # 全体のハード上限（デフォルト60秒で次ジョブへスキップ）
 GLOBAL_HARD_TIMEOUT_SEC = float(os.getenv("GLOBAL_HARD_TIMEOUT_SEC", "60"))
+# 単社処理のハード上限（candidate取得で固まるのを避けるための保険、0で無効）
+COMPANY_HARD_TIMEOUT_SEC = float(os.getenv("COMPANY_HARD_TIMEOUT_SEC", "60"))
 OFFICIAL_AI_USE_SCREENSHOT = os.getenv("OFFICIAL_AI_USE_SCREENSHOT", "true").lower() == "true"
+AI_ADDRESS_ENABLED = os.getenv("AI_ADDRESS_ENABLED", "false").lower() == "true"
 SECOND_PASS_ENABLED = os.getenv("SECOND_PASS_ENABLED", "false").lower() == "true"
 SECOND_PASS_RETRY_STATUSES = [s.strip() for s in os.getenv("SECOND_PASS_RETRY_STATUSES", "review,no_homepage,error").split(",") if s.strip()]
 LONG_PAGE_TIMEOUT_MS = int(os.getenv("LONG_PAGE_TIMEOUT_MS", os.getenv("PAGE_TIMEOUT_MS", "9000")))
@@ -115,6 +120,8 @@ DESCRIPTION_BIZ_KEYWORDS = (
     "product", "製品", "プロダクト", "システム", "プラント", "加工", "レンタル", "運送",
     "IT", "デジタル", "ITソリューション", "プロジェクト", "アウトソーシング", "研究", "技術",
     "人材", "教育", "ヘルスケア", "医療", "食品", "エネルギー", "不動産", "金融", "EC", "通販",
+    "プラットフォーム", "クラウド", "SaaS", "DX", "AI", "データ分析", "セキュリティ", "インフラ",
+    "基盤", "ソフトウェア", "ハードウェア", "ロボット", "IoT", "モビリティ", "物流DX",
 )
 
 # --------------------------------------------------
@@ -142,6 +149,7 @@ def normalize_address(s: str | None) -> str | None:
     if not s:
         return None
     s = s.strip().replace("　", " ")
+    s = re.sub(r"<[^>]+>", " ", s)
     # 全角英数字・記号を半角に寄せる
     s = s.translate(str.maketrans("０１２３４５６７８９－ー―‐／", "0123456789----/"))
     # 漢数字を簡易的に算用数字へ
@@ -173,6 +181,21 @@ def normalize_address(s: str | None) -> str | None:
         body = m.group(2).strip()
         return f"〒{m.group(1)} {body}"
     return s if s else None
+
+
+def sanitize_text_block(text: str | None) -> str:
+    """
+    軽量なサニタイズ: HTMLタグ除去・制御文字除去・空白圧縮。
+    住所や説明など、DBに入れる前に通してノイズを落とす。
+    """
+    if not text:
+        return ""
+    t = html_mod.unescape(str(text))
+    t = re.sub(r"<[^>]+>", " ", t)
+    t = re.sub(r"[\r\n\t]+", " ", t)
+    t = re.sub(r"[\x00-\x1f\x7f]", " ", t)
+    t = re.sub(r"\s+", " ", t)
+    return t.strip()
 
 
 def looks_like_address(text: str | None) -> bool:
@@ -795,7 +818,7 @@ async def process():
             log.warning("scraper.start() はスキップ（未実装または失敗）", exc_info=True)
 
     verifier = AIVerifier() if USE_AI else None
-    manager = DatabaseManager()
+    manager = DatabaseManager(worker_id=WORKER_ID)
 
     csv_file = None
     csv_writer = None
@@ -884,7 +907,49 @@ async def process():
             try:
                 candidate_limit = SEARCH_CANDIDATE_LIMIT
                 company_tokens = scraper._company_tokens(name)  # type: ignore
-                urls = await scraper.search_company(name, addr, num_results=candidate_limit)
+                try:
+                    if SEARCH_PHASE_TIMEOUT_SEC > 0:
+                        urls = await asyncio.wait_for(
+                            scraper.search_company(name, addr, num_results=candidate_limit),
+                            timeout=SEARCH_PHASE_TIMEOUT_SEC,
+                        )
+                    else:
+                        urls = await scraper.search_company(name, addr, num_results=candidate_limit)
+                except asyncio.TimeoutError:
+                    log.info(
+                        "[%s] search_company timeout (%.1fs) -> review",
+                        cid,
+                        SEARCH_PHASE_TIMEOUT_SEC,
+                    )
+                    company.update({
+                        "homepage": "",
+                        "phone": "",
+                        "found_address": "",
+                        "rep_name": company.get("rep_name", "") or "",
+                        "description": company.get("description", "") or "",
+                        "listing": company.get("listing", "") or "",
+                        "revenue": company.get("revenue", "") or "",
+                        "profit": company.get("profit", "") or "",
+                        "capital": company.get("capital", "") or "",
+                        "fiscal_month": company.get("fiscal_month", "") or "",
+                        "founded_year": company.get("founded_year", "") or "",
+                        "homepage_official_flag": 0,
+                        "homepage_official_source": "",
+                        "homepage_official_score": 0.0,
+                        "error_code": "search_timeout",
+                    })
+                    manager.save_company_data(company, status="review")
+                    if csv_writer:
+                        csv_writer.writerow({k: company.get(k, "") for k in CSV_FIELDNAMES})
+                        csv_file.flush()
+                    processed += 1
+                    try:
+                        await scraper.reset_context()
+                    except Exception:
+                        pass
+                    if SLEEP_BETWEEN_SEC > 0:
+                        await asyncio.sleep(jittered_seconds(SLEEP_BETWEEN_SEC, JITTER_RATIO))
+                    continue
                 url_flags_map, host_flags_map = manager.get_url_flags_batch(urls)
                 homepage = ""
                 info = None
@@ -914,7 +979,17 @@ async def process():
                         log.info("[%s] 既知の非公式URLを除外: %s (domain_score=%s)", cid, candidate, domain_score_for_flag)
                         return None
                     async with fetch_sem:
-                        candidate_info = await scraper.get_page_info(candidate)
+                        try:
+                            if COMPANY_HARD_TIMEOUT_SEC > 0:
+                                candidate_info = await asyncio.wait_for(
+                                    scraper.get_page_info(candidate),
+                                    timeout=COMPANY_HARD_TIMEOUT_SEC,
+                                )
+                            else:
+                                candidate_info = await scraper.get_page_info(candidate)
+                        except asyncio.TimeoutError:
+                            log.info("[%s] get_page_info timeout -> skip candidate: %s", cid, candidate)
+                            return None
                     candidate_text = candidate_info.get("text", "") or ""
                     candidate_html = candidate_info.get("html") or ""
                     extracted = scraper.extract_candidates(candidate_text, candidate_html)
@@ -943,7 +1018,48 @@ async def process():
                 ]
                 candidate_records: list[dict[str, Any]] = []
                 if prepare_tasks:
-                    prepared = await asyncio.gather(*prepare_tasks, return_exceptions=True)
+                    try:
+                        if SEARCH_PHASE_TIMEOUT_SEC > 0:
+                            prepared = await asyncio.wait_for(
+                                asyncio.gather(*prepare_tasks, return_exceptions=True),
+                                timeout=SEARCH_PHASE_TIMEOUT_SEC,
+                            )
+                        else:
+                            prepared = await asyncio.gather(*prepare_tasks, return_exceptions=True)
+                    except asyncio.TimeoutError:
+                        for t in prepare_tasks:
+                            t.cancel()
+                        await asyncio.gather(*prepare_tasks, return_exceptions=True)
+                        log.info("[%s] prepare_candidate timeout -> review/search_timeout", cid)
+                        company.update({
+                            "homepage": "",
+                            "phone": "",
+                            "found_address": "",
+                            "rep_name": company.get("rep_name", "") or "",
+                            "description": company.get("description", "") or "",
+                            "listing": company.get("listing", "") or "",
+                            "revenue": company.get("revenue", "") or "",
+                            "profit": company.get("profit", "") or "",
+                            "capital": company.get("capital", "") or "",
+                            "fiscal_month": company.get("fiscal_month", "") or "",
+                            "founded_year": company.get("founded_year", "") or "",
+                            "homepage_official_flag": 0,
+                            "homepage_official_source": "",
+                            "homepage_official_score": 0.0,
+                            "error_code": "search_timeout",
+                        })
+                        manager.save_company_data(company, status="review")
+                        if csv_writer:
+                            csv_writer.writerow({k: company.get(k, "") for k in CSV_FIELDNAMES})
+                            csv_file.flush()
+                        processed += 1
+                        try:
+                            await scraper.reset_context()
+                        except Exception:
+                            pass
+                        if SLEEP_BETWEEN_SEC > 0:
+                            await asyncio.sleep(jittered_seconds(SLEEP_BETWEEN_SEC, JITTER_RATIO))
+                        continue
                     ordered: list[tuple[int, dict[str, Any]]] = []
                     for result in prepared:
                         if isinstance(result, Exception) or not result:
@@ -1689,6 +1805,7 @@ async def process():
                 ai_phone: str | None = None
                 ai_addr: str | None = None
                 ai_rep: str | None = None
+                ai_desc: str | None = None
                 if ai_task:
                     ai_result = await ai_task
                 elif ai_needed and info_url and verifier is not None and USE_AI and not timed_out:
@@ -1706,31 +1823,34 @@ async def process():
                         ai_attempted = True
                     except Exception:
                         ai_result = None
-                if ai_result:
-                    ai_used = 1
-                    ai_model = AI_MODEL_NAME
-                    ai_phone = normalize_phone(ai_result.get("phone_number"))
-                    ai_addr = normalize_address(ai_result.get("address"))
-                    ai_rep = ai_result.get("rep_name") or ai_result.get("representative")
-                    ai_rep = scraper.clean_rep_name(ai_rep) if ai_rep else None
-                    description = ai_result.get("description")
-                    if isinstance(description, str) and description.strip():
-                        update_description_candidate(description)
+                    if ai_result:
+                        ai_used = 1
+                        ai_model = AI_MODEL_NAME
+                        ai_phone = normalize_phone(ai_result.get("phone_number"))
+                        if AI_ADDRESS_ENABLED:
+                            ai_addr = normalize_address(ai_result.get("address"))
+                        ai_rep = ai_result.get("rep_name") or ai_result.get("representative")
+                        ai_rep = scraper.clean_rep_name(ai_rep) if ai_rep else None
+                        description = ai_result.get("description")
+                        if isinstance(description, str) and description.strip():
+                            update_description_candidate(description)
                 else:
                     if ai_attempted and AI_COOLDOWN_SEC > 0:
                         await asyncio.sleep(jittered_seconds(AI_COOLDOWN_SEC, JITTER_RATIO))
                 missing_contact, missing_extra = refresh_need_flags()
-                if need_description:
-                    payloads: list[dict[str, Any]] = []
-                    if info_dict:
-                        payloads.append(info_dict)
-                    payloads.extend(priority_docs.values())
-                    for pdata in payloads:
-                        desc = extract_description_from_payload(pdata)
-                        if desc:
-                            description_val = desc
-                            need_description = False
-                            break
+                if need_description and verifier is not None and info_dict and not timed_out:
+                    desc_source = select_relevant_paragraphs(info_dict.get("text", "") or "")
+                    ai_desc = await verifier.generate_description(
+                        build_ai_text_payload(desc_source),
+                        info_dict.get("screenshot"),
+                        name,
+                        addr,
+                    )
+                    if ai_desc:
+                        description_val = ai_desc
+                        need_description = False
+                        ai_used = 1
+                        ai_model = AI_MODEL_NAME
 
                 # AI 2回目: まだ欠損がある場合に、優先リンクから集めたテキストで再度問い合わせ
                 if USE_AI and verifier is not None and priority_docs and not timed_out:
@@ -1768,7 +1888,7 @@ async def process():
                                 ai_used = 1
                                 ai_model = AI_MODEL_NAME
                                 ai_phone2 = normalize_phone(ai_result2.get("phone_number"))
-                                ai_addr2 = normalize_address(ai_result2.get("address"))
+                                ai_addr2 = normalize_address(ai_result2.get("address")) if AI_ADDRESS_ENABLED else None
                                 ai_rep2 = ai_result2.get("rep_name") or ai_result2.get("representative")
                                 ai_rep2 = scraper.clean_rep_name(ai_rep2) if ai_rep2 else None
                                 desc2 = ai_result2.get("description")
@@ -1787,6 +1907,16 @@ async def process():
                                     update_description_candidate(desc2)
 
                     missing_contact, missing_extra = refresh_need_flags()
+                    if need_description and verifier is not None:
+                        combined_sources = [select_relevant_paragraphs(v.get("text", "") or "") for v in priority_docs.values()]
+                        combined_text = build_ai_text_payload(*combined_sources)
+                        screenshot_payload = (info_dict or {}).get("screenshot") if info_dict else None
+                        ai_desc2 = await verifier.generate_description(combined_text, screenshot_payload, name, addr)
+                        if ai_desc2:
+                            description_val = ai_desc2
+                            need_description = False
+                            ai_used = 1
+                            ai_model = AI_MODEL_NAME
                     if need_description:
                         payloads: list[dict[str, Any]] = []
                         if info_dict:
@@ -2063,8 +2193,12 @@ async def process():
                                 founded_val = cleaned_fallback_founded
                                 break
 
+                found_address = sanitize_text_block(found_address)
+                rule_address = sanitize_text_block(rule_address)
                 if found_address and not looks_like_address(found_address):
                     found_address = ""
+                if not found_address and rule_address:
+                    found_address = rule_address
                 normalized_found_address = normalize_address(found_address) if found_address else ""
                 if normalized_found_address and addr and not addr_compatible(addr, normalized_found_address):
                     log.info("[%s] 住所不一致のため found_address を破棄: %s vs %s", cid, addr, normalized_found_address)
@@ -2074,9 +2208,9 @@ async def process():
                 rep_name_val = scraper.clean_rep_name(rep_name_val) or ""
                 description_val = clean_description_value(description_val)
                 listing_val = clean_listing_value(listing_val)
-                capital_val = clean_amount_value(capital_val)
-                revenue_val = clean_amount_value(revenue_val)
-                profit_val = clean_amount_value(profit_val)
+                capital_val = ai_normalize_amount(capital_val) or clean_amount_value(capital_val)
+                revenue_val = ai_normalize_amount(revenue_val) or clean_amount_value(revenue_val)
+                profit_val = ai_normalize_amount(profit_val) or clean_amount_value(profit_val)
                 fiscal_val = clean_fiscal_month(fiscal_val)
                 founded_val = clean_founded_year(founded_val)
                 company.update({

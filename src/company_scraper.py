@@ -1712,6 +1712,16 @@ class CompanyScraper:
         self.context = None
         self.http_session = None
 
+    async def reset_context(self):
+        try:
+            await self.close()
+        except Exception:
+            pass
+        try:
+            await self.start()
+        except Exception:
+            log.warning("reset_context failed", exc_info=True)
+
     def _load_slow_hosts(self) -> None:
         try:
             path = self.slow_hosts_path
