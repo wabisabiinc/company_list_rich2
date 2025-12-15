@@ -40,7 +40,7 @@ PRIO_WORDS = [
     # 概要系（最優先）
     "会社概要", "企業情報", "企業概要", "会社情報", "法人案内", "法人概要", "会社案内",
     # 連絡先系
-    "お問い合わせ", "アクセス", "連絡先", "窓口",
+    "お問い合わせ", "アクセス", "連絡先", "窓口", "役員",
     # IR/決算系
     "IR", "ir", "investor", "financial", "ディスクロージャー", "決算",
 ]
@@ -48,7 +48,7 @@ ANCHOR_PRIORITY_WORDS = [
     # 概要系
     "会社概要", "企業情報", "法人案内", "法人概要", "会社案内", "会社紹介", "会社情報", "法人紹介",
     # 連絡先系
-    "お問い合わせ", "連絡先", "アクセス", "窓口",
+    "お問い合わせ", "連絡先", "アクセス", "窓口", "役員",
     # IR/決算系
     "IR", "ir", "investor", "financial", "ディスクロージャー", "決算",
     # 英語系
@@ -59,7 +59,7 @@ PRIORITY_SECTION_KEYWORDS = (
     "会社概要", "会社案内", "法人案内", "法人概要", "企業情報", "企業概要",
     "団体概要", "施設案内", "園紹介", "学校案内", "沿革", "会社情報",
     "corporate", "about", "profile", "overview", "information", "access",
-    "お問い合わせ", "連絡先", "アクセス", "窓口",
+    "お問い合わせ", "連絡先", "アクセス", "窓口", "役員",
     "決算", "ir", "investor", "ディスクロージャー", "financial"
 )
 PRIORITY_CONTACT_KEYWORDS = (
@@ -99,7 +99,7 @@ REP_NAME_EXACT_BLOCKLIST = {
     }
 REP_NAME_SUBSTR_BLOCKLIST = (
     "ブログ", "news", "お知らせ", "採用", "求人", "recruit",
-    "代表者", "代表者名", "氏名", "お名前", "名前", "担当", "担当者",
+        "代表者", "代表者名", "氏名", "お名前", "名前", "担当", "担当者",
     "問い合わせ", "お問い合わせ", "お問合せ", "問合せ",
     "アクセス", "contact", "法人案内", "法人概要", "会社案内", "会社概要",
     "法人情報", "企業情報", "事業案内", "事業紹介",
@@ -107,12 +107,26 @@ REP_NAME_SUBSTR_BLOCKLIST = (
     "施設案内", "施設情報", "イベント", "トピックス",
     "スタッフ紹介", "スタッフ", "メニュー", "menu",
     "トップページ", "home", "沿革", "法人紹介", "会社紹介", "会社情報", "基本情報",
-    "に関する", "について", "保管", "業務", "役員", "役割", "委員会",
+    "に関する", "について", "保管", "業務", "役割", "委員会",
     "学校", "学園", "大学", "保育園", "こども園", "組合", "協会",
     "センター", "法人", "こと", "公印", "いただき", "役", "組織"
 )
 REP_NAME_EXACT_BLOCKLIST_LOWER = {s.lower() for s in REP_NAME_EXACT_BLOCKLIST}
 NAME_CHUNK_RE = re.compile(r"[一-龥]{1,3}(?:[・･\s]{0,1}[一-龥]{1,3})+")
+REP_BUSINESS_TERMS = (
+    "事業",
+    "経営",
+    "美容",
+    "美容室",
+    "美容院",
+    "サロン",
+    "会社概要",
+    "店舗",
+    "サービス",
+    "内容",
+    "紹介",
+    "概要",
+)
 
 PHONE_RE = re.compile(
     r"(?:TEL|Tel|tel|電話)?\s*[:：]?\s*"
@@ -810,6 +824,21 @@ class CompanyScraper:
         if re.search(r"(丁目|番地|号|ビル|マンション)", s):
             return True
         return False
+
+    @staticmethod
+    def _looks_like_person_name(name: str) -> bool:
+        """
+        代表者名として妥当かを軽く確認する。ラベル横の値の精度を上げるために使用。
+        """
+        if not name:
+            return False
+        if len(name) > 15:
+            return False
+        if any(term in name for term in REP_BUSINESS_TERMS):
+            return False
+        if re.search(r"[0-9@]", name):
+            return False
+        return bool(NAME_CHUNK_RE.search(name))
 
     @staticmethod
     def _looks_like_full_address(text: str) -> bool:
@@ -2553,6 +2582,8 @@ class CompanyScraper:
         phones: List[str] = []
         addrs: List[str] = []
         reps: List[str] = []
+        label_reps: List[str] = []
+        rep_from_label = False
 
         for p in PHONE_RE.finditer(text or ""):
             cand = _normalize_phone_strict(p.group(0))
@@ -2585,6 +2616,20 @@ class CompanyScraper:
                 if norm and self._looks_like_full_address(norm):
                     addrs.append(norm)
 
+        # ZIP行と次行を縦持ちでも拾うフォールバック
+        if not addrs:
+            lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+            for idx, ln in enumerate(lines):
+                m = ZIP_RE.search(ln)
+                if not m:
+                    continue
+                zip_code = f"〒{m.group(1).replace('〒', '').strip()}-{m.group(2)}"
+                body = lines[idx + 1] if idx + 1 < len(lines) else ""
+                cand_addr = f"{zip_code} {body}".strip()
+                norm = self._normalize_address_candidate(cand_addr)
+                if norm and self._looks_like_full_address(norm):
+                    addrs.append(norm)
+
         for rm in REP_RE.finditer(text or ""):
             cleaned = self.clean_rep_name(rm.group(1))
             if cleaned:
@@ -2608,14 +2653,16 @@ class CompanyScraper:
         fiscal_months: List[str] = []
         founded_years: List[str] = []
 
+        soup = None
+        pair_values: List[tuple[str, str, bool]] = []  # (label, value, is_table_pair)
+        sequential_texts: List[str] = []
+
         if html:
             try:
                 soup = BeautifulSoup(html, "html.parser")
             except Exception:
                 soup = None
             if soup:
-                pair_values: List[tuple[str, str, bool]] = []  # (label, value, is_table_pair)
-
                 for table in soup.find_all("table"):
                     for row in table.find_all("tr"):
                         cells = row.find_all(["th", "td"])
@@ -2635,7 +2682,6 @@ class CompanyScraper:
                         if label and value:
                             pair_values.append((label, value, True))
 
-                sequential_texts: List[str] = []
                 try:
                     for block in soup.find_all(["p", "li", "span", "div"]):
                         text = block.get_text(separator=" ", strip=True)
@@ -2651,182 +2697,185 @@ class CompanyScraper:
                 except Exception:
                     sequential_texts = []
 
-                def _looks_like_label(text: str) -> tuple[bool, str]:
-                    if not text:
-                        return False, ""
-                    cleaned = text.replace("\u200b", "").strip()
-                    if cleaned.startswith("・"):
-                        cleaned = cleaned.lstrip("・").strip()
-                    cleaned = cleaned.rstrip(":：").strip()
-                    if not cleaned or len(cleaned) > 20:
-                        return False, ""
-                    for keywords in TABLE_LABEL_MAP.values():
-                        if any(
-                            cleaned == kw
-                            or cleaned.startswith(kw)
-                            or kw in cleaned
-                            for kw in keywords
-                        ):
-                            return True, cleaned
-                    return False, ""
+        def _looks_like_label(text: str) -> tuple[bool, str]:
+            if not text:
+                return False, ""
+            cleaned = text.replace("\u200b", "").strip()
+            if cleaned.startswith("・"):
+                cleaned = cleaned.lstrip("・").strip()
+            cleaned = cleaned.rstrip(":：").strip()
+            if not cleaned or len(cleaned) > 20:
+                return False, ""
+            for keywords in TABLE_LABEL_MAP.values():
+                if any(
+                    cleaned == kw
+                    or cleaned.startswith(kw)
+                    or kw in cleaned
+                    for kw in keywords
+                ):
+                    return True, cleaned
+            return False, ""
 
-                for idx in range(len(sequential_texts) - 1):
-                    is_label, normalized = _looks_like_label(sequential_texts[idx])
-                    if not is_label:
-                        continue
-                    value_text = ""
-                    for j in range(idx + 1, len(sequential_texts)):
-                        candidate = sequential_texts[j].replace("\u200b", "").strip()
-                        if not candidate:
-                            continue
-                        if candidate.startswith("・"):
-                            continue
-                        looks_like_next, _ = _looks_like_label(candidate)
-                        if looks_like_next:
-                            break
-                        value_text = candidate
-                        break
-                        if not value_text or len(value_text) > 120:
-                            continue
-                        pair_values.append((normalized, value_text, False))
+        for idx in range(len(sequential_texts) - 1):
+            is_label, normalized = _looks_like_label(sequential_texts[idx])
+            if not is_label:
+                continue
+            value_text = ""
+            for j in range(idx + 1, len(sequential_texts)):
+                candidate = sequential_texts[j].replace("\u200b", "").strip()
+                if not candidate:
+                    continue
+                if candidate.startswith("・"):
+                    continue
+                looks_like_next, _ = _looks_like_label(candidate)
+                if looks_like_next:
+                    break
+                value_text = candidate
+                break
+            if not value_text or len(value_text) > 120:
+                continue
+            pair_values.append((normalized, value_text, False))
 
-                for label, value, is_table_pair in pair_values:
-                    norm_label = label.replace("：", ":").strip()
-                    raw_value = self._clean_text_value(value)
-                    if not raw_value:
-                        continue
-                    # ニュース/人事系のラベルはスキップ
-                    label_block = ("退任", "就任", "人事", "異動", "お知らせ", "ニュース", "採用")
-                    if any(b in norm_label for b in label_block):
-                        continue
-                    matched = False
-                    for field, keywords in TABLE_LABEL_MAP.items():
-                        if any(keyword in norm_label for keyword in keywords):
-                            if field == "rep_names":
-                                cleaned = self.clean_rep_name(raw_value)
-                                if cleaned:
-                                    reps.append(cleaned if not is_table_pair else f"[TABLE]{cleaned}")
-                                    matched = True
-                            elif field == "phone_numbers":
-                                for p in PHONE_RE.finditer(raw_value):
-                                    cand = _normalize_phone_strict(f"{p.group(1)}-{p.group(2)}-{p.group(3)}")
-                                    if cand:
-                                        phones.append(cand if not is_table_pair else f"[TABLE]{cand}")
-                                        matched = True
-                            elif field == "addresses":
-                                norm_addr = self._normalize_address_candidate(raw_value)
-                                if norm_addr and self.looks_like_address(norm_addr):
-                                    addrs.append(norm_addr if not is_table_pair else f"[TABLE]{norm_addr}")
-                                    matched = True
-                            elif field == "listing":
-                                listings.append(raw_value if not is_table_pair else f"[TABLE]{raw_value}")
-                                matched = True
-                            elif field == "capitals":
-                                if self._is_amount_like(raw_value):
-                                    capitals.append(raw_value if not is_table_pair else f"[TABLE]{raw_value}")
-                                    matched = True
-                            elif field == "revenues":
-                                if self._is_amount_like(raw_value):
-                                    revenues.append(raw_value if not is_table_pair else f"[TABLE]{raw_value}")
-                                    matched = True
-                            elif field == "profits":
-                                if self._is_amount_like(raw_value):
-                                    profits.append(raw_value if not is_table_pair else f"[TABLE]{raw_value}")
-                                    matched = True
-                            elif field == "fiscal_months":
-                                fiscal_months.append(raw_value if not is_table_pair else f"[TABLE]{raw_value}")
-                                matched = True
-                            elif field == "founded_years":
-                                parsed = self._parse_founded_year(raw_value)
-                                if parsed:
-                                    founded_years.append(parsed)
-                                    matched = True
-                            break
-                    if not matched and self._is_exec_title(norm_label):
+        for label, value, is_table_pair in pair_values:
+            norm_label = label.replace("：", ":").strip()
+            raw_value = self._clean_text_value(value)
+            if not raw_value:
+                continue
+            # ニュース/人事系のラベルはスキップ
+            label_block = ("退任", "就任", "人事", "異動", "お知らせ", "ニュース", "採用")
+            if any(b in norm_label for b in label_block):
+                continue
+            matched = False
+            for field, keywords in TABLE_LABEL_MAP.items():
+                if any(keyword in norm_label for keyword in keywords):
+                    if field == "rep_names":
                         cleaned = self.clean_rep_name(raw_value)
-                        if cleaned:
-                            reps.append(cleaned)
+                        if cleaned and self._looks_like_person_name(cleaned):
+                            normalized_rep = cleaned if not is_table_pair else f"[TABLE]{cleaned}"
+                            label_reps.append(normalized_rep)
+                            reps.append(normalized_rep)
+                            rep_from_label = True
+                            matched = True
+                    elif field == "phone_numbers":
+                        for p in PHONE_RE.finditer(raw_value):
+                            cand = _normalize_phone_strict(f"{p.group(1)}-{p.group(2)}-{p.group(3)}")
+                            if cand:
+                                phones.append(cand if not is_table_pair else f"[TABLE]{cand}")
+                                matched = True
+                    elif field == "addresses":
+                        norm_addr = self._normalize_address_candidate(raw_value)
+                        if norm_addr and self.looks_like_address(norm_addr):
+                            addrs.append(norm_addr if not is_table_pair else f"[TABLE]{norm_addr}")
+                            matched = True
+                    elif field == "listing":
+                        listings.append(raw_value if not is_table_pair else f"[TABLE]{raw_value}")
+                        matched = True
+                    elif field == "capitals":
+                        if self._is_amount_like(raw_value):
+                            capitals.append(raw_value if not is_table_pair else f"[TABLE]{raw_value}")
+                            matched = True
+                    elif field == "revenues":
+                        if self._is_amount_like(raw_value):
+                            revenues.append(raw_value if not is_table_pair else f"[TABLE]{raw_value}")
+                            matched = True
+                    elif field == "profits":
+                        if self._is_amount_like(raw_value):
+                            profits.append(raw_value if not is_table_pair else f"[TABLE]{raw_value}")
+                            matched = True
+                    elif field == "fiscal_months":
+                        fiscal_months.append(raw_value if not is_table_pair else f"[TABLE]{raw_value}")
+                        matched = True
+                    elif field == "founded_years":
+                        founded_years.append(raw_value if not is_table_pair else f"[TABLE]{raw_value}")
+                        matched = True
+            if matched:
+                continue
+            if not matched and self._is_exec_title(norm_label):
+                cleaned = self.clean_rep_name(raw_value)
+                if cleaned and not rep_from_label and self._looks_like_person_name(cleaned):
+                    reps.append(cleaned)
 
-                def walk_ld(entity: Any) -> None:
-                    if isinstance(entity, dict):
-                        types = entity.get("@type") or entity.get("type")
-                        type_list = []
-                        if isinstance(types, str):
-                            type_list = [types.lower()]
-                        elif isinstance(types, list):
-                            type_list = [str(t).lower() for t in types]
-                        is_org = any(t in {
-                            "organization", "localbusiness", "corporation", "educationalorganization",
-                            "ngo", "governmentoffice", "medicalorganization", "hotel", "lodgingbusiness",
-                        } for t in type_list)
-                        if is_org:
-                            tel = entity.get("telephone")
-                            if isinstance(tel, str):
-                                for p in PHONE_RE.finditer(tel):
-                                    cand = _normalize_phone_strict(f"{p.group(1)}-{p.group(2)}-{p.group(3)}")
-                                    if cand:
-                                        phones.append(cand)
-                            contact_points = entity.get("contactPoint") or entity.get("contactPoints") or []
-                            if isinstance(contact_points, dict):
-                                contact_points = [contact_points]
-                            if isinstance(contact_points, list):
-                                for cp in contact_points:
-                                    if not isinstance(cp, dict):
-                                        continue
-                                    cp_tel = cp.get("telephone")
-                                    if isinstance(cp_tel, str):
-                                        for p in PHONE_RE.finditer(cp_tel):
-                                            cand = _normalize_phone_strict(f"{p.group(1)}-{p.group(2)}-{p.group(3)}")
-                                            if cand:
-                                                phones.append(cand)
-                            addr = entity.get("address")
-                            if isinstance(addr, dict):
-                                parts = [addr.get(k, "") for k in ("postalCode", "addressRegion", "addressLocality", "streetAddress")]
-                                joined = " ".join([p for p in parts if p])
-                                if joined:
-                                    addrs.append(self._normalize_address_candidate(joined))
-                            founder = entity.get("founder")
-                            founders = entity.get("founders")
-                            founder_vals: List[str] = []
-                            if isinstance(founder, str):
-                                founder_vals.append(founder)
-                            elif isinstance(founder, dict):
-                                name = founder.get("name")
-                                if isinstance(name, str):
-                                    founder_vals.append(name)
-                            if isinstance(founders, list):
-                                for f in founders:
-                                    if isinstance(f, str):
-                                        founder_vals.append(f)
-                                    elif isinstance(f, dict):
-                                        name = f.get("name")
-                                        if isinstance(name, str):
-                                            founder_vals.append(name)
-                            for name in founder_vals:
-                                cleaned = self.clean_rep_name(name)
-                                if cleaned:
-                                    reps.append(cleaned)
+        if soup:
+            def walk_ld(entity: Any) -> None:
+                if isinstance(entity, dict):
+                    types = entity.get("@type") or entity.get("type")
+                    type_list = []
+                    if isinstance(types, str):
+                        type_list = [types.lower()]
+                    elif isinstance(types, list):
+                        type_list = [str(t).lower() for t in types]
+                    is_org = any(t in {
+                        "organization", "localbusiness", "corporation", "educationalorganization",
+                        "ngo", "governmentoffice", "medicalorganization", "hotel", "lodgingbusiness",
+                    } for t in type_list)
+                    if is_org:
+                        tel = entity.get("telephone")
+                        if isinstance(tel, str):
+                            for p in PHONE_RE.finditer(tel):
+                                cand = _normalize_phone_strict(f"{p.group(1)}-{p.group(2)}-{p.group(3)}")
+                                if cand:
+                                    phones.append(cand)
+                        contact_points = entity.get("contactPoint") or entity.get("contactPoints") or []
+                        if isinstance(contact_points, dict):
+                            contact_points = [contact_points]
+                        if isinstance(contact_points, list):
+                            for cp in contact_points:
+                                if not isinstance(cp, dict):
+                                    continue
+                                cp_tel = cp.get("telephone")
+                                if isinstance(cp_tel, str):
+                                    for p in PHONE_RE.finditer(cp_tel):
+                                        cand = _normalize_phone_strict(f"{p.group(1)}-{p.group(2)}-{p.group(3)}")
+                                        if cand:
+                                            phones.append(cand)
+                        addr = entity.get("address")
+                        if isinstance(addr, dict):
+                            parts = [addr.get(k, "") for k in ("postalCode", "addressRegion", "addressLocality", "streetAddress")]
+                            joined = " ".join([p for p in parts if p])
+                            if joined:
+                                addrs.append(self._normalize_address_candidate(joined))
+                        founder = entity.get("founder")
+                        founders = entity.get("founders")
+                        founder_vals: List[str] = []
+                        if isinstance(founder, str):
+                            founder_vals.append(founder)
+                        elif isinstance(founder, dict):
+                            name = founder.get("name")
+                            if isinstance(name, str):
+                                founder_vals.append(name)
+                        if isinstance(founders, list):
+                            for f in founders:
+                                if isinstance(f, str):
+                                    founder_vals.append(f)
+                                elif isinstance(f, dict):
+                                    name = f.get("name")
+                                    if isinstance(name, str):
+                                        founder_vals.append(name)
+                        for name in founder_vals:
+                            cleaned = self.clean_rep_name(name)
+                            if cleaned and not rep_from_label and self._looks_like_person_name(cleaned):
+                                reps.append(cleaned)
 
-                            founding_date = entity.get("foundingDate") or entity.get("foundingYear")
-                            if isinstance(founding_date, str):
-                                m = re.search(r"(\d{4})", founding_date)
-                                if m:
-                                    founded_years.append(m.group(1))
-                        for v in entity.values():
-                            walk_ld(v)
-                    elif isinstance(entity, list):
-                        for item in entity:
-                            walk_ld(item)
+                        founding_date = entity.get("foundingDate") or entity.get("foundingYear")
+                        if isinstance(founding_date, str):
+                            m = re.search(r"(\d{4})", founding_date)
+                            if m:
+                                founded_years.append(m.group(1))
+                    for v in entity.values():
+                        walk_ld(v)
+                elif isinstance(entity, list):
+                    for item in entity:
+                        walk_ld(item)
 
-                for script in soup.find_all("script"):
-                    t = script.get("type", "") or ""
-                    if "ld+json" not in t:
-                        continue
-                    try:
-                        data = json.loads(script.string or "")
-                    except Exception:
-                        continue
-                    walk_ld(data)
+            for script in soup.find_all("script"):
+                t = script.get("type", "") or ""
+                if "ld+json" not in t and "@context" not in (script.string or ""):
+                    continue
+                try:
+                    data = json.loads(script.string or "")
+                except Exception:
+                    continue
+                walk_ld(data)
 
         for lm in LISTING_RE.finditer(text or ""):
             val = lm.group(1).strip()
@@ -2850,7 +2899,7 @@ class CompanyScraper:
 
         for m in REP_RE.finditer(text or ""):
             cand = self.clean_rep_name(m.group(1))
-            if cand:
+            if cand and not rep_from_label and self._looks_like_person_name(cand):
                 reps.append(cand)
 
         capitals.extend(m.group(1).strip() for m in CAPITAL_RE.finditer(text or ""))
@@ -2871,6 +2920,10 @@ class CompanyScraper:
                     seen.add(item)
                     out.append(item)
             return out
+
+        # ラベル由来の代表者があればそれを優先
+        if label_reps:
+            reps = label_reps
 
         return {
             "phone_numbers": dedupe(phones),

@@ -2018,13 +2018,13 @@ async def process():
                                     address_source = "rule"
                                     src_addr = url
                                     need_addr = False
-                    if need_rep and cc.get("rep_names"):
-                        cand_rep = pick_best_rep(cc["rep_names"], url)
-                        cand_rep = scraper.clean_rep_name(cand_rep) if cand_rep else None
-                        if cand_rep:
-                            rep_name_val = cand_rep
-                            src_rep = url
-                            need_rep = False
+                            if need_rep and cc.get("rep_names"):
+                                cand_rep = pick_best_rep(cc["rep_names"], url)
+                                cand_rep = scraper.clean_rep_name(cand_rep) if cand_rep else None
+                                if cand_rep:
+                                    rep_name_val = cand_rep
+                                    src_rep = url
+                                    need_rep = False
                             if need_description and cc.get("description"):
                                 desc = clean_description_value(cc["description"])
                                 if desc:

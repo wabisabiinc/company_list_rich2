@@ -1,4 +1,5 @@
 import os
+import asyncio
 import json
 import logging
 import time
@@ -54,6 +55,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 log.info(f"[ai_verifier] AI_ENABLED={AI_ENABLED}, USE_AI={USE_AI}, KEY_SET={bool(API_KEY)}, GEN_OK={generativeai is not None}")
+AI_CALL_TIMEOUT_SEC = float(os.getenv("AI_CALL_TIMEOUT_SEC", "25") or 0)
 
 # ---- utils ------------------------------------------------------
 def _extract_first_json(text: str) -> Optional[Dict[str, Any]]:
@@ -244,6 +246,27 @@ class AIVerifier:
             log.warning(f"AIVerifier: failed to load system prompt from %s: %s", path, e)
             return None
 
+    async def _generate_with_timeout(self, content: list[Any]) -> Any:
+        """
+        Gemini呼び出しに上限時間を設け、ハングでワーカー全体が止まらないようにする。
+        """
+        if not self.model:
+            return None
+
+        async def _call():
+            try:
+                return await self.model.generate_content_async(content, safety_settings=None)
+            except TypeError:
+                return await self.model.generate_content_async(content)
+
+        if AI_CALL_TIMEOUT_SEC > 0:
+            try:
+                return await asyncio.wait_for(_call(), timeout=AI_CALL_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                log.warning(f"Gemini call timed out after {AI_CALL_TIMEOUT_SEC}s")
+                return None
+        return await _call()
+
     def _build_prompt(self, text: str, company_name: str = "", address: str = "") -> str:
         snippet = _shorten_text(text or "", max_len=3500)
         return (
@@ -311,10 +334,12 @@ class AIVerifier:
 
         try:
             t0 = time.time()
-            try:
-                resp = await self.model.generate_content_async(content, safety_settings=None)
-            except TypeError:
-                resp = await self.model.generate_content_async(content)
+            resp = await self._generate_with_timeout(content)
+            if resp is None:
+                log.warning(f"Gemini API returned no response (timeout/None) for {company_name} ({address}); retrying text-only.")
+                resp = await self._generate_with_timeout(_build_content(False))
+                if resp is None:
+                    return None
             dt = time.time() - t0
             log.info(f"Gemini API call ok: {company_name} ({address}) in {dt:.2f}s")
 
@@ -402,7 +427,7 @@ class AIVerifier:
         except GoogleAPIError as e:
             log.warning(f"Google API error for {company_name} ({address}) with image: {e}")
             try:
-                resp = await self.model.generate_content_async(_build_content(False), safety_settings=None)  # type: ignore
+                resp = await self._generate_with_timeout(_build_content(False))
             except Exception:
                 return None
             raw = _resp_text(resp)
@@ -410,7 +435,7 @@ class AIVerifier:
         except Exception as e:
             log.warning(f"Failed to verify info for {company_name} ({address}) with image: {e}", exc_info=True)
             try:
-                resp = await self.model.generate_content_async(_build_content(False))  # type: ignore
+                resp = await self._generate_with_timeout(_build_content(False))
             except Exception:
                 return None
             raw = _resp_text(resp)
@@ -486,10 +511,12 @@ class AIVerifier:
 
         content: list[Any] = _build_content(True)
         try:
-            try:
-                resp = await self.model.generate_content_async(content, safety_settings=None)
-            except TypeError:
-                resp = await self.model.generate_content_async(content)
+            resp = await self._generate_with_timeout(content)
+            if resp is None:
+                log.warning(f"judge_official_homepage timed out/failed for {company_name} ({url}); retrying text-only.")
+                resp = await self._generate_with_timeout(_build_content(False))
+                if resp is None:
+                    return None
             raw = _resp_text(resp)
             result = _extract_first_json(raw)
             if not isinstance(result, dict):
@@ -520,7 +547,7 @@ class AIVerifier:
         except Exception as exc:  # pylint: disable=broad-except
             log.warning(f"judge_official_homepage failed for {company_name} ({url}) with image: {exc}")
             try:
-                resp = await self.model.generate_content_async(_build_content(False), safety_settings=None)  # type: ignore
+                resp = await self._generate_with_timeout(_build_content(False))
             except Exception:
                 return None
             raw = _resp_text(resp)
