@@ -772,6 +772,8 @@ class CompanyScraper:
         # HTML断片を除去
         val = re.sub(r"<[^>]+>", " ", val)
         val = re.sub(r"\bbr\s*/?\b", " ", val, flags=re.I)
+        val = re.sub(r'\b(?:class|id|style|data-[\w-]+)\s*=\s*"[^"]*"', " ", val, flags=re.I)
+        val = val.replace(">", " ").replace("<", " ")
         val = val.replace("&nbsp;", " ")
         val = re.sub(r"(?i)<br\s*/?>", " ", val)
         val = val.replace("\u3000", " ")

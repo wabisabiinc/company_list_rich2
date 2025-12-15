@@ -194,6 +194,8 @@ def sanitize_text_block(text: str | None) -> str:
     t = t.replace("[TABLE]", "")
     t = re.sub(r"<[^>]+>", " ", t)
     t = re.sub(r"\bbr\s*/?\b", " ", t, flags=re.I)
+    t = re.sub(r'\b(?:class|id|style|data-[\w-]+)\s*=\s*"[^"]*"', " ", t, flags=re.I)
+    t = t.replace(">", " ").replace("<", " ")
     t = t.replace("|", " ").replace("｜", " ")
     t = re.sub(r"[\r\n\t]+", " ", t)
     t = re.sub(r"[\x00-\x1f\x7f]", " ", t)
@@ -813,6 +815,8 @@ async def process():
     )
 
     scraper = CompanyScraper(headless=HEADLESS)
+    base_page_timeout_ms = getattr(scraper, "page_timeout_ms", 9000) or 9000
+    PAGE_FETCH_TIMEOUT_SEC = max(5.0, (base_page_timeout_ms / 1000.0) + 5.0)
     # CompanyScraper に start()/close() が無い実装でも動くように安全に呼ぶ
     if hasattr(scraper, "start") and callable(getattr(scraper, "start")):
         try:
@@ -983,13 +987,10 @@ async def process():
                         return None
                     async with fetch_sem:
                         try:
-                            if COMPANY_HARD_TIMEOUT_SEC > 0:
-                                candidate_info = await asyncio.wait_for(
-                                    scraper.get_page_info(candidate),
-                                    timeout=COMPANY_HARD_TIMEOUT_SEC,
-                                )
-                            else:
-                                candidate_info = await scraper.get_page_info(candidate)
+                            candidate_info = await asyncio.wait_for(
+                                scraper.get_page_info(candidate),
+                                timeout=PAGE_FETCH_TIMEOUT_SEC,
+                            )
                         except asyncio.TimeoutError:
                             log.info("[%s] get_page_info timeout -> skip candidate: %s", cid, candidate)
                             return None
@@ -1680,12 +1681,15 @@ async def process():
                     info_url = info_dict.get("url") or homepage
                     # まず「会社概要/企業情報/会社情報」系の優先リンクを先に巡回して主要情報を拾う
                     try:
-                        early_priority_docs = await scraper.fetch_priority_documents(
-                            homepage,
-                            info_dict.get("html", ""),
-                            max_links=3,
-                            concurrency=FETCH_CONCURRENCY,
-                            target_types=["about", "contact", "finance"],
+                        early_priority_docs = await asyncio.wait_for(
+                            scraper.fetch_priority_documents(
+                                homepage,
+                                info_dict.get("html", ""),
+                                max_links=3,
+                                concurrency=FETCH_CONCURRENCY,
+                                target_types=["about", "contact", "finance"],
+                            ),
+                            timeout=PAGE_FETCH_TIMEOUT_SEC,
                         )
                     except Exception:
                         early_priority_docs = {}
@@ -1775,12 +1779,15 @@ async def process():
                         site_docs = {}
                         # early_priority_docs で取得済みの場合は重複を避ける
                         if priority_limit > 0 and not priority_docs:
-                            site_docs = await scraper.fetch_priority_documents(
-                                homepage,
-                                info_dict.get("html", ""),
-                                max_links=priority_limit,
-                                concurrency=FETCH_CONCURRENCY,
-                                target_types=target_types or None,
+                            site_docs = await asyncio.wait_for(
+                                scraper.fetch_priority_documents(
+                                    homepage,
+                                    info_dict.get("html", ""),
+                                    max_links=priority_limit,
+                                    concurrency=FETCH_CONCURRENCY,
+                                    target_types=target_types or None,
+                                ),
+                                timeout=PAGE_FETCH_TIMEOUT_SEC,
                             )
                     except Exception:
                         site_docs = {}
@@ -2006,21 +2013,24 @@ async def process():
                             else:
                                 max_hops = RELATED_MAX_HOPS_PHONE if need_phone else RELATED_MAX_HOPS_BASE
                                 try:
-                                    related = await scraper.crawl_related(
-                                        homepage,
-                                        need_phone,
-                                        need_addr,
-                                        need_rep,
-                                        max_pages=related_page_limit,
-                                        max_hops=max_hops,
-                                        need_listing=need_listing,
-                                        need_capital=need_capital,
-                                        need_revenue=need_revenue,
-                                        need_profit=need_profit,
-                                        need_fiscal=need_fiscal,
-                                        need_founded=need_founded,
-                                        need_description=need_description,
-                                        initial_info=info_dict if info_url == homepage else None,
+                                    related = await asyncio.wait_for(
+                                        scraper.crawl_related(
+                                            homepage,
+                                            need_phone,
+                                            need_addr,
+                                            need_rep,
+                                            max_pages=related_page_limit,
+                                            max_hops=max_hops,
+                                            need_listing=need_listing,
+                                            need_capital=need_capital,
+                                            need_revenue=need_revenue,
+                                            need_profit=need_profit,
+                                            need_fiscal=need_fiscal,
+                                            need_founded=need_founded,
+                                            need_description=need_description,
+                                            initial_info=info_dict if info_url == homepage else None,
+                                        ),
+                                        timeout=PAGE_FETCH_TIMEOUT_SEC,
                                     )
                                 except Exception:
                                     related = {}
@@ -2092,11 +2102,14 @@ async def process():
 
                     if homepage and (need_addr or not found_address) and not timed_out and not priority_docs:
                         try:
-                            extra_docs = await scraper.fetch_priority_documents(
-                                homepage,
-                                info_dict.get("html", ""),
-                                max_links=3,
-                                concurrency=FETCH_CONCURRENCY,
+                            extra_docs = await asyncio.wait_for(
+                                scraper.fetch_priority_documents(
+                                    homepage,
+                                    info_dict.get("html", ""),
+                                    max_links=3,
+                                    concurrency=FETCH_CONCURRENCY,
+                                ),
+                                timeout=PAGE_FETCH_TIMEOUT_SEC,
                             )
                         except Exception:
                             extra_docs = {}
@@ -2120,11 +2133,14 @@ async def process():
                     )
                     if need_online_verify:
                         try:
-                            verify_result = await scraper.verify_on_site(
-                                homepage,
-                                phone or rule_phone or None,
-                                found_address or addr or rule_address or None,
-                                fetch_limit=3,
+                            verify_result = await asyncio.wait_for(
+                                scraper.verify_on_site(
+                                    homepage,
+                                    phone or rule_phone or None,
+                                    found_address or addr or rule_address or None,
+                                    fetch_limit=3,
+                                ),
+                                timeout=PAGE_FETCH_TIMEOUT_SEC,
                             )
                             verify_result_source = "online"
                         except Exception:
