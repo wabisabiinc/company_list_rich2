@@ -771,6 +771,7 @@ class CompanyScraper:
         val = unicodedata.normalize("NFKC", val)
         # HTML断片を除去
         val = re.sub(r"<[^>]+>", " ", val)
+        val = re.sub(r"\bbr\s*/?\b", " ", val, flags=re.I)
         val = val.replace("&nbsp;", " ")
         val = re.sub(r"(?i)<br\s*/?>", " ", val)
         val = val.replace("\u3000", " ")
@@ -2616,7 +2617,7 @@ class CompanyScraper:
                 if norm and self._looks_like_full_address(norm):
                     addrs.append(norm)
 
-        # ZIP行と次行を縦持ちでも拾うフォールバック
+        # ZIP行と近傍行を縦持ちでも拾うフォールバック
         if not addrs:
             lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
             for idx, ln in enumerate(lines):
@@ -2624,7 +2625,14 @@ class CompanyScraper:
                 if not m:
                     continue
                 zip_code = f"〒{m.group(1).replace('〒', '').strip()}-{m.group(2)}"
-                body = lines[idx + 1] if idx + 1 < len(lines) else ""
+                # 直後1〜2行を結合して住所本体とみなす
+                body_parts: list[str] = []
+                for offset in (1, 2):
+                    if idx + offset < len(lines):
+                        body_parts.append(lines[idx + offset])
+                if not body_parts and idx > 0:
+                    body_parts.append(lines[idx - 1])  # 前行も一応参照
+                body = " ".join(body_parts).strip()
                 cand_addr = f"{zip_code} {body}".strip()
                 norm = self._normalize_address_candidate(cand_addr)
                 if norm and self._looks_like_full_address(norm):

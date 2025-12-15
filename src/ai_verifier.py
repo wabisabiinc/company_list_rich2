@@ -55,7 +55,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 log.info(f"[ai_verifier] AI_ENABLED={AI_ENABLED}, USE_AI={USE_AI}, KEY_SET={bool(API_KEY)}, GEN_OK={generativeai is not None}")
-AI_CALL_TIMEOUT_SEC = float(os.getenv("AI_CALL_TIMEOUT_SEC", "25") or 0)
+AI_CALL_TIMEOUT_SEC = float(os.getenv("AI_CALL_TIMEOUT_SEC", "20") or 0)
 
 # ---- utils ------------------------------------------------------
 def _extract_first_json(text: str) -> Optional[Dict[str, Any]]:

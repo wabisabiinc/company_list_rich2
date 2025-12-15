@@ -62,8 +62,8 @@ RELATED_MAX_HOPS_PHONE = max(1, int(os.getenv("RELATED_MAX_HOPS_PHONE", "2")))
 # 全体のタイムアウトは使わず、フェーズ別で管理する（デフォルトを短めにし停滞を防止）
 TIME_LIMIT_SEC = float(os.getenv("TIME_LIMIT_SEC", "0"))
 TIME_LIMIT_FETCH_ONLY = float(os.getenv("TIME_LIMIT_FETCH_ONLY", "10"))  # 公式未確定で候補取得フェーズ（0で無効）
-TIME_LIMIT_WITH_OFFICIAL = float(os.getenv("TIME_LIMIT_WITH_OFFICIAL", "30"))  # 公式確定後、主要項目未充足（0で無効）
-TIME_LIMIT_DEEP = float(os.getenv("TIME_LIMIT_DEEP", "30"))  # 深掘り専用の上限（公式確定後）（0で無効）
+TIME_LIMIT_WITH_OFFICIAL = float(os.getenv("TIME_LIMIT_WITH_OFFICIAL", "40"))  # 公式確定後、主要項目未充足（0で無効）
+TIME_LIMIT_DEEP = float(os.getenv("TIME_LIMIT_DEEP", "45"))  # 深掘り専用の上限（公式確定後）（0で無効）
 # 全体のハード上限（デフォルト60秒で次ジョブへスキップ）
 GLOBAL_HARD_TIMEOUT_SEC = float(os.getenv("GLOBAL_HARD_TIMEOUT_SEC", "60"))
 # 単社処理のハード上限（candidate取得で固まるのを避けるための保険、0で無効）
@@ -191,7 +191,10 @@ def sanitize_text_block(text: str | None) -> str:
     if not text:
         return ""
     t = html_mod.unescape(str(text))
+    t = t.replace("[TABLE]", "")
     t = re.sub(r"<[^>]+>", " ", t)
+    t = re.sub(r"\bbr\s*/?\b", " ", t, flags=re.I)
+    t = t.replace("|", " ").replace("｜", " ")
     t = re.sub(r"[\r\n\t]+", " ", t)
     t = re.sub(r"[\x00-\x1f\x7f]", " ", t)
     t = re.sub(r"\s+", " ", t)
@@ -1247,6 +1250,17 @@ async def process():
                                 log.info("[%s] AIが非公式判定: %s", cid, record.get("url"))
                                 continue
                         if ai_judge.get("is_official") is True:
+                            # ホストに社名トークンも名称ヒットも無ければ公式にしない
+                            if not host_token_hit and not name_hit:
+                                manager.upsert_url_flag(
+                                    normalized_url,
+                                    is_official=False,
+                                    source="rule",
+                                    reason="no_host_token_no_name",
+                                )
+                                fallback_cands.append((record.get("url"), extracted))
+                                log.info("[%s] AI公式でも社名トークン/名称なしのためスキップ: %s", cid, record.get("url"))
+                                continue
                             # ドメイン/住所/名称一致が弱い公式判定は採用しない
                             if (not host_token_hit) and domain_score < 3 and not address_ok:
                                 manager.upsert_url_flag(
@@ -1304,6 +1318,16 @@ async def process():
                             break
                     # キャッシュ公式は採用しない（参考のみ）
                     if rule_details.get("is_official"):
+                        if not host_token_hit and not name_hit:
+                            manager.upsert_url_flag(
+                                normalized_url,
+                                is_official=False,
+                                source="rule",
+                                reason="no_host_token_no_name",
+                            )
+                            fallback_cands.append((record.get("url"), extracted))
+                            log.info("[%s] 名称/ホストトークンなしのため公式判定を除外: %s", cid, record.get("url"))
+                            continue
                         name_or_domain_ok = (
                             name_hit
                             or strong_domain_host
@@ -1942,17 +1966,17 @@ async def process():
                         phone = ""
                         phone_source = "none"
 
-                    if ai_addr:
+                    if rule_address:
+                        found_address = rule_address
+                        address_source = "rule"
+                        if not src_addr:
+                            src_addr = info_url
+                    elif ai_addr:
                         found_address = ai_addr
                         address_source = "ai"
                         src_addr = info_url
-                    elif rule_address:
-                        found_address = rule_address or ""
-                        address_source = "rule" if rule_address else "none"
-                        if rule_address and not src_addr:
-                            src_addr = info_url
                     else:
-                        found_address = ""
+                        found_address = rule_address or ""
                         address_source = "none"
 
                     if ai_rep:
@@ -2200,9 +2224,6 @@ async def process():
                 if not found_address and rule_address:
                     found_address = rule_address
                 normalized_found_address = normalize_address(found_address) if found_address else ""
-                if normalized_found_address and addr and not addr_compatible(addr, normalized_found_address):
-                    log.info("[%s] 住所不一致のため found_address を破棄: %s vs %s", cid, addr, normalized_found_address)
-                    normalized_found_address = ""
                 if not normalized_found_address and addr:
                     normalized_found_address = normalize_address(addr) or ""
                 rep_name_val = scraper.clean_rep_name(rep_name_val) or ""
