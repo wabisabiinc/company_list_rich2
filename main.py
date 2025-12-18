@@ -208,6 +208,9 @@ def sanitize_text_block(text: str | None) -> str:
     t = html_mod.unescape(str(text))
     t = t.replace("[TABLE]", "")
     t = re.sub(r"<[^>]+>", " ", t)
+    # スタイル/コメント断片は早めに除去
+    t = re.sub(r"(?is)<style.*?>.*?</style>", " ", t)
+    t = re.sub(r"(?is)<!--.*?-->", " ", t)
     t = re.sub(r"\bbr\s*/?\b", " ", t, flags=re.I)
     t = re.sub(r'\b(?:class|id|style|data-[\w-]+)\s*=\s*"[^"]*"', " ", t, flags=re.I)
     t = t.replace(">", " ").replace("<", " ")
@@ -215,7 +218,11 @@ def sanitize_text_block(text: str | None) -> str:
     t = re.sub(r"[\r\n\t]+", " ", t)
     t = re.sub(r"[\x00-\x1f\x7f]", " ", t)
     t = re.sub(r"\s+", " ", t)
-    return t.strip()
+    t = t.strip()
+    # 典型的なUTF-8モジバケを検知したら破棄
+    if re.search(r"[ãÂ�]{2,}", t):
+        return ""
+    return t
 
 
 def looks_like_address(text: str | None) -> bool:

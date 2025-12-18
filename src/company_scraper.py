@@ -789,6 +789,8 @@ class CompanyScraper:
             return ""
         val = unicodedata.normalize("NFKC", val)
         # HTML断片を除去
+        val = re.sub(r"(?is)<style.*?>.*?</style>", " ", val)
+        val = re.sub(r"(?is)<!--.*?-->", " ", val)
         val = re.sub(r"<[^>]+>", " ", val)
         val = re.sub(r"\bbr\s*/?\b", " ", val, flags=re.I)
         val = re.sub(r'\b(?:class|id|style|data-[\w-]+)\s*=\s*"[^"]*"', " ", val, flags=re.I)

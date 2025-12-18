@@ -1,4 +1,4 @@
-import csv, sys, os, re, sqlite3
+import csv, sys, os, re, sqlite3, unicodedata
 from src.company_scraper import CompanyScraper  # rep_name の簡易クレンジングに再利用
 
 DB_PATH = os.environ.get("COMPANIES_DB_PATH", "data/companies.db")
@@ -37,7 +37,8 @@ def first(*vals):
 def clean(val):
     if val is None:
         return None
-    val = str(val).strip()
+    val = unicodedata.normalize("NFKC", str(val))
+    val = re.sub(r"\s+", " ", val).strip()
     return val or None
 
 
