@@ -2739,36 +2739,36 @@ class CompanyScraper:
         sequential_texts: List[str] = []
 
         if html:
-        try:
-            soup = BeautifulSoup(html, "html.parser")
-        except Exception:
-            soup = None
-        if soup:
-            for table in soup.find_all("table"):
-                for row in table.find_all("tr"):
-                    cells = row.find_all(["th", "td"])
-                    if len(cells) < 2:
-                        continue
-                    label = cells[0].get_text(separator=" ", strip=True)
-                    value = cells[1].get_text(separator=" ", strip=True)
-                    if label and value:
-                        # 代表者ラベルは優先度を上げるため先頭に積む
-                        if any(rep_kw in label for rep_kw in TABLE_LABEL_MAP["rep_names"]):
-                            pair_values.insert(0, (label, value, True))
-                        else:
-                            pair_values.append((label, value, True))
+            try:
+                soup = BeautifulSoup(html, "html.parser")
+            except Exception:
+                soup = None
+            if soup:
+                for table in soup.find_all("table"):
+                    for row in table.find_all("tr"):
+                        cells = row.find_all(["th", "td"])
+                        if len(cells) < 2:
+                            continue
+                        label = cells[0].get_text(separator=" ", strip=True)
+                        value = cells[1].get_text(separator=" ", strip=True)
+                        if label and value:
+                            # 代表者ラベルは優先度を上げるため先頭に積む
+                            if any(rep_kw in label for rep_kw in TABLE_LABEL_MAP["rep_names"]):
+                                pair_values.insert(0, (label, value, True))
+                            else:
+                                pair_values.append((label, value, True))
 
-            for dl in soup.find_all("dl"):
-                dts = dl.find_all("dt")
-                dds = dl.find_all("dd")
-                for dt, dd in zip(dts, dds):
-                    label = dt.get_text(separator=" ", strip=True)
-                    value = dd.get_text(separator=" ", strip=True)
-                    if label and value:
-                        if any(rep_kw in label for rep_kw in TABLE_LABEL_MAP["rep_names"]):
-                            pair_values.insert(0, (label, value, True))
-                        else:
-                            pair_values.append((label, value, True))
+                for dl in soup.find_all("dl"):
+                    dts = dl.find_all("dt")
+                    dds = dl.find_all("dd")
+                    for dt, dd in zip(dts, dds):
+                        label = dt.get_text(separator=" ", strip=True)
+                        value = dd.get_text(separator=" ", strip=True)
+                        if label and value:
+                            if any(rep_kw in label for rep_kw in TABLE_LABEL_MAP["rep_names"]):
+                                pair_values.insert(0, (label, value, True))
+                            else:
+                                pair_values.append((label, value, True))
 
                 try:
                     for block in soup.find_all(["p", "li", "span", "div"]):
@@ -2849,19 +2849,19 @@ class CompanyScraper:
             if any(b in norm_label for b in label_block):
                 continue
             matched = False
-                    for field, keywords in TABLE_LABEL_MAP.items():
-                        if any(keyword in norm_label for keyword in keywords):
-                            if field == "rep_names":
-                                cleaned = self.clean_rep_name(raw_value)
-                                if cleaned and self._looks_like_person_name(cleaned):
-                                    strong_role = bool(re.search(r"(代表取締役|代表者|社長|会長|理事長)", raw_value))
-                                    normalized_rep = cleaned if not is_table_pair else f"[TABLE]{cleaned}"
-                                    if ("役員" in norm_label) and not strong_role:
-                                        normalized_rep = f"[LOWROLE]{normalized_rep}"
-                                    label_reps.append(normalized_rep)
-                                    reps.append(normalized_rep)
-                                    rep_from_label = True
-                                    matched = True
+            for field, keywords in TABLE_LABEL_MAP.items():
+                if any(keyword in norm_label for keyword in keywords):
+                    if field == "rep_names":
+                        cleaned = self.clean_rep_name(raw_value)
+                        if cleaned and self._looks_like_person_name(cleaned):
+                            strong_role = bool(re.search(r"(代表取締役|代表者|社長|会長|理事長)", raw_value))
+                            normalized_rep = cleaned if not is_table_pair else f"[TABLE]{cleaned}"
+                            if ("役員" in norm_label) and not strong_role:
+                                normalized_rep = f"[LOWROLE]{normalized_rep}"
+                            label_reps.append(normalized_rep)
+                            reps.append(normalized_rep)
+                            rep_from_label = True
+                            matched = True
                     elif field == "phone_numbers":
                         for p in PHONE_RE.finditer(raw_value):
                             cand = _normalize_phone_strict(f"{p.group(1)}-{p.group(2)}-{p.group(3)}")
