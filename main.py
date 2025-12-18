@@ -1107,49 +1107,26 @@ async def process():
                     for idx, candidate in enumerate(urls)
                 ]
                 candidate_records: list[dict[str, Any]] = []
+                prepare_timed_out = False
+                prepared: list[Any] = []
                 if prepare_tasks:
-                    try:
-                        if SEARCH_PHASE_TIMEOUT_SEC > 0:
-                            prepared = await asyncio.wait_for(
-                                asyncio.gather(*prepare_tasks, return_exceptions=True),
-                                timeout=SEARCH_PHASE_TIMEOUT_SEC,
-                            )
-                        else:
-                            prepared = await asyncio.gather(*prepare_tasks, return_exceptions=True)
-                    except asyncio.TimeoutError:
-                        for t in prepare_tasks:
-                            t.cancel()
-                        await asyncio.gather(*prepare_tasks, return_exceptions=True)
-                        log.info("[%s] prepare_candidate timeout -> review/search_timeout", cid)
-                        company.update({
-                            "homepage": "",
-                            "phone": "",
-                            "found_address": "",
-                            "rep_name": company.get("rep_name", "") or "",
-                            "description": company.get("description", "") or "",
-                            "listing": company.get("listing", "") or "",
-                            "revenue": company.get("revenue", "") or "",
-                            "profit": company.get("profit", "") or "",
-                            "capital": company.get("capital", "") or "",
-                            "fiscal_month": company.get("fiscal_month", "") or "",
-                            "founded_year": company.get("founded_year", "") or "",
-                            "homepage_official_flag": 0,
-                            "homepage_official_source": "",
-                            "homepage_official_score": 0.0,
-                            "error_code": "search_timeout",
-                        })
-                        manager.save_company_data(company, status="review")
-                        if csv_writer:
-                            csv_writer.writerow({k: company.get(k, "") for k in CSV_FIELDNAMES})
-                            csv_file.flush()
-                        processed += 1
-                        try:
-                            await scraper.reset_context()
-                        except Exception:
-                            pass
-                        if SLEEP_BETWEEN_SEC > 0:
-                            await asyncio.sleep(jittered_seconds(SLEEP_BETWEEN_SEC, JITTER_RATIO))
-                        continue
+                    if SEARCH_PHASE_TIMEOUT_SEC > 0:
+                        done, pending = await asyncio.wait(
+                            prepare_tasks, timeout=SEARCH_PHASE_TIMEOUT_SEC
+                        )
+                        if pending:
+                            prepare_timed_out = True
+                            for task in pending:
+                                task.cancel()
+                            await asyncio.gather(*pending, return_exceptions=True)
+                        for task in done:
+                            try:
+                                result = task.result()
+                            except Exception:
+                                continue
+                            prepared.append(result)
+                    else:
+                        prepared = await asyncio.gather(*prepare_tasks, return_exceptions=True)
                     ordered: list[tuple[int, dict[str, Any]]] = []
                     for result in prepared:
                         if isinstance(result, Exception) or not result:
@@ -1157,6 +1134,13 @@ async def process():
                         ordered.append(result)
                     ordered.sort(key=lambda x: x[0])
                     candidate_records = [record for _, record in ordered]
+                    if prepare_timed_out and candidate_records:
+                        log.info(
+                            "[%s] prepare_candidate partial timeout (recorded %d/%d)",
+                            cid,
+                            len(candidate_records),
+                            len(prepared),
+                        )
                 search_phase_end = elapsed()
 
                 if candidate_records:
@@ -1362,6 +1346,17 @@ async def process():
                                 fallback_cands.append((record.get("url"), extracted))
                                 log.info("[%s] AI公式でも社名トークン/名称なしのためスキップ: %s", cid, record.get("url"))
                                 continue
+                            # ホストに社名トークンが無く住所根拠も無い場合は採用しない（パスだけ名称一致を防ぐ）
+                            if not host_token_hit and not address_ok:
+                                manager.upsert_url_flag(
+                                    normalized_url,
+                                    is_official=False,
+                                    source="rule",
+                                    reason="host_no_name_no_address",
+                                )
+                                fallback_cands.append((record.get("url"), extracted))
+                                log.info("[%s] AI公式でもホストに社名なし・住所根拠なしのためスキップ: %s", cid, record.get("url"))
+                                continue
                             # ドメイン/住所/名称一致が弱い公式判定は採用しない
                             if (not host_token_hit) and domain_score < 3 and not address_ok:
                                 manager.upsert_url_flag(
@@ -1446,14 +1441,18 @@ async def process():
                             log.info("[%s] 公式判定だが都道府県だけの入力で社名/ホスト根拠なしのため除外: %s", cid, record.get("url"))
                             continue
                         if addr and not address_ok:
+                            # 住所根拠なしなら review 送りでURLは維持
+                            force_review = True
+                            log.info("[%s] 公式判定だが入力住所と一致せず -> review: %s", cid, record.get("url"))
+                        if not host_token_hit and not address_ok:
                             manager.upsert_url_flag(
                                 normalized_url,
                                 is_official=False,
                                 source="rule",
-                                reason="address_mismatch_input",
+                                reason="host_no_name_no_address",
                             )
                             fallback_cands.append((record.get("url"), extracted))
-                            log.info("[%s] 公式判定だが入力住所と一致せず除外: %s", cid, record.get("url"))
+                            log.info("[%s] 公式判定でもホストに社名なし・住所根拠なしのため除外: %s", cid, record.get("url"))
                             continue
                         if not host_token_hit and not name_hit:
                             manager.upsert_url_flag(
@@ -2007,6 +2006,7 @@ async def process():
                                     max_links=priority_limit,
                                     concurrency=FETCH_CONCURRENCY,
                                     target_types=target_types or None,
+                                    allow_slow=True,
                                 ),
                                 timeout=PAGE_FETCH_TIMEOUT_SEC,
                             )

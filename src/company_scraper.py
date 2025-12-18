@@ -914,7 +914,7 @@ class CompanyScraper:
         text = re.sub(r"[（(][^）)]*[）)]", "", text)
         # keep only segment before punctuation/newline
         text = re.split(r"[、。\n/|｜,;；]", text)[0]
-        text = text.strip(" 　:：-‐―－ー'\"")
+        text = text.strip(" 　:：-‐―－ー'\"/／")
         titles = (
             "代表取締役社長", "代表取締役副社長", "代表取締役会長", "代表取締役",
             "代表社員", "代表理事", "代表理事長", "代表執行役", "代表執行役社長",
@@ -972,6 +972,12 @@ class CompanyScraper:
             "技術", "技能", "営業", "企画", "製造", "サービス", "メンテ", "生産", "部", "課", "室"
         )
         if any(term in text for term in business_terms):
+            return None
+        # 役職併記を除去してから判定（兼社長/兼CEO 等）
+        text = re.sub(r"兼.{0,10}$", "", text)
+        text = re.sub(r"(CEO|COO|CFO)$", "", text, flags=re.I)
+        text = text.strip(" 　-‐―－ー/／")
+        if not text:
             return None
         # 文末の助詞/説明終端を落とす
         text = re.sub(r"(さん|は|です|でした|となります|となっております)$", "", text).strip()
@@ -2043,38 +2049,50 @@ class CompanyScraper:
         if not queries:
             return []
 
-        candidates: List[Dict[str, Any]] = []
-        seen: set[str] = set()
         max_candidates = max(1, min(3, num_results or 3))
 
-        async def run_engine(engine: str, q_idx: int, query: str) -> tuple[str, int, str]:
-            # 現状 ddg 固定だが、引数はスコアリングのために残す
-            return engine, q_idx, await self._fetch_duckduckgo(query)
+        async def run_queries(qs: list[str]) -> list[Dict[str, Any]]:
+            candidates: List[Dict[str, Any]] = []
+            seen: set[str] = set()
 
-        tasks: list[asyncio.Task] = []
-        engines = self.search_engines or ["ddg"]
-        for q_idx, query in enumerate(queries):
-            for eng in engines:
-                tasks.append(asyncio.create_task(run_engine(eng, q_idx, query)))
+            async def run_engine(engine: str, q_idx: int, query: str) -> tuple[str, int, str]:
+                # 現状 ddg 固定だが、引数はスコアリングのために残す
+                return engine, q_idx, await self._fetch_duckduckgo(query)
 
-        results = await asyncio.gather(*tasks, return_exceptions=True) if tasks else []
-        for result in results:
-            if isinstance(result, Exception):
-                continue
-            engine, q_idx, html = result
-            if not html:
-                continue
-            extractor = self._extract_search_urls
-            for rank, url in enumerate(extractor(html)):
-                if url in seen:
+            tasks: list[asyncio.Task] = []
+            engines = self.search_engines or ["ddg"]
+            for q_idx, query in enumerate(qs):
+                for eng in engines:
+                    tasks.append(asyncio.create_task(run_engine(eng, q_idx, query)))
+
+            results = await asyncio.gather(*tasks, return_exceptions=True) if tasks else []
+            for result in results:
+                if isinstance(result, Exception):
                     continue
-                seen.add(url)
-                candidates.append({"url": url, "query_idx": q_idx, "rank": rank, "engine": engine})
+                engine, q_idx, html = result
+                if not html:
+                    continue
+                extractor = self._extract_search_urls
+                for rank, url in enumerate(extractor(html)):
+                    if url in seen:
+                        continue
+                    seen.add(url)
+                    candidates.append({"url": url, "query_idx": q_idx, "rank": rank, "engine": engine})
+                    if len(candidates) >= max_candidates:
+                        break
                 if len(candidates) >= max_candidates:
                     break
-            if len(candidates) >= max_candidates:
-                break
+            return candidates
 
+        candidates = await run_queries(queries)
+        if not candidates:
+            # フォールバック: 社名単独/社名+公式で再検索
+            fallback_queries = []
+            plain_name = unicodedata.normalize("NFKC", company_name or "").strip()
+            if plain_name:
+                fallback_queries.append(plain_name)
+                fallback_queries.append(f"{plain_name} 公式")
+            candidates = await run_queries(fallback_queries) if fallback_queries else []
         if not candidates:
             return []
 
@@ -2499,7 +2517,7 @@ class CompanyScraper:
 
         async def fetch(link: str):
             async with sem:
-                info = await self.get_page_info(link)
+                info = await self.get_page_info(link, allow_slow=True)
             return link, info
 
         tasks = [asyncio.create_task(fetch(link)) for link in links]
