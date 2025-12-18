@@ -2049,6 +2049,17 @@ class CompanyScraper:
         if not queries:
             return []
 
+        def _unique_queries(qs: list[str]) -> list[str]:
+            seen: set[str] = set()
+            ordered: list[str] = []
+            for q in qs:
+                normalized = q.strip()
+                if not normalized or normalized in seen:
+                    continue
+                seen.add(normalized)
+                ordered.append(normalized)
+            return ordered
+
         max_candidates = max(1, min(3, num_results or 3))
 
         async def run_queries(qs: list[str]) -> list[Dict[str, Any]]:
@@ -2065,25 +2076,35 @@ class CompanyScraper:
                 for eng in engines:
                     tasks.append(asyncio.create_task(run_engine(eng, q_idx, query)))
 
-            results = await asyncio.gather(*tasks, return_exceptions=True) if tasks else []
-            for result in results:
-                if isinstance(result, Exception):
-                    continue
-                engine, q_idx, html = result
-                if not html:
-                    continue
-                extractor = self._extract_search_urls
-                for rank, url in enumerate(extractor(html)):
-                    if url in seen:
+            if not tasks:
+                return []
+            try:
+                for task in asyncio.as_completed(tasks):
+                    try:
+                        result = await task
+                    except Exception:
                         continue
-                    seen.add(url)
-                    candidates.append({"url": url, "query_idx": q_idx, "rank": rank, "engine": engine})
+                    engine, q_idx, html = result
+                    if not html:
+                        continue
+                    extractor = self._extract_search_urls
+                    for rank, url in enumerate(extractor(html)):
+                        if url in seen:
+                            continue
+                        seen.add(url)
+                        candidates.append({"url": url, "query_idx": q_idx, "rank": rank, "engine": engine})
+                        if len(candidates) >= max_candidates:
+                            break
                     if len(candidates) >= max_candidates:
                         break
-                if len(candidates) >= max_candidates:
-                    break
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
             return candidates
 
+        queries = _unique_queries(queries)
         candidates = await run_queries(queries)
         if not candidates:
             # フォールバック: 社名単独/社名+公式で再検索
@@ -2092,6 +2113,7 @@ class CompanyScraper:
             if plain_name:
                 fallback_queries.append(plain_name)
                 fallback_queries.append(f"{plain_name} 公式")
+            fallback_queries = _unique_queries(fallback_queries)
             candidates = await run_queries(fallback_queries) if fallback_queries else []
         if not candidates:
             return []

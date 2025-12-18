@@ -213,6 +213,8 @@ def sanitize_text_block(text: str | None) -> str:
     t = re.sub(r"(?is)<!--.*?-->", " ", t)
     t = re.sub(r"\bbr\s*/?\b", " ", t, flags=re.I)
     t = re.sub(r'\b(?:class|id|style|data-[\w-]+)\s*=\s*"[^"]*"', " ", t, flags=re.I)
+    t = re.sub(r'\b(?:width|height|alt|href|src|title|rel)\s*=\s*"[^"]*"', " ", t, flags=re.I)
+    t = re.sub(r"\b(?:width|height|alt|href|src|title|rel)\s*=\s*'[^']*'", " ", t, flags=re.I)
     t = t.replace(">", " ").replace("<", " ")
     t = t.replace("|", " ").replace("｜", " ")
     t = re.sub(r"[\r\n\t]+", " ", t)
@@ -1060,6 +1062,14 @@ async def process():
 
                 fetch_sem = asyncio.Semaphore(FETCH_CONCURRENCY)
 
+                async def fetch_candidate_page(candidate: str, allow_slow: bool) -> Dict[str, Any]:
+                    try_timeout = PAGE_FETCH_TIMEOUT_SEC * (1.0 if not allow_slow else 1.4)
+                    async with fetch_sem:
+                        return await asyncio.wait_for(
+                            scraper.get_page_info(candidate, allow_slow=allow_slow),
+                            timeout=try_timeout,
+                        )
+
                 async def prepare_candidate(idx: int, candidate: str):
                     normalized_candidate = scraper.normalize_homepage_url(candidate)
                     url_for_flag = normalized_candidate or candidate
@@ -1071,15 +1081,32 @@ async def process():
                     if flag_info and flag_info.get("is_official") is False:
                         log.info("[%s] 既知の非公式URLを除外: %s (domain_score=%s)", cid, candidate, domain_score_for_flag)
                         return None
-                    async with fetch_sem:
+                    candidate_info: Dict[str, Any] | None = None
+
+                    async def _attempt_fetch(allow_slow: bool) -> Dict[str, Any] | None:
                         try:
-                            candidate_info = await asyncio.wait_for(
-                                scraper.get_page_info(candidate),
-                                timeout=PAGE_FETCH_TIMEOUT_SEC,
-                            )
+                            info = await fetch_candidate_page(candidate, allow_slow=allow_slow)
                         except asyncio.TimeoutError:
-                            log.info("[%s] get_page_info timeout -> skip candidate: %s", cid, candidate)
+                            log.info(
+                                "[%s] get_page_info timeout (allow_slow=%s) -> %s",
+                                cid,
+                                allow_slow,
+                                candidate,
+                            )
                             return None
+                        except Exception:
+                            log.warning("[%s] get_page_info failure -> %s", cid, candidate, exc_info=True)
+                            return None
+                        return info
+
+                    for allow in (False, True):
+                        info = await _attempt_fetch(allow)
+                        if info:
+                            candidate_info = info
+                        if info and (info.get("text") or info.get("html")):
+                            break
+                    if not candidate_info:
+                        return None
                     candidate_text = candidate_info.get("text", "") or ""
                     candidate_html = candidate_info.get("html") or ""
                     extracted = scraper.extract_candidates(candidate_text, candidate_html)
@@ -1110,23 +1137,40 @@ async def process():
                 prepare_timed_out = False
                 prepared: list[Any] = []
                 if prepare_tasks:
-                    if SEARCH_PHASE_TIMEOUT_SEC > 0:
-                        done, pending = await asyncio.wait(
-                            prepare_tasks, timeout=SEARCH_PHASE_TIMEOUT_SEC
-                        )
+                    pending: set[asyncio.Task] = set(prepare_tasks)
+                    deadline = time.monotonic() + SEARCH_PHASE_TIMEOUT_SEC if SEARCH_PHASE_TIMEOUT_SEC > 0 else None
+                    try:
+                        while pending:
+                            if deadline is not None:
+                                remaining = deadline - time.monotonic()
+                                if remaining <= 0:
+                                    prepare_timed_out = True
+                                    break
+                            else:
+                                remaining = None
+                            done, pending = await asyncio.wait(
+                                pending,
+                                timeout=remaining,
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            if not done:
+                                prepare_timed_out = True
+                                break
+                            for task in done:
+                                try:
+                                    result = task.result()
+                                except Exception:
+                                    continue
+                                prepared.append(result)
+                            if len(prepared) >= len(urls):
+                                pending.clear()
+                                break
+                    finally:
                         if pending:
-                            prepare_timed_out = True
                             for task in pending:
                                 task.cancel()
                             await asyncio.gather(*pending, return_exceptions=True)
-                        for task in done:
-                            try:
-                                result = task.result()
-                            except Exception:
-                                continue
-                            prepared.append(result)
-                    else:
-                        prepared = await asyncio.gather(*prepare_tasks, return_exceptions=True)
+                            prepare_timed_out = True
                     ordered: list[tuple[int, dict[str, Any]]] = []
                     for result in prepared:
                         if isinstance(result, Exception) or not result:
@@ -1142,6 +1186,9 @@ async def process():
                             len(prepared),
                         )
                 search_phase_end = elapsed()
+
+                if prepare_timed_out and not candidate_records:
+                    log.info("[%s] prepare_candidate timeout -> review/search_timeout", cid)
 
                 if candidate_records:
                     for record in candidate_records:
