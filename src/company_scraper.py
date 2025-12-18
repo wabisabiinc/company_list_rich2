@@ -801,13 +801,15 @@ class CompanyScraper:
         val = re.sub(r"[‐―－ー–—]", "-", val)
         # JS/トラッキング断片が混入するケースを早めにカット
         val = re.split(
-            r"(window\.\w+|dataLayer\s*=|gtm\.|googletagmanager|nr-data\.net|newrelic|bam\.nr-data\.net|function\s*\(|<script|</script>)",
+            r"(window\.\w+|dataLayer\s*=|gtm\.|googletagmanager|nr-data\.net|newrelic|bam\.nr-data\.net|function\s*\(|<script|</script>|gac?\.push|gtag|_gaq)",
             val,
             maxsplit=1,
         )[0]
         # 以降の余計な部分（TELやリンクの残骸）をカット
         val = re.split(r"(?:TEL|Tel|tel|電話|☎|℡)[:：]?\s*", val)[0]
         val = re.split(r"https?://|href=|HREF=", val)[0]
+        # 地図/マップ/アクセスはここでもカット
+        val = re.split(r"(地図アプリ|地図で見る|マップ|Google\s*マップ|map|アクセス|ルート|拡大地図)", val, maxsplit=1, flags=re.I)[0]
         val = re.sub(r"\s+", " ", val).strip(" \"'")
         # 地図・マップ系が出たらそこまででカット
         m_map = re.search(r"(地図アプリ|マップ|Google\s*マップ|地図|map)", val, flags=re.I)
@@ -2660,7 +2662,11 @@ class CompanyScraper:
             cursor = zm.end()
             snippet = (text or "")[cursor:cursor + 200]
             snippet = snippet.replace("\n", " ").replace("\r", " ").replace("\u3000", " ")
-            snippet = re.split(r"(地図アプリ|マップ|Google\s*マップ|地図|map|アクセス)", snippet, maxsplit=1)[0]
+            snippet = re.split(
+                r"(地図アプリ|地図で見る|マップ|Google\s*マップ|地図|map|アクセス|ルート|拡大地図|gac?\.push|gtag|_gaq)",
+                snippet,
+                maxsplit=1,
+            )[0]
             if ADDR_HINT.search(snippet):
                 cleaned = re.split(r"[。．、,，;；｜|/]", snippet, maxsplit=1)[0]
                 cleaned = re.sub(r"\s+", " ", cleaned)

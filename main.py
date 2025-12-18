@@ -222,8 +222,11 @@ def sanitize_text_block(text: str | None) -> str:
     # 典型的なUTF-8モジバケを検知したら破棄
     if re.search(r"[ãÂ�]{2,}", t):
         return ""
-    # 「地図アプリで見る」「マップ」「Google マップ」などの地図誘導はカット
-    map_noise_re = re.compile(r"(地図アプリ|マップ|Google\s*マップ|地図|map|アクセス)", re.I)
+    # 「地図/マップ/アクセス」やスクリプト断片が出たらそこまででカット
+    map_noise_re = re.compile(
+        r"(地図アプリ|地図で見る|マップ|Google\s*マップ|map|アクセス|ルート|拡大地図|gac?\.push|gtag|_gaq|googletagmanager|<script|function\s*\()",
+        re.I,
+    )
     m_map = map_noise_re.search(t)
     if m_map:
         t = t[: m_map.start()].strip()
