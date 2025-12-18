@@ -964,6 +964,13 @@ class CompanyScraper:
         # 住所/所在地が混入しているケースを除外
         if re.search(r"(所在地|住所|本社|所在地:|住所:)", text):
             return None
+        # 業務/部門名が混入しているケースを除外
+        business_terms = (
+            "建設", "建築", "土木", "工事", "施工", "管理", "品質", "安全", "環境",
+            "技術", "技能", "営業", "企画", "製造", "サービス", "メンテ", "生産", "部", "課", "室"
+        )
+        if any(term in text for term in business_terms):
+            return None
         # 文末の助詞/説明終端を落とす
         text = re.sub(r"(さん|は|です|でした|となります|となっております)$", "", text).strip()
         lower_text = text.lower()
@@ -2726,28 +2733,35 @@ class CompanyScraper:
         sequential_texts: List[str] = []
 
         if html:
-            try:
-                soup = BeautifulSoup(html, "html.parser")
-            except Exception:
-                soup = None
-            if soup:
-                for table in soup.find_all("table"):
-                    for row in table.find_all("tr"):
-                        cells = row.find_all(["th", "td"])
-                        if len(cells) < 2:
-                            continue
-                        label = cells[0].get_text(separator=" ", strip=True)
-                        value = cells[1].get_text(separator=" ", strip=True)
-                        if label and value:
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+        except Exception:
+            soup = None
+        if soup:
+            for table in soup.find_all("table"):
+                for row in table.find_all("tr"):
+                    cells = row.find_all(["th", "td"])
+                    if len(cells) < 2:
+                        continue
+                    label = cells[0].get_text(separator=" ", strip=True)
+                    value = cells[1].get_text(separator=" ", strip=True)
+                    if label and value:
+                        # 代表者ラベルは優先度を上げるため先頭に積む
+                        if any(rep_kw in label for rep_kw in TABLE_LABEL_MAP["rep_names"]):
+                            pair_values.insert(0, (label, value, True))
+                        else:
                             pair_values.append((label, value, True))
 
-                for dl in soup.find_all("dl"):
-                    dts = dl.find_all("dt")
-                    dds = dl.find_all("dd")
-                    for dt, dd in zip(dts, dds):
-                        label = dt.get_text(separator=" ", strip=True)
-                        value = dd.get_text(separator=" ", strip=True)
-                        if label and value:
+            for dl in soup.find_all("dl"):
+                dts = dl.find_all("dt")
+                dds = dl.find_all("dd")
+                for dt, dd in zip(dts, dds):
+                    label = dt.get_text(separator=" ", strip=True)
+                    value = dd.get_text(separator=" ", strip=True)
+                    if label and value:
+                        if any(rep_kw in label for rep_kw in TABLE_LABEL_MAP["rep_names"]):
+                            pair_values.insert(0, (label, value, True))
+                        else:
                             pair_values.append((label, value, True))
 
                 try:

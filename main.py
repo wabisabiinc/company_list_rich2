@@ -1345,15 +1345,9 @@ async def process():
                                 log.info("[%s] AI公式だが都道府県だけの入力で社名/ホスト根拠なしのため除外: %s", cid, record.get("url"))
                                 continue
                             if addr and not address_ok:
-                                manager.upsert_url_flag(
-                                    normalized_url,
-                                    is_official=False,
-                                    source="rule",
-                                    reason="address_mismatch_input",
-                                )
-                                fallback_cands.append((record.get("url"), extracted))
-                                log.info("[%s] AI公式でも入力住所と一致せず除外: %s", cid, record.get("url"))
-                                continue
+                                # AI公式なら住所不一致でも公式候補は維持し、reviewに回す
+                                force_review = True
+                                log.info("[%s] AI公式だが入力住所と一致せず -> 公式維持でreview: %s", cid, record.get("url"))
                             # ホストに社名トークンも名称ヒットも無ければ公式にしない
                             if not host_token_hit and not name_hit:
                                 manager.upsert_url_flag(
