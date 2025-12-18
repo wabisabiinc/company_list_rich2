@@ -259,6 +259,35 @@ def addr_compatible(input_addr: str, found_addr: str) -> bool:
         return True
     return input_addr[:8] in found_addr or found_addr[:8] in input_addr
 
+
+FREE_HOST_SUFFIXES = (
+    ".wixsite.com", ".ameblo.jp", ".fc2.com", ".jimdo.com", ".blogspot.com",
+    ".note.jp", ".hatena.ne.jp", ".weebly.com", ".wordpress.com", ".tumblr.com",
+)
+
+
+def _is_free_host(url: str) -> bool:
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return False
+    if host.startswith("www."):
+        host = host[4:]
+    return any(host.endswith(suf) for suf in FREE_HOST_SUFFIXES)
+
+
+def _official_signal_ok(
+    *,
+    host_token_hit: bool,
+    strong_domain_host: bool,
+    domain_score: int,
+    name_hit: bool,
+    address_ok: bool,
+) -> bool:
+    strong_domain = host_token_hit or strong_domain_host or domain_score >= 4
+    name_or_addr = name_hit or address_ok or host_token_hit
+    return bool(strong_domain and name_or_addr)
+
 def pick_best_address(expected_addr: str | None, candidates: list[str]) -> str | None:
     normalized_candidates = []
     for cand in candidates:
@@ -520,6 +549,11 @@ def clean_description_value(val: str) -> str:
     stripped = text.strip("・-—‐－ー")
     if "<" in stripped or "class=" in stripped or "svg" in stripped:
         return ""
+    # URL/メール/TEL系は説明にしない
+    if re.search(r"https?://|mailto:|@|＠|tel[:：]|電話|ＴＥＬ|ＴＥＬ：", stripped, flags=re.I):
+        return ""
+    if any(term in stripped for term in ("お問い合わせ", "お問合せ", "アクセス", "予約", "営業時間")):
+        return ""
     policy_blocks = (
         "方針",
         "ポリシー",
@@ -574,7 +608,7 @@ def extract_description_snippet(text: str | None) -> str | None:
     noise_patterns = (
         r"採用", r"求人", r"募集", r"ニュース", r"お知らせ", r"新着", r"イベント",
         r"\d{4}\s*年\s*\d{1,2}\s*月", r"\d{4}/\d{1,2}/\d{1,2}", r"\d{4}-\d{1,2}-\d{1,2}",
-        r"会社概要", r"事業概要", r"法人概要", r"沿革"
+        r"会社概要", r"事業概要", r"法人概要", r"沿革", r"アクセス", r"お問い合わせ", r"お問合せ", r"営業時間"
     )
     cleaned_paragraphs: list[str] = []
     for para in paragraphs:
@@ -623,8 +657,11 @@ def extract_lead_description(html: str | None) -> str | None:
     except Exception:
         return None
     candidates: list[str] = []
+    noise_re = re.compile(r"(お問い合わせ|お問合せ|アクセス|採用|求人|募集|news|menu|nav|http|https|tel[:：]|電話)", re.I)
     for tag in soup.find_all(["h1", "h2", "p"], limit=8):
         text = tag.get_text(separator=" ", strip=True)
+        if noise_re.search(text):
+            continue
         cleaned = clean_description_value(text)
         if cleaned:
             candidates.append(cleaned)
@@ -659,10 +696,9 @@ def _sanitize_ai_text_block(text: str | None) -> str:
             continue
         lowered = line.lower()
         if any(keyword in lowered for keyword in nav_keywords):
-            if DIGIT_RE.search(line) or "〒" in line:
-                pass
-            else:
-                continue
+            continue
+        if re.search(r"https?://|mailto:|@|＠|tel[:：]|電話|ＴＥＬ|ＴＥＬ：", line, flags=re.I):
+            continue
         cleaned_lines.append(line)
     result = " ".join(cleaned_lines)
     result = re.sub(r"\s+", " ", result).strip()
@@ -1361,6 +1397,22 @@ async def process():
                             homepage_official_source = "ai"
                             homepage_official_score = float(rule_details.get("score") or 0.0)
                             chosen_domain_score = domain_score
+                            if _is_free_host(homepage) or not _official_signal_ok(
+                                host_token_hit=host_token_hit,
+                                strong_domain_host=strong_domain_host,
+                                domain_score=domain_score,
+                                name_hit=name_hit,
+                                address_ok=address_ok,
+                            ):
+                                homepage_official_flag = 0
+                                homepage_official_source = "provisional_freehost"
+                                force_review = True
+                                manager.upsert_url_flag(
+                                    normalized_url,
+                                    is_official=False,
+                                    source="rule",
+                                    reason="free_host_or_weak_signals",
+                                )
                             if not name_hit and not address_ok:
                                 force_review = True
                             manager.upsert_url_flag(
@@ -1440,6 +1492,22 @@ async def process():
                         homepage_official_source = "rule"
                         homepage_official_score = float(rule_details.get("score") or 0.0)
                         chosen_domain_score = domain_score
+                        if _is_free_host(homepage) or not _official_signal_ok(
+                            host_token_hit=host_token_hit,
+                            strong_domain_host=strong_domain_host,
+                            domain_score=domain_score,
+                            name_hit=name_hit,
+                            address_ok=address_ok,
+                        ):
+                            homepage_official_flag = 0
+                            homepage_official_source = "provisional_freehost"
+                            force_review = True
+                            manager.upsert_url_flag(
+                                normalized_url,
+                                is_official=False,
+                                source="rule",
+                                reason="free_host_or_weak_signals",
+                            )
                         manager.upsert_url_flag(
                             normalized_url,
                             is_official=True,
@@ -2332,6 +2400,11 @@ async def process():
                         confidence = 0.8
                     else:
                         confidence = 0.4
+                    if homepage and homepage_official_flag == 1 and matches < 2:
+                        log.info("[%s] verify_on_siteで根拠不足のため公式フラグを降格 (matches=%s): %s", cid, matches, homepage)
+                        homepage_official_flag = 0
+                        homepage_official_source = "verify_fail"
+                        force_review = True
                 else:
                     if urls:
                         log.info("[%s] 公式サイト候補を判別できず -> 未保存", cid)

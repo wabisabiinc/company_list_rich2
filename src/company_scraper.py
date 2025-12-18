@@ -205,12 +205,12 @@ TABLE_LABEL_MAP = {
         "理事長",
         "代表社員",
         "代表理事",
-        "会頭",
         "組合長",
         "院長",
         "学長",
         "園長",
         "校長",
+        "役員",
     ),
     "capitals": ("資本金", "出資金", "資本金(百万円)", "資本金(万円)"),
     "revenues": (
@@ -945,7 +945,11 @@ class CompanyScraper:
             return None
         if any(word in text for word in ("株式会社", "有限会社", "合名会社", "合資会社", "合同会社")):
             return None
-        for stop in ("創業", "創立", "創設", "メッセージ", "ご挨拶", "からの", "決裁", "沿革", "代表挨拶", "お問い合わせ", "お問合せ", "問合せ", "取引先", "主な取引"):
+        for stop in (
+            "創業", "創立", "創設", "メッセージ", "ご挨拶", "からの", "決裁",
+            "沿革", "代表挨拶", "お問い合わせ", "お問合せ", "問合せ", "取引先", "主な取引",
+            "顧問", "顧問弁護士", "顧問社労士", "弁護士", "司法書士", "行政書士", "税理士", "社労士",
+        ):
             if stop in text:
                 return None
         for stop in ("就任", "あいさつ", "ごあいさつ", "挨拶", "あいさつ文", "就任のご挨拶"):
@@ -2692,7 +2696,7 @@ class CompanyScraper:
         # 追加の代表者抽出: キーワードの近傍にある漢字氏名を拾う
         if not reps:
             rep_kw_pattern = re.compile(
-                r"(代表取締役社長|代表取締役会長|代表取締役|代表理事長|代表理事|代表者|社長|会長|会頭|理事長|組合長|院長|学長|園長|校長)[^\n\r]{0,20}?([一-龥]{2,5}(?:\s*[一-龥]{2,5})?)"
+                r"(代表取締役社長|代表取締役会長|代表取締役|代表理事長|代表理事|代表者|社長|会長|理事長|組合長|院長|学長|園長|校長)[^\n\r]{0,20}?([一-龥]{2,5}(?:\s*[一-龥]{2,5})?)"
             )
             for m in rep_kw_pattern.finditer(text or ""):
                 name_cand = m.group(2)
@@ -2807,6 +2811,8 @@ class CompanyScraper:
             norm_label = label.replace("：", ":").strip()
             raw_value = self._clean_text_value(value)
             if not raw_value:
+                continue
+            if "顧問" in norm_label or "弁護士" in norm_label or "社労士" in norm_label:
                 continue
             # ニュース/人事系のラベルはスキップ
             label_block = ("退任", "就任", "人事", "異動", "お知らせ", "ニュース", "採用")

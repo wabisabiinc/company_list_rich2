@@ -34,6 +34,20 @@ def first(*vals):
     return None
 
 
+def clean_description_text(val):
+    if val is None:
+        return None
+    text = unicodedata.normalize("NFKC", str(val))
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return None
+    if re.search(r"https?://|mailto:|@|＠|tel[:：]|電話|ＴＥＬ|ＴＥＬ：", text, flags=re.I):
+        return None
+    if any(term in text for term in ("お問い合わせ", "お問合せ", "アクセス", "採用", "求人", "予約")):
+        return None
+    return text
+
+
 def clean(val):
     if val is None:
         return None
@@ -74,7 +88,7 @@ def normalize_row(row):
     homepage = first(*(row.get(key) for key in HOMEPAGE_KEYS))
     rep_name = first(*(row.get(key) for key in REP_KEYS))
     rep_name = CompanyScraper.clean_rep_name(rep_name) if rep_name else None
-    description = first(*(row.get(key) for key in DESC_KEYS))
+    description = clean_description_text(first(*(row.get(key) for key in DESC_KEYS)))
     industry = first(*(row.get(key) for key in INDUSTRY_KEYS))
     data = {
         "hubspot_id": clean(row.get("レコードID")),
