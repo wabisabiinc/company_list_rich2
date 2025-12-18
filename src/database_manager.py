@@ -569,6 +569,9 @@ class DatabaseManager:
             s = s.translate(str.maketrans("０１２３４５６７８９－ー―‐／", "0123456789----/"))
             s = re.sub(r"\s+", " ", s)
             s = s.replace("〒 ", "〒").replace("〒", "〒")
+            # 典型的なUTF-8モジバケ（ã,Â,� が連続する）を落とす
+            if re.search(r"[ãÂ�]{2,}", s):
+                return ""
             return s.strip()
 
         def set_value(column: str, value: Any) -> None:

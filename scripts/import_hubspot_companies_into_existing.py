@@ -1,4 +1,5 @@
 import csv, sys, os, re, sqlite3
+from src.company_scraper import CompanyScraper  # rep_name の簡易クレンジングに再利用
 
 DB_PATH = os.environ.get("COMPANIES_DB_PATH", "data/companies.db")
 HOMEPAGE_KEYS = ("ホームページ", "HP", "Webサイト", "website")
@@ -71,6 +72,7 @@ def determine_pk(data):
 def normalize_row(row):
     homepage = first(*(row.get(key) for key in HOMEPAGE_KEYS))
     rep_name = first(*(row.get(key) for key in REP_KEYS))
+    rep_name = CompanyScraper.clean_rep_name(rep_name) if rep_name else None
     description = first(*(row.get(key) for key in DESC_KEYS))
     industry = first(*(row.get(key) for key in INDUSTRY_KEYS))
     data = {

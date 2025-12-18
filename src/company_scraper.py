@@ -503,6 +503,25 @@ class CompanyScraper:
             return self.http_session.get(url, **kwargs)
         return requests.get(url, **kwargs)
 
+    @staticmethod
+    def _detect_html_encoding(resp: requests.Response, raw: bytes) -> str:
+        """
+        レスポンスヘッダが ISO-8859-1 固定で返ってくるサイト対策。
+        - meta charset を優先
+        - それが無ければ apparent_encoding（chardet）を利用
+        - 最後に UTF-8
+        """
+        try:
+            if raw:
+                m = re.search(br'charset=["\']?([\w-]+)', raw[:10240], flags=re.I)
+                if m:
+                    return m.group(1).decode("ascii", "ignore") or "utf-8"
+        except Exception:
+            pass
+        if resp.apparent_encoding:
+            return resp.apparent_encoding
+        return "utf-8"
+
     # ===== 公式判定ヘルパ =====
     @classmethod
     def _normalize_company_name(cls, company_name: str) -> str:
@@ -2083,8 +2102,11 @@ class CompanyScraper:
                 headers={"User-Agent": "Mozilla/5.0"},
             )
             resp.raise_for_status()
-            text = resp.text or ""
-            html = resp.text or ""
+            raw = resp.content or b""
+            encoding = self._detect_html_encoding(resp, raw)
+            decoded = raw.decode(encoding, errors="replace") if raw else ""
+            text = decoded or ""
+            html = decoded or ""
             elapsed_ms = (time.monotonic() - started) * 1000
             if self.slow_page_threshold_ms > 0 and elapsed_ms > self.slow_page_threshold_ms and host:
                 self._add_slow_host(host)
