@@ -222,6 +222,13 @@ def sanitize_text_block(text: str | None) -> str:
     # 典型的なUTF-8モジバケを検知したら破棄
     if re.search(r"[ãÂ�]{2,}", t):
         return ""
+    # 「地図アプリで見る」「マップ」「Google マップ」などの地図誘導はカット
+    map_noise_re = re.compile(r"(地図アプリ|マップ|Google\s*マップ|地図|map|アクセス)", re.I)
+    m_map = map_noise_re.search(t)
+    if m_map:
+        t = t[: m_map.start()].strip()
+    if not t:
+        return ""
     return t
 
 
@@ -387,6 +394,10 @@ def pick_best_rep(names: list[str], source_url: str | None = None) -> str | None
         is_table = cleaned.startswith("[TABLE]")
         if is_table:
             cleaned = cleaned.replace("[TABLE]", "", 1).strip()
+        low_role = False
+        if cleaned.startswith("[LOWROLE]"):
+            low_role = True
+            cleaned = cleaned.replace("[LOWROLE]", "", 1).strip()
         if not cleaned:
             continue
         if any(b in cleaned for b in blocked):
@@ -396,6 +407,8 @@ def pick_best_rep(names: list[str], source_url: str | None = None) -> str | None
             score += 5
         if any(k in cleaned for k in role_keywords):
             score += 8
+        if low_role:
+            score -= 6
         if score > best_score:
             best_score = score
             best = cleaned

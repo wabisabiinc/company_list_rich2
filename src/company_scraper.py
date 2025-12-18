@@ -809,6 +809,12 @@ class CompanyScraper:
         val = re.split(r"(?:TEL|Tel|tel|電話|☎|℡)[:：]?\s*", val)[0]
         val = re.split(r"https?://|href=|HREF=", val)[0]
         val = re.sub(r"\s+", " ", val).strip(" \"'")
+        # 地図・マップ系が出たらそこまででカット
+        m_map = re.search(r"(地図アプリ|マップ|Google\s*マップ|地図|map)", val, flags=re.I)
+        if m_map:
+            val = val[: m_map.start()].strip()
+        if not val:
+            return ""
         return val
 
     @staticmethod
@@ -1995,7 +2001,7 @@ class CompanyScraper:
 
         for target in targets:
             try:
-                info = await self.get_page_info(target)
+                info = await self.get_page_info(target, allow_slow=True)
             except Exception:
                 continue
             text = info.get("text", "") or ""
@@ -2094,6 +2100,7 @@ class CompanyScraper:
             host = ""
         if host and (host in self.HARD_EXCLUDE_HOSTS or self._is_excluded(host)):
             return {"url": url, "text": "", "html": ""}
+        # 公式候補ホストはスキップ対象から除外するため、上位層で呼び分ける
         if host and self.skip_slow_hosts and host in self.slow_hosts:
             log.info("[http] skip slow host %s url=%s", host, url)
             return {"url": url, "text": "", "html": ""}
@@ -2126,7 +2133,7 @@ class CompanyScraper:
             return {"url": url, "text": "", "html": ""}
 
     # ===== ページ取得（ブラウザ再利用＋軽いリトライ） =====
-    async def get_page_info(self, url: str, timeout: int | None = None, need_screenshot: bool = False) -> Dict[str, Any]:
+    async def get_page_info(self, url: str, timeout: int | None = None, need_screenshot: bool = False, allow_slow: bool = False) -> Dict[str, Any]:
         """
         対象URLの本文テキストとフルページスクショを取得（2回まで再試行）
         """
@@ -2141,7 +2148,7 @@ class CompanyScraper:
             text_len = len((http_info.get("text") or "").strip())
             html_len = len(http_info.get("html") or "")
             # 軽量取得で十分な本文/HTMLが取れた場合のみ即返す。薄い場合はブラウザで再取得。
-            if text_len >= 120 or html_len >= 1200:
+            if text_len >= 200 or html_len >= 1800:
                 self.page_cache[url] = {
                     "url": url,
                     "text": http_info.get("text", "") or "",
@@ -2166,7 +2173,9 @@ class CompanyScraper:
         if host and (host in self.HARD_EXCLUDE_HOSTS or self._is_excluded(host)):
             return {"url": url, "text": "", "html": "", "screenshot": b""}
 
-        if host and self.skip_slow_hosts and host in self.slow_hosts:
+        # 公式候補などで明示的に許可された場合は skip_slow_hosts を無視できるようにする
+        # 上位で allow_slow=True をセットする呼び出しを追加する。
+        if host and self.skip_slow_hosts and host in self.slow_hosts and not allow_slow:
             log.info("[page] skip slow host %s url=%s", host, url)
             fallback = {"url": url, "text": "", "html": "", "screenshot": b""}
             if cached:
@@ -2644,6 +2653,7 @@ class CompanyScraper:
             cursor = zm.end()
             snippet = (text or "")[cursor:cursor + 200]
             snippet = snippet.replace("\n", " ").replace("\r", " ").replace("\u3000", " ")
+            snippet = re.split(r"(地図アプリ|マップ|Google\s*マップ|地図|map|アクセス)", snippet, maxsplit=1)[0]
             if ADDR_HINT.search(snippet):
                 cleaned = re.split(r"[。．、,，;；｜|/]", snippet, maxsplit=1)[0]
                 cleaned = re.sub(r"\s+", " ", cleaned)
@@ -2819,16 +2829,19 @@ class CompanyScraper:
             if any(b in norm_label for b in label_block):
                 continue
             matched = False
-            for field, keywords in TABLE_LABEL_MAP.items():
-                if any(keyword in norm_label for keyword in keywords):
-                    if field == "rep_names":
-                        cleaned = self.clean_rep_name(raw_value)
-                        if cleaned and self._looks_like_person_name(cleaned):
-                            normalized_rep = cleaned if not is_table_pair else f"[TABLE]{cleaned}"
-                            label_reps.append(normalized_rep)
-                            reps.append(normalized_rep)
-                            rep_from_label = True
-                            matched = True
+                    for field, keywords in TABLE_LABEL_MAP.items():
+                        if any(keyword in norm_label for keyword in keywords):
+                            if field == "rep_names":
+                                cleaned = self.clean_rep_name(raw_value)
+                                if cleaned and self._looks_like_person_name(cleaned):
+                                    strong_role = bool(re.search(r"(代表取締役|代表者|社長|会長|理事長)", raw_value))
+                                    normalized_rep = cleaned if not is_table_pair else f"[TABLE]{cleaned}"
+                                    if ("役員" in norm_label) and not strong_role:
+                                        normalized_rep = f"[LOWROLE]{normalized_rep}"
+                                    label_reps.append(normalized_rep)
+                                    reps.append(normalized_rep)
+                                    rep_from_label = True
+                                    matched = True
                     elif field == "phone_numbers":
                         for p in PHONE_RE.finditer(raw_value):
                             cand = _normalize_phone_strict(f"{p.group(1)}-{p.group(2)}-{p.group(3)}")
