@@ -1,13 +1,118 @@
+import argparse
 import csv, sys, os, re, sqlite3, unicodedata
+from pathlib import Path
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 from src.company_scraper import CompanyScraper  # rep_name の簡易クレンジングに再利用
 
-DB_PATH = os.environ.get("COMPANIES_DB_PATH", "data/companies.db")
-HOMEPAGE_KEYS = ("ホームページ", "HP", "Webサイト", "website")
-REP_KEYS = ("代表者名", "代表取締役", "代表者")
-DESC_KEYS = ("説明文", "会社説明", "備考")
-INDUSTRY_KEYS = ("業種", "業界")
-PHONE_SOURCE_VALUE = "hubspot"
-ADDRESS_SOURCE_VALUE = "hubspot"
+DEFAULT_DB_PATH = os.environ.get("COMPANIES_DB_PATH", "data/companies.db")
+DB_PATH = DEFAULT_DB_PATH
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS companies (
+    id INTEGER PRIMARY KEY,
+    company_name   TEXT,
+    address        TEXT,
+    employee_count INTEGER,
+    homepage       TEXT,
+    phone          TEXT,
+    found_address  TEXT,
+    status         TEXT DEFAULT 'pending',
+    locked_by      TEXT,
+    locked_at      TEXT,
+    rep_name       TEXT,
+    description    TEXT,
+    listing        TEXT,
+    revenue        TEXT,
+    profit         TEXT,
+    capital        TEXT,
+    fiscal_month   TEXT,
+    founded_year   TEXT,
+    ai_used        INTEGER DEFAULT 0,
+    ai_model       TEXT,
+    phone_source   TEXT,
+    address_source TEXT,
+    extract_confidence REAL,
+    last_checked_at TEXT,
+    hubspot_id     TEXT,
+    corporate_number     TEXT,
+    corporate_number_norm TEXT,
+    source_csv     TEXT,
+    reference_homepage TEXT,
+    reference_phone TEXT,
+    reference_address TEXT,
+    accuracy_homepage TEXT,
+    accuracy_phone TEXT,
+    accuracy_address TEXT,
+    homepage_official_flag INTEGER,
+    homepage_official_source TEXT,
+    homepage_official_score REAL,
+    source_url_phone TEXT,
+    source_url_address TEXT,
+    source_url_rep TEXT
+);
+"""
+INDEX_SQL = [
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_companies_name_addr ON companies(company_name, address);",
+    "CREATE INDEX IF NOT EXISTS idx_companies_status ON companies(status);",
+    "CREATE INDEX IF NOT EXISTS idx_companies_emp ON companies(employee_count);",
+    "CREATE INDEX IF NOT EXISTS idx_companies_corporate_number_norm ON companies(corporate_number_norm);",
+    "CREATE INDEX IF NOT EXISTS idx_companies_hubspot_id ON companies(hubspot_id);",
+]
+
+DATASET_CONFIGS = {
+    "hubspot": {
+        "homepage_keys": ("ホームページ", "HP", "Webサイト", "website"),
+        "rep_keys": ("代表者名", "代表取締役", "代表者"),
+        "desc_keys": ("説明文", "会社説明", "備考"),
+        "industry_keys": ("業種", "業界"),
+        "phone_source": "hubspot",
+        "address_source": "hubspot",
+    },
+    "logistics": {
+        "homepage_keys": ("ホームページ", "HP", "Webサイト", "website"),
+        "rep_keys": ("代表者名", "代表取締役", "代表者"),
+        "desc_keys": ("説明文", "会社説明", "備考"),
+        "industry_keys": ("業種_保険DB", "業種グループ", "業種", "業界"),
+        "phone_source": "logistics_csv",
+        "address_source": "logistics_csv",
+    },
+}
+
+CURRENT_CONFIG = DATASET_CONFIGS["hubspot"]
+HOMEPAGE_KEYS = CURRENT_CONFIG["homepage_keys"]
+REP_KEYS = CURRENT_CONFIG["rep_keys"]
+DESC_KEYS = CURRENT_CONFIG["desc_keys"]
+INDUSTRY_KEYS = CURRENT_CONFIG["industry_keys"]
+PHONE_SOURCE_VALUE = CURRENT_CONFIG["phone_source"]
+ADDRESS_SOURCE_VALUE = CURRENT_CONFIG["address_source"]
+
+
+def apply_dataset_config(name: str):
+    global CURRENT_CONFIG, HOMEPAGE_KEYS, REP_KEYS, DESC_KEYS, INDUSTRY_KEYS, PHONE_SOURCE_VALUE, ADDRESS_SOURCE_VALUE
+    if name not in DATASET_CONFIGS:
+        raise ValueError(f"Unknown dataset: {name}")
+    CURRENT_CONFIG = DATASET_CONFIGS[name]
+    HOMEPAGE_KEYS = CURRENT_CONFIG["homepage_keys"]
+    REP_KEYS = CURRENT_CONFIG["rep_keys"]
+    DESC_KEYS = CURRENT_CONFIG["desc_keys"]
+    INDUSTRY_KEYS = CURRENT_CONFIG["industry_keys"]
+    PHONE_SOURCE_VALUE = CURRENT_CONFIG["phone_source"]
+    ADDRESS_SOURCE_VALUE = CURRENT_CONFIG["address_source"]
+
+
+def ensure_db_schema():
+    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.executescript(SCHEMA_SQL)
+        for sql in INDEX_SQL:
+            con.execute(sql)
+        con.commit()
+    finally:
+        con.close()
 
 
 def existing_cols():
@@ -23,8 +128,16 @@ def existing_cols():
 def to_int(s):
     if s is None:
         return None
-    s = re.sub(r"[^0-9]", "", str(s))
-    return int(s) if s else None
+    if isinstance(s, (int, float)):
+        return int(s)
+    val = str(s).strip().replace(",", "")
+    if not val:
+        return None
+    try:
+        return int(float(val))
+    except ValueError:
+        digits = re.sub(r"[^0-9]", "", val)
+        return int(digits) if digits else None
 
 
 def first(*vals):
@@ -251,18 +364,25 @@ def process_csv(csv_path, cols, employee_col):
 
 
 def main(args):
-    if not args:
-        print("Usage: python scripts/import_hubspot_companies_into_existing.py <csv> [<csv> ...]")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Import HubSpot/Logistics CSVs into the companies DB.")
+    parser.add_argument("--db", default=DEFAULT_DB_PATH, help="Path to the SQLite DB (new files are created if missing)")
+    parser.add_argument("--dataset", choices=DATASET_CONFIGS.keys(), default="hubspot", help="Column mapping preset")
+    parser.add_argument("csvs", nargs="+", help="CSV files to import")
+    parsed = parser.parse_args(args)
+
+    global DB_PATH
+    DB_PATH = parsed.db
+    apply_dataset_config(parsed.dataset)
+    ensure_db_schema()
     cols = existing_cols()
     if not cols:
         print("companies table not found in database.")
         sys.exit(3)
     employee_col = resolve_employee_col(cols)
     total = 0
-    for csv_path in args:
+    for csv_path in parsed.csvs:
         total += process_csv(csv_path, cols, employee_col)
-    print(f"Imported/Merged {total} rows into companies (safe).")
+    print(f"Imported/Merged {total} rows into companies (dataset={parsed.dataset}).")
 
 
 if __name__ == "__main__":

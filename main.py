@@ -15,8 +15,18 @@ from bs4 import BeautifulSoup
 
 from src.database_manager import DatabaseManager
 from src.company_scraper import CompanyScraper, CITY_RE
-from src.ai_verifier import AIVerifier, DEFAULT_MODEL as AI_MODEL_NAME, _normalize_amount as ai_normalize_amount
+from src.ai_verifier import (
+    AIVerifier,
+    DEFAULT_MODEL as AI_MODEL_NAME,
+    AI_CALL_TIMEOUT_SEC,
+    _normalize_amount as ai_normalize_amount,
+)
 from src.reference_checker import ReferenceChecker
+from src.jp_number import normalize_kanji_numbers
+
+class HardTimeout(Exception):
+    """Raised when the per-company hard time limit is exceeded."""
+    pass
 
 # --------------------------------------------------
 # ロギング設定
@@ -41,6 +51,7 @@ load_dotenv()
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 USE_AI = os.getenv("USE_AI", "true").lower() == "true"
 WORKER_ID = os.getenv("WORKER_ID", "w1")  # 並列識別子
+COMPANIES_DB_PATH = os.getenv("COMPANIES_DB_PATH", "data/companies.db")
 
 MAX_ROWS = int(os.getenv("MAX_ROWS", "0"))
 ID_MIN = int(os.getenv("ID_MIN", "0"))
@@ -519,6 +530,7 @@ def clean_listing_value(val: str) -> str:
 
 def clean_amount_value(val: str) -> str:
     raw = (val or "").strip()
+    raw = normalize_kanji_numbers(raw)
     if not raw:
         return ""
     # 従業員数など人員系の表記を除外
@@ -902,7 +914,7 @@ async def process():
             log.warning("scraper.start() はスキップ（未実装または失敗）", exc_info=True)
 
     verifier = AIVerifier() if USE_AI else None
-    manager = DatabaseManager(worker_id=WORKER_ID)
+    manager = DatabaseManager(db_path=COMPANIES_DB_PATH, worker_id=WORKER_ID)
 
     csv_file = None
     csv_writer = None
@@ -1005,17 +1017,46 @@ async def process():
             def over_deep_phase_deadline() -> bool:
                 return deep_phase_deadline is not None and time.monotonic() > deep_phase_deadline
 
+            hard_timeout_logged = False
+            ai_call_timeout = AI_CALL_TIMEOUT_SEC or 20.0
+
+            def raise_hard_timeout(stage: str) -> None:
+                nonlocal timed_out, hard_timeout_logged
+                timed_out = True
+                if not company.get("error_code"):
+                    company["error_code"] = "timeout"
+                if not hard_timeout_logged:
+                    log.info("[%s] hard timeout reached (%s) at %.1fs", cid, stage, elapsed())
+                    hard_timeout_logged = True
+                raise HardTimeout(stage)
+
+            def ensure_global_time(stage: str = "") -> None:
+                if over_hard_deadline():
+                    raise_hard_timeout(stage or "global_deadline")
+
+            def clamp_timeout(desired: float) -> float:
+                remaining = hard_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise_hard_timeout("global_deadline")
+                if desired <= 0:
+                    return max(0.1, remaining)
+                return max(0.1, min(desired, remaining))
+
+            fatal_error = False
             try:
-                candidate_limit = SEARCH_CANDIDATE_LIMIT
+                try:
+                    candidate_limit = SEARCH_CANDIDATE_LIMIT
                 company_tokens = scraper._company_tokens(name)  # type: ignore
                 try:
                     if SEARCH_PHASE_TIMEOUT_SEC > 0:
                         urls = await asyncio.wait_for(
                             scraper.search_company(name, addr, num_results=candidate_limit),
-                            timeout=SEARCH_PHASE_TIMEOUT_SEC,
+                            timeout=clamp_timeout(SEARCH_PHASE_TIMEOUT_SEC),
                         )
                     else:
+                        ensure_global_time("search_company_start")
                         urls = await scraper.search_company(name, addr, num_results=candidate_limit)
+                    ensure_global_time("search_company_end")
                 except asyncio.TimeoutError:
                     log.info(
                         "[%s] search_company timeout (%.1fs) -> review",
@@ -1051,6 +1092,10 @@ async def process():
                     if SLEEP_BETWEEN_SEC > 0:
                         await asyncio.sleep(jittered_seconds(SLEEP_BETWEEN_SEC, JITTER_RATIO))
                     continue
+                max_candidates = max(1, min(3, candidate_limit))
+                if len(urls) > max_candidates:
+                    log.info("[%s] limiting candidates to top %s (had %s)", cid, max_candidates, len(urls))
+                    urls = urls[:max_candidates]
                 url_flags_map, host_flags_map = manager.get_url_flags_batch(urls)
                 homepage = ""
                 info = None
@@ -1073,7 +1118,7 @@ async def process():
                     async with fetch_sem:
                         return await asyncio.wait_for(
                             scraper.get_page_info(candidate, allow_slow=allow_slow),
-                            timeout=try_timeout,
+                            timeout=clamp_timeout(try_timeout),
                         )
 
                 async def prepare_candidate(idx: int, candidate: str):
@@ -1220,6 +1265,8 @@ async def process():
 
                 if over_fetch_limit() or over_time_limit():
                     timed_out = True
+                    if over_hard_deadline():
+                        raise_hard_timeout("candidate_phase")
                 if homepage and over_after_official():
                     timed_out = True
 
@@ -1251,6 +1298,7 @@ async def process():
                         await asyncio.sleep(jittered_seconds(SLEEP_BETWEEN_SEC, JITTER_RATIO))
                     continue
 
+                ensure_global_time("after_candidate_records")
                 ai_official_attempted = False
                 selected_candidate_record: dict[str, Any] | None = None
                 if USE_AI and verifier is not None and hasattr(verifier, "judge_official_homepage"):
@@ -1275,12 +1323,15 @@ async def process():
                             record["info"] = info_payload
                             ai_started = time.monotonic()
                             try:
-                                ai_verdict = await verifier.judge_official_homepage(
-                                    info_payload.get("text", "") or "",
-                                    info_payload.get("screenshot"),
-                                    name,
-                                    addr,
-                                    record.get("normalized_url") or record.get("url"),
+                                ai_verdict = await asyncio.wait_for(
+                                    verifier.judge_official_homepage(
+                                        info_payload.get("text", "") or "",
+                                        info_payload.get("screenshot"),
+                                        name,
+                                        addr,
+                                        record.get("normalized_url") or record.get("url"),
+                                    ),
+                                    timeout=clamp_timeout(max(ai_call_timeout, 5.0)),
                                 )
                             except Exception:
                                 log.warning("[%s] AI公式判定失敗: %s", cid, record.get("url"), exc_info=True)
@@ -1999,6 +2050,8 @@ async def process():
                     # まず「会社概要/企業情報/会社情報」系の優先リンクを先に巡回して主要情報を拾う
                     if over_hard_deadline() or over_time_limit() or over_deep_phase_deadline():
                         timed_out = True
+                        if over_hard_deadline():
+                            raise_hard_timeout("priority_docs")
                         priority_docs = {}
                     else:
                         should_fetch_priority = (
@@ -2021,7 +2074,7 @@ async def process():
                                     target_types=["about", "contact", "finance"] if should_fetch_priority else None,
                                     exclude_urls=set(priority_docs.keys()) if priority_docs else None,
                                 ),
-                                timeout=PAGE_FETCH_TIMEOUT_SEC,
+                                timeout=clamp_timeout(PAGE_FETCH_TIMEOUT_SEC),
                             ) if should_fetch_priority else {}
                         except Exception:
                             early_priority_docs = {}
@@ -2032,9 +2085,6 @@ async def process():
                         missing_contact, missing_extra = refresh_need_flags()
                         fully_filled = False
                         related = {}
-                        goto_finalize = True
-                    else:
-                        goto_finalize = False
 
                     cands = primary_cands or {}
                     phones = cands.get("phone_numbers") or []
@@ -2097,6 +2147,8 @@ async def process():
 
                     if over_time_limit():
                         timed_out = True
+                        if over_hard_deadline():
+                            raise_hard_timeout("after_priority_docs")
 
                     fully_filled = homepage and missing_contact == 0 and missing_extra == 0
 
@@ -2128,7 +2180,7 @@ async def process():
                                     allow_slow=missing_contact > 0,
                                     exclude_urls=set(priority_docs.keys()) if priority_docs else None,
                                 ),
-                                timeout=PAGE_FETCH_TIMEOUT_SEC,
+                                timeout=clamp_timeout(PAGE_FETCH_TIMEOUT_SEC),
                             )
                     except Exception:
                         site_docs = {}
@@ -2169,11 +2221,14 @@ async def process():
                         nonlocal ai_time_spent
                         ai_started = time.monotonic()
                         try:
-                            res = await verifier.verify_info(
-                                ai_text_payload,
-                                info_dict.get("screenshot"),
-                                name,
-                                addr,
+                            res = await asyncio.wait_for(
+                                verifier.verify_info(
+                                    ai_text_payload,
+                                    info_dict.get("screenshot"),
+                                    name,
+                                    addr,
+                                ),
+                                timeout=clamp_timeout(max(ai_call_timeout, 5.0)),
                             )
                         except Exception:
                             log.warning("[%s] AI検証失敗 -> ルールベースにフォールバック", cid, exc_info=True)
@@ -2221,11 +2276,14 @@ async def process():
                     try:
                         info_dict = await ensure_info_has_screenshot(scraper, info_url, info_dict, need_screenshot=OFFICIAL_AI_USE_SCREENSHOT)
                         ai_started = time.monotonic()
-                        ai_result = await verifier.verify_info(
-                            build_ai_text_payload(info_dict.get("text", "")),
-                            info_dict.get("screenshot"),
-                            name,
-                            addr,
+                        ai_result = await asyncio.wait_for(
+                            verifier.verify_info(
+                                build_ai_text_payload(info_dict.get("text", "")),
+                                info_dict.get("screenshot"),
+                                name,
+                                addr,
+                            ),
+                            timeout=clamp_timeout(max(ai_call_timeout, 5.0)),
                         )
                         ai_time_spent += time.monotonic() - ai_started
                         ai_attempted = True
@@ -2238,11 +2296,14 @@ async def process():
                 missing_contact, missing_extra = refresh_need_flags()
                 if need_description and verifier is not None and info_dict and not timed_out:
                     desc_source = select_relevant_paragraphs(info_dict.get("text", "") or "")
-                    ai_desc = await verifier.generate_description(
-                        build_ai_text_payload(desc_source),
-                        info_dict.get("screenshot"),
-                        name,
-                        addr,
+                    ai_desc = await asyncio.wait_for(
+                        verifier.generate_description(
+                            build_ai_text_payload(desc_source),
+                            info_dict.get("screenshot"),
+                            name,
+                            addr,
+                        ),
+                        timeout=clamp_timeout(max(ai_call_timeout, 5.0)),
                     )
                     if ai_desc:
                         description_val = ai_desc
@@ -2275,7 +2336,10 @@ async def process():
                                 nonlocal ai_time_spent
                                 ai_started = time.monotonic()
                                 try:
-                                    return await verifier.verify_info(combined_text, screenshot_payload, name, addr)
+                                    return await asyncio.wait_for(
+                                        verifier.verify_info(combined_text, screenshot_payload, name, addr),
+                                        timeout=clamp_timeout(max(ai_call_timeout, 5.0)),
+                                    )
                                 except Exception:
                                     return None
                                 finally:
@@ -2309,7 +2373,10 @@ async def process():
                         combined_sources = [select_relevant_paragraphs(v.get("text", "") or "") for v in priority_docs.values()]
                         combined_text = build_ai_text_payload(*combined_sources)
                         screenshot_payload = (info_dict or {}).get("screenshot") if info_dict else None
-                        ai_desc2 = await verifier.generate_description(combined_text, screenshot_payload, name, addr)
+                        ai_desc2 = await asyncio.wait_for(
+                            verifier.generate_description(combined_text, screenshot_payload, name, addr),
+                            timeout=clamp_timeout(max(ai_call_timeout, 5.0)),
+                        )
                         if ai_desc2:
                             description_val = ai_desc2
                             need_description = False
@@ -2385,6 +2452,8 @@ async def process():
                         if not weak_provisional_target and not timed_out and ((missing_contact > 0) or need_extra_fields):
                             if over_time_limit() or over_deep_limit() or over_hard_deadline() or over_deep_phase_deadline():
                                 timed_out = True
+                                if over_hard_deadline():
+                                    raise_hard_timeout("related_crawl")
                             else:
                                 max_hops = RELATED_MAX_HOPS_PHONE if need_phone else RELATED_MAX_HOPS_BASE
                                 try:
@@ -2405,7 +2474,7 @@ async def process():
                                             need_description=need_description,
                                             initial_info=info_dict if info_url == homepage else None,
                                         ),
-                                        timeout=PAGE_FETCH_TIMEOUT_SEC,
+                                        timeout=clamp_timeout(PAGE_FETCH_TIMEOUT_SEC),
                                     )
                                 except Exception:
                                     related = {}
@@ -2486,7 +2555,7 @@ async def process():
                                     allow_slow=need_addr,
                                     exclude_urls=set(priority_docs.keys()) if priority_docs else None,
                                 ),
-                                timeout=PAGE_FETCH_TIMEOUT_SEC,
+                                timeout=clamp_timeout(PAGE_FETCH_TIMEOUT_SEC),
                             )
                         except Exception:
                             extra_docs = {}
@@ -2518,7 +2587,7 @@ async def process():
                                     found_address or addr or rule_address or None,
                                     fetch_limit=3,
                                 ),
-                                timeout=PAGE_FETCH_TIMEOUT_SEC,
+                                timeout=clamp_timeout(PAGE_FETCH_TIMEOUT_SEC),
                             )
                             verify_result_source = "online"
                         except Exception:
@@ -2547,234 +2616,245 @@ async def process():
                     company["description"] = company.get("description", "") or ""
                     confidence = 0.4
 
-                # 公式サイトが無い場合のみ、検索結果の非公式ページから連絡先を補完
-                if not homepage and (not phone or not found_address or not rep_name_val):
-                    for url, data in fallback_cands:
-                        if not phone and data.get("phone_numbers"):
-                            cand = pick_best_phone(data["phone_numbers"])
-                            if cand:
-                                phone = cand
-                                phone_source = "rule"
-                                src_phone = url
-                        if not found_address and data.get("addresses"):
-                            cand_addr = pick_best_address(addr, data["addresses"])
-                            if cand_addr:
-                                found_address = cand_addr
-                                address_source = "rule"
-                                src_addr = url
-                        if not rep_name_val and data.get("rep_names"):
-                            cand_rep = pick_best_rep(data["rep_names"], url)
-                            cand_rep = scraper.clean_rep_name(cand_rep) if cand_rep else None
-                            if cand_rep:
-                                rep_name_val = cand_rep
-                                src_rep = url
-                        if phone and found_address and rep_name_val:
-                            break
-
-                if not listing_val:
-                    for url, data in fallback_cands:
-                        values = data.get("listings") or []
-                        candidate = pick_best_listing(values)
-                        if candidate:
-                            listing_val = candidate
-                            break
-                if not capital_val:
-                    for url, data in fallback_cands:
-                        values = data.get("capitals") or []
-                        candidate = pick_best_amount(values)
-                        if candidate:
-                            capital_val = candidate
-                            break
-                if not revenue_val:
-                    for url, data in fallback_cands:
-                        values = data.get("revenues") or []
-                        candidate = pick_best_amount(values)
-                        if candidate:
-                            revenue_val = candidate
-                            break
-                if not profit_val:
-                    for url, data in fallback_cands:
-                        values = data.get("profits") or []
-                        candidate = pick_best_amount(values)
-                        if candidate:
-                            profit_val = candidate
-                            break
-                if not fiscal_val:
-                    for url, data in fallback_cands:
-                        values = data.get("fiscal_months") or []
-                        if values:
-                            cleaned_fallback_fiscal = clean_fiscal_month(values[0] or "")
-                            if cleaned_fallback_fiscal:
-                                fiscal_val = cleaned_fallback_fiscal
-                                break
-                if not founded_val:
-                    for url, data in fallback_cands:
-                        values = data.get("founded_years") or []
-                        if values:
-                            cleaned_fallback_founded = clean_founded_year(values[0] or "")
-                            if cleaned_fallback_founded:
-                                founded_val = cleaned_fallback_founded
-                                break
-
-                found_address = sanitize_text_block(found_address)
-                rule_address = sanitize_text_block(rule_address)
-                if found_address and not looks_like_address(found_address):
-                    found_address = ""
-                if not found_address and rule_address:
-                    found_address = rule_address
-                if found_address and not looks_like_address(found_address):
-                    found_address = ""
-                normalized_found_address = normalize_address(found_address) if found_address else ""
-                if not normalized_found_address and addr:
-                    normalized_found_address = normalize_address(addr) or ""
-                rep_name_val = scraper.clean_rep_name(rep_name_val) or ""
-                description_val = clean_description_value(sanitize_text_block(description_val))
-                listing_val = clean_listing_value(listing_val)
-                capital_val = ai_normalize_amount(capital_val) or clean_amount_value(capital_val)
-                revenue_val = ai_normalize_amount(revenue_val) or clean_amount_value(revenue_val)
-                profit_val = ai_normalize_amount(profit_val) or clean_amount_value(profit_val)
-                fiscal_val = clean_fiscal_month(fiscal_val)
-                founded_val = clean_founded_year(founded_val)
-                company.update({
-                    "homepage": homepage,
-                    "phone": phone or "",
-                    "found_address": normalized_found_address,
-                    "rep_name": rep_name_val,
-                    "description": description_val,
-                    "listing": listing_val,
-                    "revenue": revenue_val,
-                    "profit": profit_val,
-                    "capital": capital_val,
-                    "fiscal_month": fiscal_val,
-                    "founded_year": founded_val,
-                    "phone_source": phone_source,
-                    "address_source": address_source,
-                    "ai_used": ai_used,
-                    "ai_model": ai_model,
-                    "extract_confidence": confidence,
-                    "source_url_phone": src_phone,
-                    "source_url_address": src_addr,
-                    "source_url_rep": src_rep,
-                    "homepage_official_flag": homepage_official_flag,
-                    "homepage_official_source": homepage_official_source,
-                    "homepage_official_score": homepage_official_score,
-                })
-
-                had_verify_target = bool(
-                    phone or rule_phone or found_address or rule_address or addr
-                )
-
-                if REFERENCE_CHECKER:
-                    accuracy_payload = REFERENCE_CHECKER.evaluate(company)
-                    if accuracy_payload:
-                        company.update(accuracy_payload)
-
-                # 暫定URLは強いドメイン/社名ヒットが無ければ保存しない
-                if (
-                    homepage
-                    and homepage_official_flag == 0
-                    and homepage_official_source.startswith("provisional")
-                ):
-                    strong_provisional = (
-                        (chosen_domain_score >= 4)
-                        or (provisional_host_token and chosen_domain_score >= 3)
-                        or (provisional_name_present and chosen_domain_score >= 3)
-                        or (provisional_address_ok and chosen_domain_score >= 4)
-                    )
-                    if not strong_provisional:
-                        log.info(
-                            "[%s] 暫定URLを保存しません (domain_score=%s host_token=%s name=%s addr=%s): %s",
-                            cid,
-                            chosen_domain_score,
-                            provisional_host_token,
-                            provisional_name_present,
-                            provisional_address_ok,
-                            homepage,
-                        )
-                        homepage = ""
-                        homepage_official_source = ""
-                        homepage_official_score = 0.0
-                        chosen_domain_score = 0
-
-                status = "done" if homepage else "no_homepage"
-                if timed_out:
-                    company["error_code"] = "timeout"
-                    status = "review"
-                if not homepage and candidate_records:
-                    status = "review"
-                if status == "done" and found_address and not addr_compatible(addr, found_address):
-                    status = "review"
-                if (
-                    status == "done"
-                    and had_verify_target
-                    and not verify_result.get("phone_ok")
-                    and not verify_result.get("address_ok")
-                    and chosen_domain_score < 5
-                ):
-                    status = "review"
-                if force_review and status != "error":
-                    status = "review"
-                if status == "done" and chosen_domain_score and chosen_domain_score < 4 and homepage_official_source in ("ai", "rule"):
-                    status = "review"
-                if status == "review" and homepage_official_source == "provisional" and not verify_result.get("phone_ok") and not verify_result.get("address_ok"):
-                    # 暫定URLで検証できない場合でも、深掘り/AI結果があれば保持し、ホームページは空に戻さない
-                    pass
-
-                if status == "done":
-                    strong_official = bool(
-                        homepage
-                        and homepage_official_flag == 1
-                        and (chosen_domain_score or 0) >= 4
-                        and (not addr or not found_address or addr_compatible(addr, found_address))
-                        and (
-                            not had_verify_target
-                            or verify_result.get("phone_ok")
-                            or verify_result.get("address_ok")
-                        )
-                    )
-                    if not strong_official:
-                        status = "review"
-
-                company.setdefault("error_code", "")
-
-                total_elapsed = elapsed()
-                if not search_phase_end:
-                    search_phase_end = total_elapsed
-                if not official_phase_end:
-                    official_phase_end = search_phase_end
-                if not deep_phase_end:
-                    deep_phase_end = total_elapsed
-                search_time = search_phase_end
-                official_time = max(0.0, official_phase_end - search_phase_end)
-                deep_time = max(0.0, deep_phase_end - official_phase_end)
-                log.info(
-                    "[%s] timings: search=%.1fs official=%.1fs deep=%.1fs ai=%.1fs total=%.1fs verify=%s",
-                    cid,
-                    search_time,
-                    official_time,
-                    deep_time,
-                    ai_time_spent,
-                    total_elapsed,
-                    verify_result_source,
-                )
-                try:
-                    log_phase_metric(cid, "search", search_time, status, homepage, company.get("error_code", ""))
-                    log_phase_metric(cid, "official", official_time, status, homepage, company.get("error_code", ""))
-                    log_phase_metric(cid, "deep", deep_time, status, homepage, company.get("error_code", ""))
-                    log_phase_metric(cid, "ai", ai_time_spent, status, homepage, company.get("error_code", ""))
-                    log_phase_metric(cid, "total", total_elapsed, status, homepage, company.get("error_code", ""))
+                except HardTimeout:
+                    raise
                 except Exception:
-                    log.debug("phase metrics skipped", exc_info=True)
+                    fatal_error = True
+                    raise
+                finally:
+                    if fatal_error:
+                        pass
+                    else:
+                        # 公式サイトが無い場合のみ、検索結果の非公式ページから連絡先を補完
+                        if not homepage and (not phone or not found_address or not rep_name_val):
+                            for url, data in fallback_cands:
+                                if not phone and data.get("phone_numbers"):
+                                    cand = pick_best_phone(data["phone_numbers"])
+                                    if cand:
+                                        phone = cand
+                                        phone_source = "rule"
+                                        src_phone = url
+                                if not found_address and data.get("addresses"):
+                                    cand_addr = pick_best_address(addr, data["addresses"])
+                                    if cand_addr:
+                                        found_address = cand_addr
+                                        address_source = "rule"
+                                        src_addr = url
+                                if not rep_name_val and data.get("rep_names"):
+                                    cand_rep = pick_best_rep(data["rep_names"], url)
+                                    cand_rep = scraper.clean_rep_name(cand_rep) if cand_rep else None
+                                    if cand_rep:
+                                        rep_name_val = cand_rep
+                                        src_rep = url
+                                if phone and found_address and rep_name_val:
+                                    break
 
-                manager.save_company_data(company, status=status)
-                log.info("[%s] 保存完了: status=%s elapsed=%.1fs (worker=%s)", cid, status, elapsed(), WORKER_ID)
+                        if not listing_val:
+                            for url, data in fallback_cands:
+                                values = data.get("listings") or []
+                                candidate = pick_best_listing(values)
+                                if candidate:
+                                    listing_val = candidate
+                                    break
+                        if not capital_val:
+                            for url, data in fallback_cands:
+                                values = data.get("capitals") or []
+                                candidate = pick_best_amount(values)
+                                if candidate:
+                                    capital_val = candidate
+                                    break
+                        if not revenue_val:
+                            for url, data in fallback_cands:
+                                values = data.get("revenues") or []
+                                candidate = pick_best_amount(values)
+                                if candidate:
+                                    revenue_val = candidate
+                                    break
+                        if not profit_val:
+                            for url, data in fallback_cands:
+                                values = data.get("profits") or []
+                                candidate = pick_best_amount(values)
+                                if candidate:
+                                    profit_val = candidate
+                                    break
+                        if not fiscal_val:
+                            for url, data in fallback_cands:
+                                values = data.get("fiscal_months") or []
+                                if values:
+                                    cleaned_fallback_fiscal = clean_fiscal_month(values[0] or "")
+                                    if cleaned_fallback_fiscal:
+                                        fiscal_val = cleaned_fallback_fiscal
+                                        break
+                        if not founded_val:
+                            for url, data in fallback_cands:
+                                values = data.get("founded_years") or []
+                                if values:
+                                    cleaned_fallback_founded = clean_founded_year(values[0] or "")
+                                    if cleaned_fallback_founded:
+                                        founded_val = cleaned_fallback_founded
+                                        break
 
-                if csv_writer:
-                    csv_writer.writerow({k: company.get(k, "") for k in CSV_FIELDNAMES})
-                    csv_file.flush()
+                        found_address = sanitize_text_block(found_address)
+                        rule_address = sanitize_text_block(rule_address)
+                        if found_address and not looks_like_address(found_address):
+                            found_address = ""
+                        if not found_address and rule_address:
+                            found_address = rule_address
+                        if found_address and not looks_like_address(found_address):
+                            found_address = ""
+                        normalized_found_address = normalize_address(found_address) if found_address else ""
+                        if not normalized_found_address and addr:
+                            normalized_found_address = normalize_address(addr) or ""
+                        rep_name_val = scraper.clean_rep_name(rep_name_val) or ""
+                        description_val = clean_description_value(sanitize_text_block(description_val))
+                        listing_val = clean_listing_value(listing_val)
+                        capital_val = ai_normalize_amount(capital_val) or clean_amount_value(capital_val)
+                        revenue_val = ai_normalize_amount(revenue_val) or clean_amount_value(revenue_val)
+                        profit_val = ai_normalize_amount(profit_val) or clean_amount_value(profit_val)
+                        fiscal_val = clean_fiscal_month(fiscal_val)
+                        founded_val = clean_founded_year(founded_val)
+                        company.update({
+                            "homepage": homepage,
+                            "phone": phone or "",
+                            "found_address": normalized_found_address,
+                            "rep_name": rep_name_val,
+                            "description": description_val,
+                            "listing": listing_val,
+                            "revenue": revenue_val,
+                            "profit": profit_val,
+                            "capital": capital_val,
+                            "fiscal_month": fiscal_val,
+                            "founded_year": founded_val,
+                            "phone_source": phone_source,
+                            "address_source": address_source,
+                            "ai_used": ai_used,
+                            "ai_model": ai_model,
+                            "extract_confidence": confidence,
+                            "source_url_phone": src_phone,
+                            "source_url_address": src_addr,
+                            "source_url_rep": src_rep,
+                            "homepage_official_flag": homepage_official_flag,
+                            "homepage_official_source": homepage_official_source,
+                            "homepage_official_score": homepage_official_score,
+                        })
 
-                processed += 1
+                        had_verify_target = bool(
+                            phone or rule_phone or found_address or rule_address or addr
+                        )
 
+                        if REFERENCE_CHECKER:
+                            accuracy_payload = REFERENCE_CHECKER.evaluate(company)
+                            if accuracy_payload:
+                                company.update(accuracy_payload)
+
+                        # 暫定URLは強いドメイン/社名ヒットが無ければ保存しない
+                        if (
+                            homepage
+                            and homepage_official_flag == 0
+                            and homepage_official_source.startswith("provisional")
+                        ):
+                            strong_provisional = (
+                                (chosen_domain_score >= 4)
+                                or (provisional_host_token and chosen_domain_score >= 3)
+                                or (provisional_name_present and chosen_domain_score >= 3)
+                                or (provisional_address_ok and chosen_domain_score >= 4)
+                            )
+                            if not strong_provisional:
+                                log.info(
+                                    "[%s] 暫定URLを保存しません (domain_score=%s host_token=%s name=%s addr=%s): %s",
+                                    cid,
+                                    chosen_domain_score,
+                                    provisional_host_token,
+                                    provisional_name_present,
+                                    provisional_address_ok,
+                                    homepage,
+                                )
+                                homepage = ""
+                                homepage_official_source = ""
+                                homepage_official_score = 0.0
+                                chosen_domain_score = 0
+
+                        status = "done" if homepage else "no_homepage"
+                        if timed_out:
+                            company["error_code"] = "timeout"
+                            status = "review"
+                        if not homepage and candidate_records:
+                            status = "review"
+                        if status == "done" and found_address and not addr_compatible(addr, found_address):
+                            status = "review"
+                        if (
+                            status == "done"
+                            and had_verify_target
+                            and not verify_result.get("phone_ok")
+                            and not verify_result.get("address_ok")
+                            and chosen_domain_score < 5
+                        ):
+                            status = "review"
+                        if force_review and status != "error":
+                            status = "review"
+                        if status == "done" and chosen_domain_score and chosen_domain_score < 4 and homepage_official_source in ("ai", "rule"):
+                            status = "review"
+                        if status == "review" and homepage_official_source == "provisional" and not verify_result.get("phone_ok") and not verify_result.get("address_ok"):
+                            # 暫定URLで検証できない場合でも、深掘り/AI結果があれば保持し、ホームページは空に戻さない
+                            pass
+
+                        if status == "done":
+                            strong_official = bool(
+                                homepage
+                                and homepage_official_flag == 1
+                                and (chosen_domain_score or 0) >= 4
+                                and (not addr or not found_address or addr_compatible(addr, found_address))
+                                and (
+                                    not had_verify_target
+                                    or verify_result.get("phone_ok")
+                                    or verify_result.get("address_ok")
+                                )
+                            )
+                            if not strong_official:
+                                status = "review"
+
+                        company.setdefault("error_code", "")
+
+                        total_elapsed = elapsed()
+                        if not search_phase_end:
+                            search_phase_end = total_elapsed
+                        if not official_phase_end:
+                            official_phase_end = search_phase_end
+                        if not deep_phase_end:
+                            deep_phase_end = total_elapsed
+                        search_time = search_phase_end
+                        official_time = max(0.0, official_phase_end - search_phase_end)
+                        deep_time = max(0.0, deep_phase_end - official_phase_end)
+                        log.info(
+                            "[%s] timings: search=%.1fs official=%.1fs deep=%.1fs ai=%.1fs total=%.1fs verify=%s",
+                            cid,
+                            search_time,
+                            official_time,
+                            deep_time,
+                            ai_time_spent,
+                            total_elapsed,
+                            verify_result_source,
+                        )
+                        try:
+                            log_phase_metric(cid, "search", search_time, status, homepage, company.get("error_code", ""))
+                            log_phase_metric(cid, "official", official_time, status, homepage, company.get("error_code", ""))
+                            log_phase_metric(cid, "deep", deep_time, status, homepage, company.get("error_code", ""))
+                            log_phase_metric(cid, "ai", ai_time_spent, status, homepage, company.get("error_code", ""))
+                            log_phase_metric(cid, "total", total_elapsed, status, homepage, company.get("error_code", ""))
+                        except Exception:
+                            log.debug("phase metrics skipped", exc_info=True)
+
+                        manager.save_company_data(company, status=status)
+                        log.info("[%s] 保存完了: status=%s elapsed=%.1fs (worker=%s)", cid, status, elapsed(), WORKER_ID)
+
+                        if csv_writer:
+                            csv_writer.writerow({k: company.get(k, "") for k in CSV_FIELDNAMES})
+                            csv_file.flush()
+
+                        processed += 1
+
+            except HardTimeout:
+                pass
             except Exception as e:
                 log.error("[%s] エラー: %s (worker=%s)", cid, e, WORKER_ID, exc_info=True)
                 manager.update_status(cid, "error")

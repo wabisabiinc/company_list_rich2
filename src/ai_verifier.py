@@ -9,6 +9,8 @@ import base64
 import hashlib
 from typing import Optional, Dict, Any
 
+from .jp_number import normalize_kanji_numbers
+
 # ---- .env -------------------------------------------------------
 try:
     from dotenv import load_dotenv
@@ -129,7 +131,7 @@ def _normalize_listing(val: Any) -> Optional[str]:
 def _normalize_amount(val: Any) -> Optional[str]:
     if not val:
         return None
-    text = unicodedata.normalize("NFKC", str(val))
+    text = normalize_kanji_numbers(unicodedata.normalize("NFKC", str(val)))
     text = re.sub(r"\s+", "", text)
     if not text:
         return None

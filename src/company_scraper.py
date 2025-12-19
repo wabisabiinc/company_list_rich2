@@ -170,16 +170,20 @@ REP_RE = re.compile(
     r"\s*[:：]?\s*([^\n\r<>\|（）\(\)]{1,40})"
 )
 LISTING_RE = re.compile(r"(?:上場(?:区分|市場|先)?|株式上場|未上場|非上場|未公開|非公開)\s*[:：]?\s*([^\s、。\n]+)")
-CAPITAL_RE = re.compile(r"資本金\s*[:：]?\s*([0-9０-９,.]+(?:兆|億|万|千)?(?:円|百万円|千円)?)")
+KANJI_AMOUNT_CHARS = "0-9０-９零〇一二三四五六七八九十百千万億兆"
+
+CAPITAL_RE = re.compile(
+    rf"資本金\s*[:：]?\s*([△▲-]?\s*[{KANJI_AMOUNT_CHARS},\.]+(?:兆|億|万|千)?(?:円|百万円|千円|万円)?)"
+)
 REVENUE_RE = re.compile(
     r"(?:売上高|売上|売上収益|売上額|営業収益|営業収入|事業収益|年商|売上総額|売上金額|売上高（連結）|売上収益（連結）|売上高\(連結\)|売上収益\(連結\))"
     r"\s*[:：]?\s*"
-    r"([△▲-]?\s*[0-9０-９,.]+(?:兆|億|万|千)?(?:円|百万円|千円)?)"
+    rf"([△▲-]?\s*[{KANJI_AMOUNT_CHARS},\.]+(?:兆|億|万|千)?(?:円|百万円|千円|万円)?)"
 )
 PROFIT_RE = re.compile(
     r"(?:営業利益|経常利益|純利益|当期純利益|営業損益|経常損益|税引後利益|純損益|損益|損失|赤字|営業利益（連結）|経常利益（連結）|純利益（連結）)"
     r"\s*[:：]?\s*"
-    r"([△▲-]?\s*[0-9０-９,.]+(?:兆|億|万|千)?(?:円|百万円|千円)?)"
+    rf"([△▲-]?\s*[{KANJI_AMOUNT_CHARS},\.]+(?:兆|億|万|千)?(?:円|百万円|千円|万円)?)"
 )
 FISCAL_RE = re.compile(
     r"(?:決算(?:月|期|日)?|会計年度|会計期)\s*[:：]?\s*([0-9０-９]{1,2}月(?:末)?|[0-9０-９]{1,2}月期|Q[1-4])",
@@ -837,7 +841,7 @@ class CompanyScraper:
             return False
         if re.search(r"(名|人)\b", val):
             return False
-        if not re.search(r"[0-9０-９]", val):
+        if not re.search(rf"[{KANJI_AMOUNT_CHARS}]", val):
             return False
         return bool(re.search(r"(円|万|億|兆)", val))
 
