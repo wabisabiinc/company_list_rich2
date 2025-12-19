@@ -210,6 +210,30 @@ def _shorten_text(text: str, max_len: int = 3500) -> str:
     tail = t[- max_len // 2 :]
     return head + "\n...\n" + tail
 
+def _text_contexts(text: str, pattern: str, window: int = 28) -> list[str]:
+    """
+    Return nearby contexts for regex matches in normalized text (NFKC).
+    """
+    if not text:
+        return []
+    t = unicodedata.normalize("NFKC", text)
+    out: list[str] = []
+    try:
+        for m in re.finditer(pattern, t, flags=re.IGNORECASE):
+            s = max(0, m.start() - window)
+            e = min(len(t), m.end() + window)
+            out.append(t[s:e])
+    except re.error:
+        return []
+    return out
+
+def _digits_fuzzy_pattern(digits: str) -> Optional[str]:
+    d = re.sub(r"\D", "", digits or "")
+    if len(d) < 8:
+        return None
+    sep = r"[\\s\\-‐―－ー]*"
+    return sep.join(map(re.escape, list(d)))
+
 # ---- main -------------------------------------------------------
 class AIVerifier:
     def __init__(self, model=None, listoss_data: Dict[str, dict] = None, db_path: str = 'data/companies.db'):
@@ -272,18 +296,21 @@ class AIVerifier:
     def _build_prompt(self, text: str, company_name: str = "", address: str = "") -> str:
         snippet = _shorten_text(text or "", max_len=3500)
         return (
-            "あなたは企業サイトから企業情報を抽出する専門家です。別会社を混ぜず、わからない項目は必ずnullにしてください。推測禁止。\n"
-            "JSONのみを返してください（説明やマークダウン不要）。\n"
+            "あなたは日本企業の公式Webサイトから「代表電話番号」と「本社/本店所在地住所」を抽出する専門家です。\n"
+            "推測は禁止。確証がない場合は null を返してください。\n"
+            "出力はJSONのみ（説明文やマークダウンは禁止）。\n"
+            "重要:\n"
+            "- 支店・営業所・事業所・工場・店舗・センター・倉庫・拠点一覧の住所は、本社/本店である確証がない限り採用しない。\n"
+            "- FAX/直通/採用窓口/問い合わせ窓口など、代表以外の番号は採用しない。\n"
+            "- Cookie/利用規約/ナビ/フッター/メニュー等の定型文やHTML/CSS/JS断片を住所に混ぜない。\n"
             f"対象企業: {company_name or '不明'} / 入力住所: {address or '不明'}\n"
             "{\n"
             '  "phone_number": "03-1234-5678" または null,\n'
-            '  "address": "〒123-4567 東京都..." または null (郵便番号が無ければ都道府県から始めてください),\n'
-            '  "rep_name": "代表取締役 山田太郎" または null,\n'
-            '  "description": "1文 60-120文字で事業内容のみ。お問い合わせ/採用/ニュース/挨拶/アクセス/予約の情報は入れない" または null\n'
+            '  "address": "東京都新宿区西新宿1-1-1 ○○ビル3F" または null,\n'
+            '  "confidence": 0.0-1.0,\n'
+            '  "evidence": "根拠となる原文抜粋（20〜80文字程度）" または null\n'
             "}\n"
-            "禁止: 推測、問い合わせ/採用/アクセス/予約/ニュース/挨拶情報の混入、汎用語(氏名/名前/役職/担当/選任/概要など)をrep_nameにすること。\n"
-            "代表者は現任のみ。退任/就任/人事異動/お知らせ/プレスリリースの氏名は rep_name に含めない。\n"
-            "住所は本文に無ければ null。description は文末を句点で終える1文のみ。\n"
+            "evidence は必ず入力（本文テキスト/スクショ内テキスト）に存在する原文の短い抜粋のみ。存在しない文言を作らない。\n"
             f"# 本文テキスト抜粋\n{snippet}\n"
         )
 
@@ -353,24 +380,22 @@ class AIVerifier:
 
             phone = _normalize_phone(result.get("phone_number"))
             addr = _normalize_address(result.get("address"))
+            confidence_val = result.get("confidence")
+            try:
+                confidence = float(confidence_val) if confidence_val is not None else None
+            except Exception:
+                confidence = None
+            if confidence is None:
+                confidence = 0.0
+            confidence = max(0.0, min(1.0, confidence))
 
-            rep_name = result.get("rep_name", result.get("representative"))
-            if isinstance(rep_name, str):
-                rep_name = rep_name.strip() or None
+            evidence_raw = result.get("evidence")
+            evidence: Optional[str]
+            if isinstance(evidence_raw, str):
+                cleaned = re.sub(r"\s+", " ", evidence_raw.strip())
+                evidence = cleaned[:80] if len(cleaned) >= 20 else None
             else:
-                rep_name = None
-
-            description = result.get("description")
-            if isinstance(description, str):
-                description = re.sub(r"\s+", " ", description.strip()) or None
-                if description:
-                    banned_terms = ("お問い合わせ", "お問合せ", "採用", "求人", "アクセス", "予約")
-                    if any(term in description for term in banned_terms):
-                        description = None
-                    elif len(description) > 120:
-                        description = description[:120].rstrip()
-            else:
-                description = None
+                evidence = None
 
             # -------- AI結果バリデーション --------
             def _looks_like_address(a: str) -> bool:
@@ -378,53 +403,75 @@ class AIVerifier:
                     return False
                 if "<" in a or ">" in a:
                     return False
+                if re.search(r"(cookie|privacy|プライバシ|利用規約|サイトマップ|copyright|©|nav|menu|footer|javascript|function\\s*\\()", a, flags=re.I):
+                    return False
                 has_zip = bool(re.search(r"\d{3}-\d{4}", a))
                 has_pref_city = bool(re.search(r"(都|道|府|県).+?(市|区|郡|町|村)", a))
                 return has_zip or has_pref_city
 
-            def _clean_desc(desc: Optional[str]) -> Optional[str]:
-                if not desc:
-                    return None
-                if "http://" in desc or "https://" in desc:
-                    return None
-                if not re.search(r"[ぁ-んァ-ン一-龥a-zA-Z]", desc):
-                    return None
-                if len(desc) < 12:
-                    return None
-                return desc
-
             if addr and not _looks_like_address(addr):
                 addr = None
-            description = _clean_desc(description)
-            if rep_name:
-                rep_name = re.sub(r"[\x00-\x1f\x7f]", " ", rep_name).strip()
-                if not re.search(r"[ぁ-んァ-ン一-龥a-zA-Z]", rep_name):
-                    rep_name = None
 
-            homepage_url = result.get("homepage_url")
-            if isinstance(homepage_url, str):
-                homepage_url = homepage_url.strip() or None
-            else:
-                homepage_url = None
-            if not homepage_url:
-                company_key = ((company_name or "").strip(), (address or "").strip())
-                ref = self.listoss_data.get(company_key)
-                if ref:
-                    homepage_url = (ref.get("hp") or "").strip() or None
+            if evidence and not (phone or addr):
+                evidence = None
 
-            if not any([phone, addr, rep_name, description, homepage_url]):
-                log.warning("AI result rejected: no valid fields after validation")
-                return None
+            # ---- contextual rejection (avoid common mis-picks) ----
+            # If the number/address appears only in clearly non-representative contexts, drop it.
+            if phone and text:
+                pat = _digits_fuzzy_pattern(phone)
+                if pat:
+                    ctxs = _text_contexts(text, pat, window=32)
+                    if ctxs:
+                        allow = ("代表", "代表電話", "TEL", "電話")
+                        deny = (
+                            "FAX", "ファックス", "ﾌｧｯｸｽ",
+                            "直通", "ダイヤルイン", "内線",
+                            "採用", "求人", "エントリー",
+                            "問い合わせ", "お問合せ", "お問合わせ", "お問い合わせ",
+                            "窓口", "サポート", "カスタマー",
+                        )
+                        ok = False
+                        for c in ctxs:
+                            has_allow = any(k in c for k in allow)
+                            has_deny = any(k in c for k in deny)
+                            if has_allow and not ("FAX" in c or "ファックス" in c or "ﾌｧｯｸｽ" in c):
+                                ok = True
+                                break
+                            if not has_deny:
+                                ok = True
+                                break
+                        if not ok:
+                            phone = None
 
-            out: Dict[str, Any] = {
+            if addr and text:
+                # First: if the extracted address itself contains strong branch keywords and not HQ keywords, reject.
+                hq_markers = ("本社", "本店", "本社所在地", "本店所在地")
+                branch_markers = ("支店", "営業所", "事業所", "工場", "店舗", "センター", "倉庫", "拠点", "サテライト")
+                if any(k in addr for k in branch_markers) and not any(k in addr for k in hq_markers):
+                    addr = None
+                else:
+                    # If we can find the address in the text, use surrounding labels to reject branch-only picks.
+                    nt = re.sub(r"\s+", " ", unicodedata.normalize("NFKC", text))
+                    addr_n = re.sub(r"\s+", " ", unicodedata.normalize("NFKC", addr))
+                    idx = nt.find(addr_n)
+                    if idx != -1:
+                        s = max(0, idx - 32)
+                        e = min(len(nt), idx + len(addr_n) + 32)
+                        ctx = nt[s:e]
+                        has_hq = any(k in ctx for k in hq_markers)
+                        has_branch = any(k in ctx for k in branch_markers)
+                        if has_branch and not has_hq:
+                            addr = None
+
+            if evidence and not (phone or addr):
+                evidence = None
+
+            return {
                 "phone_number": phone,
                 "address": addr,
-                "rep_name": rep_name,
-                "description": description,
+                "confidence": confidence,
+                "evidence": evidence,
             }
-            if homepage_url:
-                out["homepage_url"] = homepage_url
-            return out
 
         except GoogleAPIError as e:
             log.warning(f"Google API error for {company_name} ({address}) with image: {e}")
@@ -500,8 +547,6 @@ class AIVerifier:
         )
         def _build_content(use_image: bool) -> list[Any]:
             payload: list[Any] = []
-            if self.system_prompt:
-                payload.append(self.system_prompt)
             payload.append(prompt)
             if use_image and screenshot:
                 try:

@@ -14,6 +14,8 @@ from playwright.async_api import (
     TimeoutError as PlaywrightTimeoutError, Route
 )
 
+from .site_validator import extract_name_signals, score_name_match
+
 try:
     from pykakasi import kakasi as _kakasi_constructor
 except Exception:
@@ -32,7 +34,7 @@ PRIORITY_PATHS = [
     "/company", "/about", "/corporate", "/会社概要", "/企業情報", "/企業概要",
     "/会社情報", "/会社案内", "/法人案内", "/法人概要",
     # 連絡先系
-    "/contact", "/お問い合わせ", "/アクセス",
+    "/contact", "/access", "/location", "/head-office", "/headquarters", "/お問い合わせ", "/アクセス",
     # IR/決算系
     "/ir", "/investor", "/investor-relations", "/financial", "/disclosure", "/決算",
 ]
@@ -40,7 +42,7 @@ PRIO_WORDS = [
     # 概要系（最優先）
     "会社概要", "企業情報", "企業概要", "会社情報", "法人案内", "法人概要", "会社案内",
     # 連絡先系
-    "お問い合わせ", "アクセス", "連絡先", "窓口", "役員",
+    "お問い合わせ", "アクセス", "連絡先", "所在地", "本社", "本店", "窓口", "役員",
     # IR/決算系
     "IR", "ir", "investor", "financial", "ディスクロージャー", "決算",
 ]
@@ -48,7 +50,7 @@ ANCHOR_PRIORITY_WORDS = [
     # 概要系
     "会社概要", "企業情報", "法人案内", "法人概要", "会社案内", "会社紹介", "会社情報", "法人紹介",
     # 連絡先系
-    "お問い合わせ", "連絡先", "アクセス", "窓口", "役員",
+    "お問い合わせ", "連絡先", "アクセス", "所在地", "本社", "本店", "窓口", "役員",
     # IR/決算系
     "IR", "ir", "investor", "financial", "ディスクロージャー", "決算",
     # 英語系
@@ -137,6 +139,18 @@ PHONE_RE = re.compile(
     r"[-‐―－ー–—.\s]*"
     r"(\d{3,4})"
 )
+
+COOKIE_PRIVACY_LINE_RE = re.compile(
+    r"(cookie|クッキー|cookie\s*policy|privacy\s*policy|プライバシ|個人情報|利用規約|免責|GDPR|同意|consent|同意する|同意します|拒否|accept|reject)",
+    re.IGNORECASE,
+)
+
+NAV_LIKE_LINE_RE = re.compile(
+    r"^(?:ホーム|home|トップ|top|会社概要|企業情報|会社情報|事業内容|サービス|製品|採用|求人|ニュース|お知らせ|ブログ|blog|お問い合わせ|contact|アクセス|sitemap|サイトマップ|menu|メニュー)$",
+    re.IGNORECASE,
+)
+
+COOKIE_NODE_HINT_RE = re.compile(r"(cookie|consent|gdpr|privacy|banner|modal|popup)", re.IGNORECASE)
 
 def _normalize_phone_strict(raw: str) -> Optional[str]:
     if not raw:
@@ -1335,6 +1349,56 @@ class CompanyScraper:
             return str(page.get("text") or ""), str(page.get("html") or "")
         return str(page or ""), ""
 
+    @classmethod
+    def _filter_noise_lines(cls, text: str) -> str:
+        if not text:
+            return ""
+        lines = []
+        for raw in re.split(r"[\r\n]+", text):
+            line = re.sub(r"\s+", " ", raw.strip())
+            if not line:
+                continue
+            # 住所/電話っぽい行は優先して残す
+            if ZIP_RE.search(line) or PREFECTURE_NAME_RE.search(line) or PHONE_RE.search(line):
+                lines.append(line)
+                continue
+            # cookie/プライバシー/同意バナー等を除外
+            if COOKIE_PRIVACY_LINE_RE.search(line):
+                continue
+            # ナビゲーション単語だけの短行を除外
+            if len(line) <= 16 and NAV_LIKE_LINE_RE.match(line):
+                continue
+            if any(k in line.lower() for k in ("breadcrumb", "パンくず", "メニュー", "menu", "nav")) and len(line) <= 40:
+                continue
+            lines.append(line)
+        return "\n".join(lines).strip()
+
+    @classmethod
+    def _clean_text_from_html(cls, html: str, fallback_text: str = "") -> str:
+        if not html:
+            return cls._filter_noise_lines(fallback_text or "")
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+        except Exception:
+            return cls._filter_noise_lines(fallback_text or "")
+
+        for tag in soup.find_all(["script", "style", "nav", "footer", "header", "aside", "noscript", "svg", "canvas", "iframe", "form", "button"]):
+            tag.decompose()
+
+        for node in soup.find_all(True):
+            attrs = " ".join(
+                str(node.get(k) or "")
+                for k in ("id", "class", "role", "aria-label")
+            )
+            if attrs and COOKIE_NODE_HINT_RE.search(attrs):
+                node.decompose()
+
+        base = soup.body or soup
+        text = base.get_text(separator="\n", strip=True)
+        text = unicodedata.normalize("NFKC", text)
+        text = cls._filter_noise_lines(text)
+        return text or cls._filter_noise_lines(fallback_text or "")
+
     @staticmethod
     def _meta_strings(html: str) -> str:
         if not html:
@@ -1374,9 +1438,14 @@ class CompanyScraper:
             address_match: bool = False,
             prefecture_match: bool = False,
             postal_code_match: bool = False,
+            name_match_ratio: float = 0.0,
+            name_match_exact: bool = False,
+            name_match_partial_only: bool = False,
+            name_match_source: str = "",
             domain_score: int = 0,
             host_value: str = "",
             blocked_host: bool = False,
+            prefecture_mismatch: bool = False,
         ) -> bool | Dict[str, Any]:
             payload = {
                 "is_official": is_official,
@@ -1386,9 +1455,14 @@ class CompanyScraper:
                 "address_match": address_match,
                 "prefecture_match": prefecture_match,
                 "postal_code_match": postal_code_match,
+                "name_match_ratio": name_match_ratio,
+                "name_match_exact": name_match_exact,
+                "name_match_partial_only": name_match_partial_only,
+                "name_match_source": name_match_source,
                 "domain_score": domain_score,
                 "host": host_value,
                 "blocked_host": blocked_host,
+                "prefecture_mismatch": prefecture_mismatch,
             }
             return payload if return_details else payload["is_official"]
 
@@ -1469,6 +1543,8 @@ class CompanyScraper:
         meta_snippet = self._meta_strings(html)
         combined = f"{text_snippet}\n{meta_snippet}".strip()
         lowered = combined.lower()
+        signals = extract_name_signals(html or "", text_snippet or "")
+        name_match = score_name_match(company_name or "", signals)
         entity_tags = self._detect_entity_tags(company_name)
         def _entity_suffix_hit(tag: str) -> bool:
             allowed = self.ENTITY_SITE_SUFFIXES.get(tag, ())
@@ -1482,7 +1558,13 @@ class CompanyScraper:
         if not company_tokens:
             host_token_hit = True  # Fallback when romaji tokens cannot be generated
         loose_host_hit = host_token_hit or (company_has_corp and allowed_tld and domain_match_score >= 3)
-        name_present_flag = bool(norm_name and norm_name in combined) or any(tok in host for tok in company_tokens) or any(tok in host_compact for tok in company_tokens) or loose_host_hit
+        name_present_flag = (
+            bool(norm_name and norm_name in combined)
+            or (name_match.ratio >= 0.85 and not name_match.partial_only)
+            or any(tok in host for tok in company_tokens)
+            or any(tok in host_compact for tok in company_tokens)
+            or loose_host_hit
+        )
         strong_domain_flag = company_has_corp and loose_host_hit and (domain_match_score >= 3 or whitelist_hit or is_google_sites)
         # generic_tld is computed above; generic TLDs need name/address corroboration
 
@@ -1497,24 +1579,61 @@ class CompanyScraper:
         if any(kw in host for kw in self.NON_OFFICIAL_KEYWORDS):
             score -= 3
 
+        # タイトル/h1/og:site_name/body冒頭の一致度（部分一致だけは除外寄りにする）
+        if name_match.exact:
+            score += 5
+        elif name_match.ratio >= 0.92 and not name_match.partial_only:
+            score += 3
+        elif name_match.partial_only:
+            score -= 4
+
+        # 入力住所がある場合、ページ側の都道府県が明確に不一致なら低スコア
+        pref_mismatch = False
+        expected_city = ""
+        if expected_pref:
+            expected_city_match = CITY_RE.search(expected_address or "")
+            expected_city = expected_city_match.group(1) if expected_city_match else ""
+            found_prefs = set(PREFECTURE_NAME_RE.findall(combined or ""))
+            # 店舗一覧のような大量列挙は除外（=ペナルティ対象から外す）
+            if 0 < len(found_prefs) <= 3 and expected_pref not in found_prefs:
+                pref_mismatch = True
+                score -= 3
+
+        content_name_ok = bool(norm_name and norm_name in combined) or (name_match.ratio >= 0.85 and not name_match.partial_only)
+        company_name_has_kanji = bool(re.search(r"[一-龥]", norm_name or ""))
+        domain_only_ok = bool(company_name_has_kanji and host_token_hit and domain_match_score >= 5 and not pref_mismatch and not name_match.partial_only)
+
         # ドメインに社名トークンが強く含まれる場合は即公式とみなす
         if host_token_hit and domain_match_score >= 4:
-            return finalize(
-                True,
-                score=max(score, 4),
-                name_present=name_present_flag,
-                strong_domain=True,
-                address_match=False,
-                prefecture_match=False,
-                postal_code_match=False,
-                domain_score=domain_match_score,
-                host_value=host,
-                blocked_host=False,
+            # 部分一致しか根拠が無い候補（例: 株式会社ホンマ -> 本間ゴルフ）を除外する
+            strong_name_ok = (
+                bool(norm_name and norm_name in combined)
+                or name_match.exact
+                or (name_match.ratio >= 0.92 and not name_match.partial_only)
             )
+            if strong_name_ok and not pref_mismatch:
+                return finalize(
+                    True,
+                    score=max(score, 4),
+                    name_present=name_present_flag,
+                    strong_domain=True,
+                    address_match=False,
+                    prefecture_match=False,
+                    postal_code_match=False,
+                    name_match_ratio=name_match.ratio,
+                    name_match_exact=name_match.exact,
+                    name_match_partial_only=name_match.partial_only,
+                    name_match_source=name_match.best_source,
+                    domain_score=domain_match_score,
+                    host_value=host,
+                    blocked_host=False,
+                    prefecture_mismatch=pref_mismatch,
+                )
 
         address_hit = False
         pref_hit = False
         postal_hit = False
+        pref_mismatch_in_address = False
         if expected_address:
             candidate_addrs: List[str] = []
             if extracted and extracted.get("addresses"):
@@ -1527,6 +1646,11 @@ class CompanyScraper:
                 pref_ok = bool(expected_pref and cand_pref and expected_pref == cand_pref)
                 zip_ok = bool(expected_zip and cand_zip and expected_zip == cand_zip)
                 addr_ok = self._address_matches(expected_address, cand)
+                if expected_pref and cand_pref and not pref_ok:
+                    pref_mismatch_in_address = True
+                    score -= 6
+                if expected_city and cand and expected_city not in cand:
+                    score -= 1
                 if addr_ok:
                     score += 3
                     if pref_ok:
@@ -1553,14 +1677,15 @@ class CompanyScraper:
                     address_match=address_hit,
                     prefecture_match=pref_hit,
                     postal_code_match=postal_hit,
+                    name_match_ratio=name_match.ratio,
+                    name_match_exact=name_match.exact,
+                    name_match_partial_only=name_match.partial_only,
+                    name_match_source=name_match.best_source,
                     domain_score=domain_match_score,
                     host_value=host,
                     blocked_host=False,
+                    prefecture_mismatch=(pref_mismatch or pref_mismatch_in_address),
                 )
-        # ドメインに社名トークンが強く含まれる場合、住所シグナルがなくても公式寄りに扱う
-        if not address_hit and host_token_hit and domain_match_score >= 4:
-            address_hit = True
-
         if generic_tld and not whitelist_hit and not is_google_sites:
             name_ok = name_present_flag or domain_match_score >= 4 or host_token_hit
             strong_generic_ok = strong_domain_flag or (host_token_hit and domain_match_score >= 4)
@@ -1573,9 +1698,14 @@ class CompanyScraper:
                     address_match=address_hit,
                     prefecture_match=pref_hit,
                     postal_code_match=postal_hit,
+                    name_match_ratio=name_match.ratio,
+                    name_match_exact=name_match.exact,
+                    name_match_partial_only=name_match.partial_only,
+                    name_match_source=name_match.best_source,
                     domain_score=domain_match_score,
                     host_value=host,
                     blocked_host=False,
+                    prefecture_mismatch=(pref_mismatch or pref_mismatch_in_address),
                 )
             if expected_address and not (address_hit or pref_hit or postal_hit) and not strong_generic_ok:
                 return finalize(
@@ -1586,9 +1716,14 @@ class CompanyScraper:
                     address_match=address_hit,
                     prefecture_match=pref_hit,
                     postal_code_match=postal_hit,
+                    name_match_ratio=name_match.ratio,
+                    name_match_exact=name_match.exact,
+                    name_match_partial_only=name_match.partial_only,
+                    name_match_source=name_match.best_source,
                     domain_score=domain_match_score,
                     host_value=host,
                     blocked_host=False,
+                    prefecture_mismatch=(pref_mismatch or pref_mismatch_in_address),
                 )
 
         if allowed_tld and host_token_hit and company_has_corp and score < 4:
@@ -1603,8 +1738,13 @@ class CompanyScraper:
                 address_match=address_hit,
                 prefecture_match=pref_hit,
                 postal_code_match=postal_hit,
+                name_match_ratio=name_match.ratio,
+                name_match_exact=name_match.exact,
+                name_match_partial_only=name_match.partial_only,
+                name_match_source=name_match.best_source,
                 domain_score=domain_match_score,
                 host_value=host,
+                prefecture_mismatch=(pref_mismatch or pref_mismatch_in_address),
             )
 
         if (address_hit or pref_hit or postal_hit) and (allowed_tld or whitelist_hit or is_google_sites):
@@ -1616,11 +1756,33 @@ class CompanyScraper:
                 address_match=address_hit,
                 prefecture_match=pref_hit,
                 postal_code_match=postal_hit,
+                name_match_ratio=name_match.ratio,
+                name_match_exact=name_match.exact,
+                name_match_partial_only=name_match.partial_only,
+                name_match_source=name_match.best_source,
                 domain_score=domain_match_score,
                 host_value=host,
+                prefecture_mismatch=(pref_mismatch or pref_mismatch_in_address),
             )
 
         if allowed_tld and company_has_corp and (host_token_hit or domain_match_score >= 3 or name_present_flag):
+            if not (content_name_ok or domain_only_ok) and not (address_hit or pref_hit or postal_hit) and not whitelist_hit and not is_google_sites:
+                return finalize(
+                    False,
+                    score=score,
+                    name_present=name_present_flag,
+                    strong_domain=strong_domain_flag,
+                    address_match=address_hit,
+                    prefecture_match=pref_hit,
+                    postal_code_match=postal_hit,
+                    name_match_ratio=name_match.ratio,
+                    name_match_exact=name_match.exact,
+                    name_match_partial_only=name_match.partial_only,
+                    name_match_source=name_match.best_source,
+                    domain_score=domain_match_score,
+                    host_value=host,
+                    prefecture_mismatch=(pref_mismatch or pref_mismatch_in_address),
+                )
             return finalize(
                 True,
                 score=score,
@@ -1629,8 +1791,13 @@ class CompanyScraper:
                 address_match=address_hit,
                 prefecture_match=pref_hit,
                 postal_code_match=postal_hit,
+                name_match_ratio=name_match.ratio,
+                name_match_exact=name_match.exact,
+                name_match_partial_only=name_match.partial_only,
+                name_match_source=name_match.best_source,
                 domain_score=domain_match_score,
                 host_value=host,
+                prefecture_mismatch=(pref_mismatch or pref_mismatch_in_address),
             )
 
         if whitelist_hit and expected_address:
@@ -1644,8 +1811,13 @@ class CompanyScraper:
                 address_match=address_hit,
                 prefecture_match=pref_hit,
                 postal_code_match=postal_hit,
+                name_match_ratio=name_match.ratio,
+                name_match_exact=name_match.exact,
+                name_match_partial_only=name_match.partial_only,
+                name_match_source=name_match.best_source,
                 domain_score=domain_match_score,
                 host_value=host,
+                prefecture_mismatch=(pref_mismatch or pref_mismatch_in_address),
             )
 
         # ドメインが弱いものは住所等の裏付けが無ければ公式扱いしない
@@ -1658,17 +1830,52 @@ class CompanyScraper:
                 address_match=address_hit,
                 prefecture_match=pref_hit,
                 postal_code_match=postal_hit,
+                name_match_ratio=name_match.ratio,
+                name_match_exact=name_match.exact,
+                name_match_partial_only=name_match.partial_only,
+                name_match_source=name_match.best_source,
                 domain_score=domain_match_score,
                 host_value=host,
+                prefecture_mismatch=(pref_mismatch or pref_mismatch_in_address),
             )
 
         name_present = name_present_flag
         strong_domain = strong_domain_flag
         if not (name_present or strong_domain):
-            return finalize(False, score=score, name_present=name_present, strong_domain=strong_domain, address_match=address_hit, prefecture_match=pref_hit, postal_code_match=postal_hit, domain_score=domain_match_score, host_value=host)
+            return finalize(
+                False,
+                score=score,
+                name_present=name_present,
+                strong_domain=strong_domain,
+                address_match=address_hit,
+                prefecture_match=pref_hit,
+                postal_code_match=postal_hit,
+                name_match_ratio=name_match.ratio,
+                name_match_exact=name_match.exact,
+                name_match_partial_only=name_match.partial_only,
+                name_match_source=name_match.best_source,
+                domain_score=domain_match_score,
+                host_value=host,
+                prefecture_mismatch=(pref_mismatch or pref_mismatch_in_address),
+            )
         # ドメイン一致が弱く、名前も住所も見つからない場合は非公式扱い
         if not (name_present or address_hit or pref_hit or postal_hit) and domain_match_score < 4:
-            return finalize(False, score=score, name_present=name_present, strong_domain=strong_domain, address_match=address_hit, prefecture_match=pref_hit, postal_code_match=postal_hit, domain_score=domain_match_score, host_value=host)
+            return finalize(
+                False,
+                score=score,
+                name_present=name_present,
+                strong_domain=strong_domain,
+                address_match=address_hit,
+                prefecture_match=pref_hit,
+                postal_code_match=postal_hit,
+                name_match_ratio=name_match.ratio,
+                name_match_exact=name_match.exact,
+                name_match_partial_only=name_match.partial_only,
+                name_match_source=name_match.best_source,
+                domain_score=domain_match_score,
+                host_value=host,
+                prefecture_mismatch=(pref_mismatch or pref_mismatch_in_address),
+            )
         result = score >= 4
         return finalize(
             result,
@@ -1678,8 +1885,13 @@ class CompanyScraper:
             address_match=address_hit,
             prefecture_match=pref_hit,
             postal_code_match=postal_hit,
+            name_match_ratio=name_match.ratio,
+            name_match_exact=name_match.exact,
+            name_match_partial_only=name_match.partial_only,
+            name_match_source=name_match.best_source,
             domain_score=domain_match_score,
             host_value=host,
+            prefecture_mismatch=(pref_mismatch or pref_mismatch_in_address),
         )
 
     @staticmethod
@@ -2175,8 +2387,8 @@ class CompanyScraper:
             raw = resp.content or b""
             encoding = self._detect_html_encoding(resp, raw)
             decoded = raw.decode(encoding, errors="replace") if raw else ""
-            text = decoded or ""
             html = decoded or ""
+            text = self._clean_text_from_html(html, fallback_text=decoded or "")
             elapsed_ms = (time.monotonic() - started) * 1000
             if self.slow_page_threshold_ms > 0 and elapsed_ms > self.slow_page_threshold_ms and host:
                 self._add_slow_host(host)
@@ -2279,7 +2491,8 @@ class CompanyScraper:
                     screenshot: bytes = b""
                     if need_screenshot:
                         screenshot = await page.screenshot(full_page=True)
-                result = {"url": url, "text": text, "html": html, "screenshot": screenshot}
+                cleaned_text = self._clean_text_from_html(html, fallback_text=text or "")
+                result = {"url": url, "text": cleaned_text, "html": html, "screenshot": screenshot}
                 if cached and not screenshot:
                     # 再訪時にスクショなしなら旧データを活かす
                     if cached.get("screenshot"):
@@ -2323,13 +2536,40 @@ class CompanyScraper:
 
     # ===== 同一ドメイン内を浅く探索 =====
     FOCUS_KEYWORD_MAP = {
+        "phone": {
+            "anchor": (
+                "お問い合わせ", "お問合せ", "問合せ", "contact", "contact us", "電話", "tel", "連絡先",
+                "窓口", "カスタマー", "サポート", "support",
+            ),
+            "path": (
+                "/contact", "/inquiry", "/support", "/contact-us", "/toiawase", "/otoiawase",
+            ),
+        },
+        "address": {
+            "anchor": (
+                "所在地", "本社", "本店", "アクセス", "地図", "map",
+                "会社概要", "会社案内", "会社情報", "企業情報", "法人概要", "corporate", "about", "profile", "overview",
+            ),
+            "path": (
+                "/access", "/map", "/company", "/about", "/corporate", "/profile", "/overview", "/gaiyo", "/gaiyou",
+            ),
+        },
+        "rep": {
+            "anchor": (
+                "役員", "代表者", "代表取締役", "代表理事", "理事長",
+                "会社概要", "会社情報", "企業情報", "法人概要", "profile", "corporate",
+            ),
+            "path": (
+                "/company", "/about", "/profile", "/corporate", "/overview",
+            ),
+        },
         "contact": {
             "anchor": (
                 "お問い合わせ", "お問合せ", "問合せ", "contact", "アクセス", "電話", "tel", "連絡先",
-                "アクセスマップ", "map", "所在地", "recruit", "採用"
+                "アクセスマップ", "map", "所在地", "本社", "本店"
             ),
             "path": (
-                "/contact", "/inquiry", "/access", "/support", "/contact-us", "/recruit"
+                "/contact", "/inquiry", "/access", "/support", "/contact-us"
             ),
         },
         "finance": {
@@ -2586,6 +2826,7 @@ class CompanyScraper:
         need_founded: bool = False,
         need_description: bool = False,
         initial_info: Optional[Dict[str, Any]] = None,
+        expected_address: Optional[str] = None,
     ) -> Dict[str, Dict[str, Any]]:
         results: Dict[str, Dict[str, Any]] = {}
         if not homepage:
@@ -2611,6 +2852,11 @@ class CompanyScraper:
             max_pages = max_pages
             max_hops = max_hops
 
+        # 探索の上限は軽め（2〜3ページ）に抑える
+        max_pages = max(0, min(int(max_pages or 0), 3))
+        max_hops = max(0, min(int(max_hops or 0), 3))
+
+        expected_pref = self._extract_prefecture(expected_address or "")
         visited: set[str] = {homepage}
         concurrency = max(1, min(4, max_pages))
         sem = asyncio.Semaphore(concurrency)
@@ -2653,6 +2899,12 @@ class CompanyScraper:
             if hop >= max_hops:
                 continue
 
+            # 入力住所の都道府県があるのに、ページ側の都道府県が明確に不一致なら深掘りを打ち切る
+            if expected_pref:
+                found_prefs = set(PREFECTURE_NAME_RE.findall(results[url]["text"] or ""))
+                if 0 < len(found_prefs) <= 3 and expected_pref not in found_prefs:
+                    continue
+
             missing: List[str] = []
             if need_phone:
                 missing.append("phone")
@@ -2673,8 +2925,12 @@ class CompanyScraper:
             if not html:
                 continue
             focus_targets: set[str] = set()
-            if need_phone or need_addr or need_rep:
-                focus_targets.add("contact")
+            if need_phone:
+                focus_targets.update({"phone", "contact"})
+            if need_addr:
+                focus_targets.update({"address", "contact", "profile"})
+            if need_rep:
+                focus_targets.update({"rep", "profile"})
             if need_listing or need_capital or need_revenue or need_profit or need_fiscal or need_founded:
                 focus_targets.add("finance")
             if need_description:

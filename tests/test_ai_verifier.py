@@ -28,9 +28,8 @@ async def test_verify_info_success():
     fake_json = {
         "phone_number": "03-0000-0000",
         "address": "東京都中央区1-1-1",
-        "homepage_url": "https://example.com",
-        "rep_name": "山田太郎",
-        "description": "東京都に本社を置くソフトウェア企業です。",
+        "confidence": 0.93,
+        "evidence": "代表電話：03-0000-0000　所在地：東京都中央区1-1-1",
     }
 
     listoss_data = {
@@ -47,9 +46,8 @@ async def test_verify_info_success():
     assert isinstance(result, dict)
     assert result["phone_number"] == "03-0000-0000"
     assert result["address"] == "東京都中央区1-1-1"
-    assert result.get("homepage_url") == "https://example.com"
-    assert result.get("rep_name") == "山田太郎"
-    assert result.get("description") == "東京都に本社を置くソフトウェア企業です。"
+    assert abs(result["confidence"] - 0.93) < 1e-6
+    assert isinstance(result.get("evidence"), str)
 
 
 # 追加の健全性チェック

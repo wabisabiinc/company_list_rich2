@@ -57,3 +57,25 @@ SELECT id, company_name, homepage, phone, source_csv
 - `homepage/phone/address/rep_name/description/listing…` など既存の列は**空欄のみ**を埋め、値が入っている場合は触りません。
 - 公式スクレイプの進捗を壊さないため、既存の `done/review/error` は維持し、新規行のみ `pending` で挿入します。
 - 取り込みスクリプトは `hubspot_id/corporate_number` などの追加カラムを使って名寄せし、同一企業を重複登録しないようにしています。
+
+## スクレイプ実行
+
+```bash
+# 既定DBで実行
+python3 main.py
+
+# 対象DBを切り替える
+COMPANIES_DB_PATH=data/companies_logistics.db python3 main.py
+```
+
+主な環境変数（抜粋）:
+- `USE_AI=true/false`（AI補助のON/OFF）
+- `AI_VERIFY_MIN_CONFIDENCE`（AI抽出の最低信頼度。低い場合は採用せず深掘りで再抽出。デフォルト `0.65`）
+- `SEARCH_CANDIDATE_LIMIT`（検索候補の最大数）
+- `RELATED_BASE_PAGES`, `RELATED_MAX_HOPS_BASE`（深掘りのページ数/ホップ上限。内部でも最大3にクランプ）
+
+## テスト
+
+```bash
+python3 -m pytest
+```

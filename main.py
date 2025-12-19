@@ -94,6 +94,7 @@ LONG_TIME_LIMIT_FETCH_ONLY = float(os.getenv("LONG_TIME_LIMIT_FETCH_ONLY", os.ge
 LONG_TIME_LIMIT_WITH_OFFICIAL = float(os.getenv("LONG_TIME_LIMIT_WITH_OFFICIAL", os.getenv("TIME_LIMIT_WITH_OFFICIAL", "45")))
 LONG_TIME_LIMIT_DEEP = float(os.getenv("LONG_TIME_LIMIT_DEEP", os.getenv("TIME_LIMIT_DEEP", "60")))
 AI_MIN_REMAINING_SEC = float(os.getenv("AI_MIN_REMAINING_SEC", "2.5"))
+AI_VERIFY_MIN_CONFIDENCE = float(os.getenv("AI_VERIFY_MIN_CONFIDENCE", "0.65"))
 DEFAULT_TIME_LIMIT_FETCH_ONLY = TIME_LIMIT_FETCH_ONLY
 DEFAULT_TIME_LIMIT_WITH_OFFICIAL = TIME_LIMIT_WITH_OFFICIAL
 DEFAULT_TIME_LIMIT_DEEP = TIME_LIMIT_DEEP
@@ -360,6 +361,7 @@ def pick_best_address(expected_addr: str | None, candidates: list[str]) -> str |
     if not expected_norm:
         return normalized_candidates[0]
 
+    expected_pref = CompanyScraper._extract_prefecture(expected_norm)
     expected_key = CompanyScraper._addr_key(expected_norm)
     expected_zip_match = ZIP_CODE_RE.search(expected_norm)
     expected_zip = expected_zip_match.group(1) if expected_zip_match else ""
@@ -367,7 +369,11 @@ def pick_best_address(expected_addr: str | None, candidates: list[str]) -> str |
 
     best = normalized_candidates[0]
     best_score = float("-inf")
+    scored_any = False
     for cand in normalized_candidates:
+        if expected_pref and expected_pref not in cand:
+            continue
+        scored_any = True
         key = CompanyScraper._addr_key(cand)
         score = 0.0
         cand_zip_match = ZIP_CODE_RE.search(cand)
@@ -388,6 +394,8 @@ def pick_best_address(expected_addr: str | None, candidates: list[str]) -> str |
         if score > best_score:
             best_score = score
             best = cand
+    if expected_pref and not scored_any:
+        return None
     return best
 
 def pick_best_phone(candidates: list[str]) -> str | None:
@@ -1196,6 +1204,23 @@ async def process():
                         )
                         if not isinstance(rule_details, dict):
                             rule_details = {"is_official": bool(rule_details), "score": 0.0}
+                        try:
+                            log.info(
+                                "[%s] official_candidate url=%s rule_score=%.1f domain_score=%s name_ratio=%.2f exact=%s partial_only=%s pref_mismatch=%s addr_hit=%s pref_hit=%s zip_hit=%s",
+                                cid,
+                                candidate,
+                                float(rule_details.get("score") or 0.0),
+                                domain_score_for_flag,
+                                float(rule_details.get("name_match_ratio") or 0.0),
+                                bool(rule_details.get("name_match_exact")),
+                                bool(rule_details.get("name_match_partial_only")),
+                                bool(rule_details.get("prefecture_mismatch")),
+                                bool(rule_details.get("address_match")),
+                                bool(rule_details.get("prefecture_match")),
+                                bool(rule_details.get("postal_code_match")),
+                            )
+                        except Exception:
+                            pass
                         return (
                             idx,
                             {
@@ -2268,6 +2293,20 @@ async def process():
                             return
                         ai_used = 1
                         ai_model = AI_MODEL_NAME
+                        conf_val = res.get("confidence")
+                        try:
+                            ai_conf = float(conf_val) if conf_val is not None else None
+                        except Exception:
+                            ai_conf = None
+                        if ai_conf is not None and ai_conf < AI_VERIFY_MIN_CONFIDENCE:
+                            log.info(
+                                "[%s] AI low confidence=%.2f (<%.2f) -> ignore fields and continue deep crawl (evidence=%s)",
+                                cid,
+                                ai_conf,
+                                AI_VERIFY_MIN_CONFIDENCE,
+                                res.get("evidence"),
+                            )
+                            return
                         phone_candidate = normalize_phone(res.get("phone_number"))
                         if phone_candidate:
                             ai_phone = phone_candidate
@@ -2372,6 +2411,22 @@ async def process():
                                 ai_attempted = True
                                 ai_result2 = await run_ai_verify2()
                                 if ai_result2:
+                                    conf_val2 = ai_result2.get("confidence")
+                                    try:
+                                        ai_conf2 = float(conf_val2) if conf_val2 is not None else None
+                                    except Exception:
+                                        ai_conf2 = None
+                                    if ai_conf2 is not None and ai_conf2 < AI_VERIFY_MIN_CONFIDENCE:
+                                        log.info(
+                                            "[%s] AI(low) second pass confidence=%.2f (<%.2f) -> ignore fields (evidence=%s)",
+                                            cid,
+                                            ai_conf2,
+                                            AI_VERIFY_MIN_CONFIDENCE,
+                                            ai_result2.get("evidence"),
+                                        )
+                                        ai_result2 = None
+                                        ai_conf2 = None
+                                if ai_result2:
                                     ai_used = 1
                                     ai_model = AI_MODEL_NAME
                                     ai_phone2 = normalize_phone(ai_result2.get("phone_number"))
@@ -2464,7 +2519,7 @@ async def process():
                             related_page_limit = RELATED_BASE_PAGES + (1 if missing_extra else 0)
                             if need_phone:
                                 related_page_limit += RELATED_EXTRA_PHONE
-                            related_page_limit = max(0, related_page_limit)
+                            related_page_limit = max(0, min(3, related_page_limit))
                             related = {}
                             weak_provisional_target = (
                                 homepage_official_flag == 0
@@ -2481,6 +2536,7 @@ async def process():
                                         raise_hard_timeout("related_crawl")
                                 else:
                                     max_hops = RELATED_MAX_HOPS_PHONE if need_phone else RELATED_MAX_HOPS_BASE
+                                    max_hops = max(0, min(3, int(max_hops or 0)))
                                     try:
                                         related = await asyncio.wait_for(
                                             scraper.crawl_related(
@@ -2498,11 +2554,17 @@ async def process():
                                                 need_founded=need_founded,
                                                 need_description=need_description,
                                                 initial_info=info_dict if info_url == homepage else None,
+                                                expected_address=addr,
                                             ),
                                             timeout=clamp_timeout(PAGE_FETCH_TIMEOUT_SEC),
                                         )
                                     except Exception:
                                         related = {}
+                            if related:
+                                try:
+                                    log.info("[%s] deep_crawl visited=%s", cid, list(related.keys()))
+                                except Exception:
+                                    pass
                             for url, data in related.items():
                                 text = data.get("text", "") or ""
                                 html_content = data.get("html", "") or ""
@@ -2514,6 +2576,9 @@ async def process():
                                         phone_source = "rule"
                                         src_phone = url
                                         need_phone = False
+                                        log.info("[%s] deep_crawl picked phone=%s url=%s", cid, cand, url)
+                                    else:
+                                        log.info("[%s] deep_crawl rejected phones url=%s candidates=%s", cid, url, (cc.get("phone_numbers") or [])[:3])
                                 if need_addr and cc.get("addresses"):
                                     cand_addr = pick_best_address(addr, cc["addresses"])
                                     if cand_addr:
@@ -2521,6 +2586,9 @@ async def process():
                                         address_source = "rule"
                                         src_addr = url
                                         need_addr = False
+                                        log.info("[%s] deep_crawl picked address=%s url=%s", cid, cand_addr, url)
+                                    else:
+                                        log.info("[%s] deep_crawl rejected addresses url=%s candidates=%s", cid, url, (cc.get("addresses") or [])[:3])
                                 if need_rep and cc.get("rep_names"):
                                     cand_rep = pick_best_rep(cc["rep_names"], url)
                                     cand_rep = scraper.clean_rep_name(cand_rep) if cand_rep else None
@@ -2528,6 +2596,7 @@ async def process():
                                         rep_name_val = cand_rep
                                         src_rep = url
                                         need_rep = False
+                                        log.info("[%s] deep_crawl picked rep=%s url=%s", cid, cand_rep, url)
                                 if need_description and cc.get("description"):
                                     desc = clean_description_value(cc["description"])
                                     if desc:
@@ -2738,6 +2807,24 @@ async def process():
                         profit_val = ai_normalize_amount(profit_val) or clean_amount_value(profit_val)
                         fiscal_val = clean_fiscal_month(fiscal_val)
                         founded_val = clean_founded_year(founded_val)
+                        try:
+                            log.info(
+                                "[%s] final_decision homepage=%s official=%s(%s score=%.1f domain=%s) phone=%s(%s) address=%s(%s) rep=%s(%s)",
+                                cid,
+                                homepage or "",
+                                homepage_official_flag,
+                                homepage_official_source,
+                                float(homepage_official_score or 0.0),
+                                chosen_domain_score,
+                                phone or "",
+                                phone_source or "",
+                                normalized_found_address or "",
+                                address_source or "",
+                                rep_name_val or "",
+                                (src_rep or ""),
+                            )
+                        except Exception:
+                            pass
                         company.update({
                             "homepage": homepage,
                             "phone": phone or "",
