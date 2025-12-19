@@ -2655,6 +2655,7 @@ class CompanyScraper:
             "/company", "/about", "/profile", "/corporate", "/overview",
             "/gaiyou", "/gaiyo", "/kaisya", "/info", "/information",
             "/contact", "/inquiry", "/access",
+            "/会社案内",
         ]
         for path in verify_priority_paths + list(self.PRIORITY_PATHS):
             try:
@@ -3003,7 +3004,7 @@ class CompanyScraper:
         "rep": {
             "anchor": (
                 "役員", "代表者", "代表取締役", "代表理事", "理事長",
-                "会社概要", "会社情報", "企業情報", "法人概要", "profile", "corporate",
+                "会社概要", "会社案内", "会社情報", "企業情報", "法人概要", "profile", "corporate",
             ),
             "path": (
                 "/company", "/about", "/profile", "/corporate", "/overview",
@@ -3029,7 +3030,7 @@ class CompanyScraper:
         },
         "profile": {
             "anchor": (
-                "会社概要", "企業情報", "法人概要", "事業紹介", "about", "profile", "corporate", "沿革",
+                "会社概要", "会社案内", "企業情報", "法人概要", "事業紹介", "about", "profile", "corporate", "沿革",
                 "組織図", "会社案内", "overview", "company"
             ),
             "path": (

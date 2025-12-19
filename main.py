@@ -800,6 +800,38 @@ def build_ai_text_payload(*blocks: str) -> str:
     joined = "\n\n".join(payloads)
     return joined[:4000]
 
+def build_official_ai_text(text: str, html: str) -> str:
+    """
+    AI公式判定向けに、1回fetch済みの text/html から根拠を落としにくい形で短文化する。
+    追加fetchはしない（CPUのみ）。
+    """
+    parts: list[str] = []
+    if text:
+        parts.append(str(text))
+    if html:
+        try:
+            parts.append(CompanyScraper._meta_strings(html))
+        except Exception:
+            pass
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            h1 = soup.find("h1")
+            if h1:
+                parts.append(f"[H1] {h1.get_text(' ', strip=True)}")
+            footer = soup.find("footer")
+            if footer:
+                ft = footer.get_text(" ", strip=True)
+                if ft:
+                    parts.append(f"[FOOTER] {ft}")
+        except Exception:
+            pass
+    joined = "\n".join([p for p in parts if p and str(p).strip()])
+    try:
+        joined = CompanyScraper._filter_noise_lines(joined)
+    except Exception:
+        pass
+    return joined[:4000]
+
 def clean_founded_year(val: str) -> str:
     text = (val or "").strip()
     if not text:
@@ -1186,9 +1218,10 @@ async def process():
                             )
 
                     async def prepare_candidate(idx: int, candidate: str):
+                        # 取得前は軽い正規化のみ（canonical/og:url は HTML が必要）
                         normalized_candidate = scraper.normalize_homepage_url(candidate)
                         url_for_flag = normalized_candidate or candidate
-                        normalized_flag_url, host_for_flag = manager._normalize_flag_target(candidate)
+                        normalized_flag_url, host_for_flag = manager._normalize_flag_target(url_for_flag)
                         flag_info = url_flags_map.get(normalized_flag_url)
                         if not flag_info and host_for_flag:
                             flag_info = host_flags_map.get(host_for_flag)
@@ -1222,6 +1255,17 @@ async def process():
                                 break
                         if not candidate_info:
                             return None
+                        # HTML取得後に canonical/og:url を反映した正規化を再計算（追加fetchなし）
+                        try:
+                            normalized_candidate2 = scraper.normalize_homepage_url(candidate, candidate_info)
+                        except Exception:
+                            normalized_candidate2 = normalized_candidate
+                        if normalized_candidate2:
+                            url_for_flag = normalized_candidate2
+                            normalized_flag_url, host_for_flag = manager._normalize_flag_target(url_for_flag)
+                            # 旗の参照キーだけ更新（map自体は候補urlsで事前取得済みなので、無ければNoneのまま）
+                            flag_info = url_flags_map.get(normalized_flag_url) or (host_flags_map.get(host_for_flag) if host_for_flag else None)
+                            domain_score_for_flag = scraper._domain_score(company_tokens, url_for_flag)  # type: ignore
                         candidate_text = candidate_info.get("text", "") or ""
                         candidate_html = candidate_info.get("html") or ""
                         extracted = scraper.extract_candidates(candidate_text, candidate_html)
@@ -1427,7 +1471,10 @@ async def process():
                                         return None
                                     ai_verdict = await asyncio.wait_for(
                                         verifier.judge_official_homepage(
-                                            info_payload.get("text", "") or "",
+                                            build_official_ai_text(
+                                                info_payload.get("text", "") or "",
+                                                info_payload.get("html", "") or "",
+                                            ),
                                             info_payload.get("screenshot"),
                                             name,
                                             addr,
