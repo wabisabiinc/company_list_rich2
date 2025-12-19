@@ -561,15 +561,25 @@ class DatabaseManager:
             return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
 
         def _clean_address(raw: Any) -> str:
-            s = (raw or "").strip().replace("　", " ")
+            s = (raw or "").strip()
             if not s:
                 return ""
+            s = s.replace("　", " ")
             s = re.sub(r"<[^>]+>", " ", s)
             s = re.sub(r"[\x00-\x1f\x7f]", " ", s)
+            contact_pattern = re.compile(r"(TEL|電話|☎|℡|FAX|ファックス|メール|E[-\s]?mail)", re.IGNORECASE)
+            contact_match = contact_pattern.search(s)
+            if contact_match:
+                s = s[: contact_match.start()]
+            map_match = re.search(r"(地図アプリ|地図で見る|マップ|Google\s*マップ|アクセス|ルート|Route|Directions|行き方)", s, flags=re.IGNORECASE)
+            if map_match:
+                s = s[: map_match.start()]
+            arrow_idx = min([idx for idx in (s.find("→"), s.find("⇒")) if idx >= 0], default=-1)
+            if arrow_idx >= 0:
+                s = s[:arrow_idx]
             s = s.translate(str.maketrans("０１２３４５６７８９－ー―‐／", "0123456789----/"))
             s = re.sub(r"\s+", " ", s)
             s = s.replace("〒 ", "〒").replace("〒", "〒")
-            # 典型的なUTF-8モジバケ（ã,Â,� が連続する）を落とす
             if re.search(r"[ãÂ�]{2,}", s):
                 return ""
             return s.strip()
@@ -579,11 +589,34 @@ class DatabaseManager:
                 updates.append(f"{column} = ?")
                 params.append(value)
 
+        raw_address = (company.get("address") or "").strip()
         set_value("homepage", company.get("homepage", "") or "")
         cleaned_phone = _clean_phone(company.get("phone"))
         set_value("phone", cleaned_phone)
         found_addr_clean = _clean_address(company.get("found_address"))
         set_value("found_address", found_addr_clean)
+        final_address = raw_address
+        found_addr = found_addr_clean or ""
+        if found_addr:
+            strong_official = bool(
+                (company.get("homepage_official_flag") == 1)
+                and float(company.get("homepage_official_score") or 0.0) >= 4.0
+            )
+            addr_source = (company.get("address_source") or "").lower()
+            if strong_official or addr_source in {"official", "rule"}:
+                has_zip = bool(re.search(r"\d{3}-\d{4}", found_addr))
+                has_city = bool(re.search(r"(\u5e02|\u533a|\u753a|\u6751|\u90e1)", found_addr))
+                raw_has_zip = bool(re.search(r"\d{3}-\d{4}", raw_address))
+                raw_has_city = bool(re.search(r"(\u5e02|\u533a|\u753a|\u6751|\u90e1)", raw_address))
+                if (
+                    not raw_address
+                    or len(found_addr) > len(raw_address)
+                    or (has_zip and not raw_has_zip)
+                    or (has_city and not raw_has_city)
+                ):
+                    final_address = found_addr
+                    company["address"] = final_address
+        set_value("address", final_address)
         set_value("rep_name", company.get("rep_name", "") or "")
         set_value("description", company.get("description", "") or "")
         set_value("ai_used", int(company.get("ai_used", 0) or 0))
@@ -643,40 +676,6 @@ class DatabaseManager:
             return
         self._commit_with_checkpoint()
         import logging as _l; _l.info(f"DB_WRITE_OK id={company['id']} status={status}")
-
-        # 住所が入力側で粗い場合に、スクレイプで得た詳細住所を address に昇格させる（公式度が高い場合のみ）
-        # Promote found_address to address when it is more detailed and official enough
-        try:
-            if "found_address" in cols and "address" in cols:
-                strong_official = bool(
-                    (company.get("homepage_official_flag") == 1)
-                    and float(company.get("homepage_official_score") or 0.0) >= 4.0
-                )
-                addr_source = (company.get("address_source") or "").lower()
-                if not strong_official and addr_source not in {"official", "rule"}:
-                    return
-                raw_addr = (company.get("address") or "").strip()
-                found_addr = found_addr_clean or ""
-                if found_addr:
-                    has_zip = bool(re.search(r"\d{3}-\d{4}", found_addr))
-                    has_city = bool(re.search(r"(\u5e02|\u533a|\u753a|\u6751|\u90e1)", found_addr))
-                    raw_has_zip = bool(re.search(r"\d{3}-\d{4}", raw_addr))
-                    raw_has_city = bool(re.search(r"(\u5e02|\u533a|\u753a|\u6751|\u90e1)", raw_addr))
-                    # Overwrite when address is empty/very short, found is longer, or adds zip/city info
-                    if (
-                        not raw_addr
-                        or len(raw_addr) <= 8
-                        or len(found_addr) > len(raw_addr)
-                        or (has_zip and not raw_has_zip)
-                        or (has_city and not raw_has_city)
-                    ):
-                        self.conn.execute(
-                            "UPDATE companies SET address=? WHERE id=?",
-                            (found_addr, company["id"]),
-                        )
-                        self._commit_with_checkpoint()
-        except Exception:
-            pass
 
         # 任意：CSVミラー（指定時のみ）
         if not self.csv_path:

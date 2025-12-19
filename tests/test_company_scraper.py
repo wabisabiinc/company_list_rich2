@@ -65,7 +65,7 @@ async def test_search_company_filters_and_resolves(mock_get, scraper):
 
     # 空文字を含まない & 上限件数
     assert all(u for u in urls)
-    assert len(urls) <= 3
+    assert len(urls) <= 10
 
 @pytest.mark.asyncio
 @patch("src.company_scraper.requests.get")

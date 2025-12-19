@@ -810,10 +810,13 @@ class CompanyScraper:
             maxsplit=1,
         )[0]
         # 以降の余計な部分（TELやリンクの残骸）をカット
-        val = re.split(r"(?:TEL|Tel|tel|電話|☎|℡)[:：]?\s*", val)[0]
+        val = re.split(r"(?:TEL|Tel|tel|電話|☎|℡|FAX|Fax|fax|ファックス)[:：.．]?\s*", val)[0]
         val = re.split(r"https?://|href=|HREF=", val)[0]
         # 地図/マップ/アクセスはここでもカット
-        val = re.split(r"(地図アプリ|地図で見る|マップ|Google\s*マップ|map|アクセス|ルート|拡大地図)", val, maxsplit=1, flags=re.I)[0]
+        val = re.split(r"(地図アプリ|地図で見る|マップ|Google\s*マップ|map|アクセス|アクセスマップ|ルート|経路|Directions?)", val, maxsplit=1, flags=re.I)[0]
+        arrow_idx = min([idx for idx in (val.find("→"), val.find("⇒")) if idx >= 0], default=-1)
+        if arrow_idx >= 0:
+            val = val[:arrow_idx]
         val = re.sub(r"\s+", " ", val).strip(" \"'")
         # 地図・マップ系が出たらそこまででカット
         m_map = re.search(r"(地図アプリ|マップ|Google\s*マップ|地図|map)", val, flags=re.I)
@@ -2018,9 +2021,22 @@ class CompanyScraper:
         phone_pattern = self._phone_variants_regex(phone) if phone else None
         addr_key = self._addr_key(address) if address else ""
 
-        for target in targets:
+        verify_deadline = time.monotonic() + max(5.0, min(fetch_limit * max(self.page_timeout_ms / 1000.0, 1.0), 20.0))
+
+        for idx, target in enumerate(targets):
+            if time.monotonic() >= verify_deadline:
+                break
             try:
-                info = await self.get_page_info(target, allow_slow=True)
+                allow_slow = idx == 0
+                if not allow_slow:
+                    try:
+                        parsed_target = urllib.parse.urlparse(target)
+                        host = (parsed_target.netloc or "").lower().split(":")[0]
+                    except Exception:
+                        host = ""
+                    if host and self.skip_slow_hosts and host in self.slow_hosts:
+                        continue
+                info = await self.get_page_info(target, allow_slow=allow_slow)
             except Exception:
                 continue
             text = info.get("text", "") or ""
@@ -2064,48 +2080,36 @@ class CompanyScraper:
                 ordered.append(normalized)
             return ordered
 
-        max_candidates = max(1, min(3, num_results or 3))
+        max_candidates = max(1, num_results or 1)
 
         async def run_queries(qs: list[str]) -> list[Dict[str, Any]]:
             candidates: List[Dict[str, Any]] = []
             seen: set[str] = set()
-
-            async def run_engine(engine: str, q_idx: int, query: str) -> tuple[str, int, str]:
-                # 現状 ddg 固定だが、引数はスコアリングのために残す
-                return engine, q_idx, await self._fetch_duckduckgo(query)
-
-            tasks: list[asyncio.Task] = []
             engines = self.search_engines or ["ddg"]
+
+            async def run_engine(engine: str, q_idx: int, query: str) -> str:
+                if engine == "bing":
+                    return await self._fetch_bing(query)
+                return await self._fetch_duckduckgo(query)
+
             for q_idx, query in enumerate(qs):
                 for eng in engines:
-                    tasks.append(asyncio.create_task(run_engine(eng, q_idx, query)))
-
-            if not tasks:
-                return []
-            try:
-                for task in asyncio.as_completed(tasks):
                     try:
-                        result = await task
+                        html = await run_engine(eng, q_idx, query)
                     except Exception:
                         continue
-                    engine, q_idx, html = result
                     if not html:
                         continue
-                    extractor = self._extract_search_urls
+                    extractor = self._extract_bing_urls if eng == "bing" else self._extract_search_urls
                     for rank, url in enumerate(extractor(html)):
                         if url in seen:
                             continue
                         seen.add(url)
-                        candidates.append({"url": url, "query_idx": q_idx, "rank": rank, "engine": engine})
+                        candidates.append({"url": url, "query_idx": q_idx, "rank": rank, "engine": eng})
                         if len(candidates) >= max_candidates:
-                            break
-                    if len(candidates) >= max_candidates:
-                        break
-            finally:
-                for task in tasks:
-                    if not task.done():
-                        task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
+                            return candidates
+                if len(candidates) >= max_candidates:
+                    break
             return candidates
 
         queries = _unique_queries(queries)

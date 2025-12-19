@@ -10,7 +10,11 @@ import html as html_mod
 from difflib import SequenceMatcher
 from typing import Any, Dict
 from urllib.parse import urlparse
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv() -> None:  # type: ignore
+        return None
 from bs4 import BeautifulSoup
 
 from src.database_manager import DatabaseManager
@@ -89,6 +93,10 @@ LONG_SLOW_PAGE_THRESHOLD_MS = int(os.getenv("LONG_SLOW_PAGE_THRESHOLD_MS", os.ge
 LONG_TIME_LIMIT_FETCH_ONLY = float(os.getenv("LONG_TIME_LIMIT_FETCH_ONLY", os.getenv("TIME_LIMIT_FETCH_ONLY", "30")))
 LONG_TIME_LIMIT_WITH_OFFICIAL = float(os.getenv("LONG_TIME_LIMIT_WITH_OFFICIAL", os.getenv("TIME_LIMIT_WITH_OFFICIAL", "45")))
 LONG_TIME_LIMIT_DEEP = float(os.getenv("LONG_TIME_LIMIT_DEEP", os.getenv("TIME_LIMIT_DEEP", "60")))
+AI_MIN_REMAINING_SEC = float(os.getenv("AI_MIN_REMAINING_SEC", "2.5"))
+DEFAULT_TIME_LIMIT_FETCH_ONLY = TIME_LIMIT_FETCH_ONLY
+DEFAULT_TIME_LIMIT_WITH_OFFICIAL = TIME_LIMIT_WITH_OFFICIAL
+DEFAULT_TIME_LIMIT_DEEP = TIME_LIMIT_DEEP
 
 MIRROR_TO_CSV = os.getenv("MIRROR_TO_CSV", "false").lower() == "true"
 OUTPUT_CSV_PATH = os.getenv("OUTPUT_CSV_PATH", "data/output.csv")
@@ -172,6 +180,18 @@ def normalize_address(s: str | None) -> str | None:
     m_noise = ADDRESS_JS_NOISE_RE.search(s)
     if m_noise:
         s = s[: m_noise.start()]
+    # 連絡先や地図系キーワードが混入した場合はそれ以降をカット
+    contact_pattern = re.compile(r"(TEL|電話|☎|℡|FAX|ファックス|メール|E[-\s]?mail)", re.IGNORECASE)
+    contact_match = contact_pattern.search(s)
+    if contact_match:
+        s = s[: contact_match.start()]
+    map_pattern = re.compile(r"(地図アプリ|地図で見る|マップ|Google\s*マップ|アクセス|アクセスマップ|ルート|経路|Route|Directions|行き方)", re.IGNORECASE)
+    map_match = map_pattern.search(s)
+    if map_match:
+        s = s[: map_match.start()]
+    arrow_idx = min([idx for idx in (s.find("→"), s.find("⇒")) if idx >= 0], default=-1)
+    if arrow_idx >= 0:
+        s = s[:arrow_idx]
     # 全角英数字・記号を半角に寄せる
     s = s.translate(str.maketrans("０１２３４５６７８９－ー―‐／", "0123456789----/"))
     # 漢数字を簡易的に算用数字へ
@@ -895,6 +915,7 @@ def jittered_seconds(base: float, ratio: float) -> float:
 # メイン処理（ワーカー）
 # --------------------------------------------------
 async def process():
+    global TIME_LIMIT_FETCH_ONLY, TIME_LIMIT_WITH_OFFICIAL, TIME_LIMIT_DEEP
     log.info(
         "=== Runner started (worker=%s) === HEADLESS=%s USE_AI=%s MAX_ROWS=%s "
         "ID_MIN=%s ID_MAX=%s AI_COOLDOWN_SEC=%s SLEEP_BETWEEN_SEC=%s JITTER_RATIO=%.2f "
@@ -905,6 +926,8 @@ async def process():
 
     scraper = CompanyScraper(headless=HEADLESS)
     base_page_timeout_ms = getattr(scraper, "page_timeout_ms", 9000) or 9000
+    normal_page_timeout_ms = getattr(scraper, "page_timeout_ms", base_page_timeout_ms)
+    normal_slow_page_threshold_ms = getattr(scraper, "slow_page_threshold_ms", base_page_timeout_ms)
     PAGE_FETCH_TIMEOUT_SEC = max(5.0, (base_page_timeout_ms / 1000.0) + 5.0)
     # CompanyScraper に start()/close() が無い実装でも動くように安全に呼ぶ
     if hasattr(scraper, "start") and callable(getattr(scraper, "start")):
@@ -934,6 +957,7 @@ async def process():
         original_retry_statuses = list(manager.retry_statuses)
         if SECOND_PASS_ENABLED:
             manager.retry_statuses = []
+        timeouts_extended = False
 
         while True:
             if MAX_ROWS and processed >= MAX_ROWS:
@@ -948,7 +972,6 @@ async def process():
                     second_pass = True
                     manager.retry_statuses = SECOND_PASS_RETRY_STATUSES
                     # タイムアウトを緩和
-                    global TIME_LIMIT_FETCH_ONLY, TIME_LIMIT_WITH_OFFICIAL, TIME_LIMIT_DEEP
                     TIME_LIMIT_FETCH_ONLY = LONG_TIME_LIMIT_FETCH_ONLY
                     TIME_LIMIT_WITH_OFFICIAL = LONG_TIME_LIMIT_WITH_OFFICIAL
                     TIME_LIMIT_DEEP = LONG_TIME_LIMIT_DEEP
@@ -957,6 +980,7 @@ async def process():
                         scraper.slow_page_threshold_ms = LONG_SLOW_PAGE_THRESHOLD_MS
                     except Exception:
                         pass
+                    timeouts_extended = True
                     continue
                 log.info("キューが空です。終了。")
                 break
@@ -1042,6 +1066,12 @@ async def process():
                     return max(0.1, remaining)
                 return max(0.1, min(desired, remaining))
 
+            def remaining_time_budget() -> float:
+                return hard_deadline - time.monotonic()
+
+            def has_time_for_ai() -> bool:
+                return remaining_time_budget() > AI_MIN_REMAINING_SEC
+
             fatal_error = False
             try:
                 try:
@@ -1092,7 +1122,7 @@ async def process():
                         if SLEEP_BETWEEN_SEC > 0:
                             await asyncio.sleep(jittered_seconds(SLEEP_BETWEEN_SEC, JITTER_RATIO))
                         continue
-                    max_candidates = max(1, min(3, candidate_limit))
+                    max_candidates = max(1, candidate_limit or 1)
                     if len(urls) > max_candidates:
                         log.info("[%s] limiting candidates to top %s (had %s)", cid, max_candidates, len(urls))
                         urls = urls[:max_candidates]
@@ -1308,21 +1338,40 @@ async def process():
                         async def run_official_ai(record: dict[str, Any]) -> dict[str, Any] | None:
                             nonlocal ai_official_attempted, ai_time_spent
                             async with ai_sem:
+                                remaining = remaining_time_budget()
+                                if remaining <= AI_MIN_REMAINING_SEC:
+                                    log.info(
+                                        "[%s] skip AI公式判定（残り%.1fs）: %s",
+                                        cid,
+                                        max(0.0, remaining),
+                                        record.get("url"),
+                                    )
+                                    return None
                                 normalized_for_ai = record.get("normalized_url") or record.get("url") or ""
                                 domain_score = int(record.get("domain_score") or 0)
                                 if normalized_for_ai and domain_score == 0:
                                     domain_score = scraper._domain_score(company_tokens, normalized_for_ai)  # type: ignore
                                     record["domain_score"] = domain_score
                                 info_payload = record.get("info") or {}
-                                info_payload = await ensure_info_has_screenshot(
+                                info_payload = await ensure_info_text(
                                     scraper,
                                     record.get("url"),
                                     info_payload,
-                                    need_screenshot=OFFICIAL_AI_USE_SCREENSHOT,
                                 )
                                 record["info"] = info_payload
+                                remaining = remaining_time_budget()
+                                if remaining <= AI_MIN_REMAINING_SEC:
+                                    log.info(
+                                        "[%s] skip AI公式判定（残り%.1fs, info取得後）: %s",
+                                        cid,
+                                        max(0.0, remaining),
+                                        record.get("url"),
+                                    )
+                                    return None
                                 ai_started = time.monotonic()
                                 try:
+                                    if remaining_time_budget() <= AI_MIN_REMAINING_SEC:
+                                        return None
                                     ai_verdict = await asyncio.wait_for(
                                         verifier.judge_official_homepage(
                                             info_payload.get("text", "") or "",
@@ -1344,6 +1393,8 @@ async def process():
 
                         def _attach_ai_task(record: dict[str, Any]) -> None:
                             if not record_needs_official_ai(record):
+                                return
+                            if remaining_time_budget() <= AI_MIN_REMAINING_SEC:
                                 return
                             task = asyncio.create_task(run_official_ai(record))
                             ai_tasks.append(task)
@@ -2210,7 +2261,7 @@ async def process():
                             or need_founded
                         )
                     )
-                    if ai_needed and not timed_out:
+                    if ai_needed and not timed_out and has_time_for_ai():
                         ai_attempted = True
                         info_dict = await ensure_info_has_screenshot(scraper, info_url, info_dict, need_screenshot=OFFICIAL_AI_USE_SCREENSHOT)
                         info = info_dict
@@ -2219,6 +2270,8 @@ async def process():
 
                         async def run_ai_verify():
                             nonlocal ai_time_spent
+                            if not has_time_for_ai():
+                                return None
                             ai_started = time.monotonic()
                             try:
                                 res = await asyncio.wait_for(
@@ -2238,6 +2291,8 @@ async def process():
                             return res
 
                         ai_task = asyncio.create_task(run_ai_verify())
+                    elif ai_needed and not timed_out:
+                        ai_needed = False
 
                     ai_phone: str | None = None
                     ai_addr: str | None = None
@@ -2271,11 +2326,13 @@ async def process():
                             if cleaned_ai_desc:
                                 description_val = cleaned_ai_desc
                                 need_description = False
-                    elif ai_needed and info_url and verifier is not None and USE_AI and not timed_out:
+                    elif ai_needed and info_url and verifier is not None and USE_AI and not timed_out and has_time_for_ai():
                         # 公式候補はあるがテキストが乏しい場合のフォールバック: 再取得してでもAIを1回回す
                         try:
                             info_dict = await ensure_info_has_screenshot(scraper, info_url, info_dict, need_screenshot=OFFICIAL_AI_USE_SCREENSHOT)
                             ai_started = time.monotonic()
+                            if not has_time_for_ai():
+                                raise asyncio.TimeoutError()
                             ai_result = await asyncio.wait_for(
                                 verifier.verify_info(
                                     build_ai_text_payload(info_dict.get("text", "")),
@@ -2294,7 +2351,7 @@ async def process():
                         if ai_attempted and AI_COOLDOWN_SEC > 0:
                             await asyncio.sleep(jittered_seconds(AI_COOLDOWN_SEC, JITTER_RATIO))
                     missing_contact, missing_extra = refresh_need_flags()
-                    if need_description and verifier is not None and info_dict and not timed_out:
+                    if need_description and verifier is not None and info_dict and not timed_out and has_time_for_ai():
                         desc_source = select_relevant_paragraphs(info_dict.get("text", "") or "")
                         ai_desc = await asyncio.wait_for(
                             verifier.generate_description(
@@ -2312,7 +2369,7 @@ async def process():
                             ai_model = AI_MODEL_NAME
 
                     # AI 2回目: まだ欠損がある場合に、優先リンクから集めたテキストで再度問い合わせ
-                    if USE_AI and verifier is not None and priority_docs and not timed_out:
+                    if USE_AI and verifier is not None and priority_docs and not timed_out and has_time_for_ai():
                         provisional_contact_missing = int(not (phone or ai_phone or rule_phone)) + int(not (found_address or ai_addr or rule_address or addr)) + int(not (rep_name_val or ai_rep or rule_rep))
                         missing_extra = sum([
                             int(need_description),
@@ -2334,8 +2391,12 @@ async def process():
                                 screenshot_payload = (info_dict or {}).get("screenshot")
                                 async def run_ai_verify2():
                                     nonlocal ai_time_spent
+                                    if not has_time_for_ai():
+                                        return None
                                     ai_started = time.monotonic()
                                     try:
+                                        if not has_time_for_ai():
+                                            return None
                                         return await asyncio.wait_for(
                                             verifier.verify_info(combined_text, screenshot_payload, name, addr),
                                             timeout=clamp_timeout(max(ai_call_timeout, 5.0)),
@@ -2369,7 +2430,7 @@ async def process():
                                         update_description_candidate(desc2)
 
                         missing_contact, missing_extra = refresh_need_flags()
-                        if need_description and verifier is not None:
+                        if need_description and verifier is not None and has_time_for_ai():
                             combined_sources = [select_relevant_paragraphs(v.get("text", "") or "") for v in priority_docs.values()]
                             combined_text = build_ai_text_payload(*combined_sources)
                             screenshot_payload = (info_dict or {}).get("screenshot") if info_dict else None
@@ -2862,6 +2923,16 @@ async def process():
             # 1社ごとのスリープ（±JITTERでレート制限/ドメイン集中回避）
             if SLEEP_BETWEEN_SEC > 0:
                 await asyncio.sleep(jittered_seconds(SLEEP_BETWEEN_SEC, JITTER_RATIO))
+
+        if timeouts_extended:
+            TIME_LIMIT_FETCH_ONLY = DEFAULT_TIME_LIMIT_FETCH_ONLY
+            TIME_LIMIT_WITH_OFFICIAL = DEFAULT_TIME_LIMIT_WITH_OFFICIAL
+            TIME_LIMIT_DEEP = DEFAULT_TIME_LIMIT_DEEP
+            try:
+                scraper.page_timeout_ms = normal_page_timeout_ms
+                scraper.slow_page_threshold_ms = normal_slow_page_threshold_ms
+            except Exception:
+                pass
 
     finally:
         if csv_file:
