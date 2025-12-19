@@ -456,6 +456,36 @@ class CompanyScraper:
         "リストス", "上場区分", "企業情報サイト", "まとめ", "一覧", "ランキング", "プラン",
         "sales promotion", "booking", "reservation", "hotel", "travel", "camp",
     )
+    # 企業DB/ディレクトリ系の強いシグナル（URLパス＋本文）
+    DIRECTORY_URL_PATTERNS = (
+        re.compile(r"/companies/\\d+(?:/|$)", re.IGNORECASE),
+        re.compile(r"/company/\\d+(?:/|$)", re.IGNORECASE),
+        re.compile(r"/detail/\\d+(?:/|$)", re.IGNORECASE),
+        re.compile(r"/(?:directory|listing|db)(?:/|$)", re.IGNORECASE),
+        re.compile(r"/search(?:/|$)", re.IGNORECASE),
+    )
+    DIRECTORY_TEXT_KEYWORDS_STRONG = (
+        "掲載企業",
+        "掲載情報",
+        "掲載企業数",
+        "企業一覧",
+        "企業検索",
+        "企業を探す",
+        "検索",
+        "絞り込み",
+        "他社",
+        "企業データベース",
+        "企業db",
+        "企業情報db",
+        "企業情報サイト",
+        "法人番号",
+        "この企業情報は",
+        "掲載している企業",
+    )
+    DIRECTORY_TEXT_PATTERNS = (
+        re.compile(r"(企業|会社).{0,6}(一覧|検索|データベース|db)", re.IGNORECASE),
+        re.compile(r"(掲載|登録).{0,8}(企業|会社)", re.IGNORECASE),
+    )
     EXEC_TITLE_KEYWORDS = (
         "代表取締役", "代表理事", "代表者", "社長", "会長", "理事長", "学長",
         "園長", "校長", "院長", "組合長", "議長", "知事", "市長", "区長", "町長", "村長",
@@ -1441,6 +1471,282 @@ class CompanyScraper:
                     hints.append(content)
         return " \n".join(hints)
 
+    @staticmethod
+    def _safe_json_loads(candidate: str) -> Optional[Any]:
+        if not candidate:
+            return None
+        try:
+            return json.loads(candidate)
+        except Exception:
+            return None
+
+    @classmethod
+    def _extract_jsonld_objects(cls, html: str) -> List[Dict[str, Any]]:
+        if not html:
+            return []
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+        except Exception:
+            return []
+        out: List[Dict[str, Any]] = []
+        for node in soup.find_all("script", attrs={"type": lambda v: v and "ld+json" in str(v).lower()}):
+            raw = node.string or node.get_text(" ", strip=True) or ""
+            raw = raw.strip()
+            if not raw:
+                continue
+            data = cls._safe_json_loads(raw)
+            if not data:
+                continue
+            candidates: List[Any] = []
+            if isinstance(data, dict):
+                if isinstance(data.get("@graph"), list):
+                    candidates.extend(data.get("@graph") or [])
+                else:
+                    candidates.append(data)
+            elif isinstance(data, list):
+                candidates.extend(data)
+            for obj in candidates:
+                if isinstance(obj, dict):
+                    out.append(obj)
+        return out
+
+    @classmethod
+    def _detect_directory_like(
+        cls,
+        url: str,
+        *,
+        text: str = "",
+        html: str = "",
+    ) -> Dict[str, Any]:
+        """
+        企業DB/ディレクトリ系ページを強制除外するための判定。
+        ドメイン名ではなく URLパス構造＋本文シグナルでスコアリングする。
+        """
+        score = 0
+        reasons: List[str] = []
+        try:
+            parsed = urllib.parse.urlparse(url or "")
+        except Exception:
+            parsed = None
+
+        path = ""
+        query = ""
+        if parsed:
+            path = unquote(parsed.path or "")
+            query = parsed.query or ""
+        path_lower = (path or "").lower()
+
+        for pat in cls.DIRECTORY_URL_PATTERNS:
+            if pat.search(path_lower):
+                score += 8
+                reasons.append(f"url:{pat.pattern}")
+                break
+
+        if query:
+            qs = parse_qs(query)
+            for key in ("company_id", "companyid", "cid", "id", "detail_id", "detailid"):
+                vals = qs.get(key)
+                if not vals:
+                    continue
+                v0 = (vals[0] or "").strip()
+                if re.fullmatch(r"\\d{2,}", v0):
+                    score += 4
+                    reasons.append(f"query:{key}={v0}")
+                    break
+
+        sample_text = (text or "")
+        if not sample_text and html:
+            try:
+                soup = BeautifulSoup(html, "html.parser")
+                sample_text = soup.get_text(" ", strip=True)
+            except Exception:
+                sample_text = ""
+        t = unicodedata.normalize("NFKC", sample_text)[:7000]
+        t_low = t.lower()
+        for kw in cls.DIRECTORY_TEXT_KEYWORDS_STRONG:
+            if kw.lower() in t_low:
+                score += 2
+                reasons.append(f"text:{kw}")
+        for pat in cls.DIRECTORY_TEXT_PATTERNS:
+            if pat.search(t):
+                score += 3
+                reasons.append(f"text_re:{pat.pattern}")
+
+        # 多数の企業リンクがある（/companies/ 等）場合はディレクトリUIとみなす
+        if html:
+            try:
+                hits = len(re.findall(r"href=[\"'][^\"']*(?:/companies/|/company/|/detail/)\\d+", html, flags=re.I))
+            except Exception:
+                hits = 0
+            if hits >= 4:
+                score += 6
+                reasons.append(f"html:many_company_links={hits}")
+
+        return {
+            "is_directory_like": score >= 10,
+            "directory_score": score,
+            "directory_reasons": reasons[:12],
+        }
+
+    @classmethod
+    def _compute_official_evidence(
+        cls,
+        company_name: str,
+        *,
+        url: str,
+        html: str,
+    ) -> Dict[str, Any]:
+        """
+        ドメイン一致より「公式らしさの根拠」を重視するための加点。
+        1回fetchしたHTMLのみを使い、追加のネットワークアクセスはしない。
+        """
+        evidence: List[str] = []
+        score = 0
+        norm_name = cls._normalize_company_name(company_name or "")
+        full_name = unicodedata.normalize("NFKC", company_name or "").strip()
+        name_variants = [v for v in (full_name, norm_name) if v]
+        if not html:
+            return {"official_evidence_score": 0, "official_evidence": []}
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+        except Exception:
+            return {"official_evidence_score": 0, "official_evidence": []}
+
+        def _name_hit(s: str) -> float:
+            s = unicodedata.normalize("NFKC", s or "").strip()
+            if not s or not name_variants:
+                return 0.0
+            best = 0.0
+            for nv in name_variants:
+                if nv in s:
+                    return 1.0
+                best = max(best, SequenceMatcher(None, nv, s).ratio())
+            return best
+
+        title = soup.title.string if soup.title and soup.title.string else ""
+        title_ratio = _name_hit(title)
+        if title_ratio >= 0.92:
+            score += 3
+            evidence.append("title")
+        elif title_ratio >= 0.85:
+            score += 2
+            evidence.append("title_partial")
+
+        h1 = ""
+        try:
+            h1_node = soup.find("h1")
+            h1 = h1_node.get_text(" ", strip=True) if h1_node else ""
+        except Exception:
+            h1 = ""
+        h1_ratio = _name_hit(h1)
+        if h1_ratio >= 0.92:
+            score += 3
+            evidence.append("h1")
+        elif h1_ratio >= 0.85:
+            score += 2
+            evidence.append("h1_partial")
+
+        og_site = ""
+        try:
+            og = soup.find("meta", attrs={"property": "og:site_name"}) or soup.find("meta", attrs={"name": "og:site_name"})
+            og_site = (og.get("content") or "").strip() if og else ""
+        except Exception:
+            og_site = ""
+        og_ratio = _name_hit(og_site)
+        if og_ratio >= 0.92:
+            score += 3
+            evidence.append("og:site_name")
+
+        # JSON-LD Organization
+        jsonld_objs = cls._extract_jsonld_objects(html)
+        org_matched = False
+        org_has_addr = False
+        org_has_tel = False
+        for obj in jsonld_objs:
+            raw_type = obj.get("@type") or obj.get("['@type']")  # defensive
+            types: List[str] = []
+            if isinstance(raw_type, str):
+                types = [raw_type]
+            elif isinstance(raw_type, list):
+                types = [str(t) for t in raw_type if t]
+            types_low = {t.lower() for t in types}
+            if not ({"organization", "corporation", "localbusiness"} & types_low):
+                continue
+            name_val = obj.get("name")
+            ratio = _name_hit(str(name_val) if name_val is not None else "")
+            if ratio >= 0.9:
+                org_matched = True
+                score += 4
+                evidence.append("jsonld:org_name")
+                addr_val = obj.get("address")
+                tel_val = obj.get("telephone") or obj.get("tel")
+                if addr_val:
+                    org_has_addr = True
+                    score += 2
+                    evidence.append("jsonld:address")
+                if tel_val:
+                    org_has_tel = True
+                    score += 1
+                    evidence.append("jsonld:telephone")
+                break
+
+        # 同一ドメイン内の「会社概要/お問い合わせ/アクセス」リンク
+        try:
+            links = soup.find_all("a", href=True)
+        except Exception:
+            links = []
+        if links:
+            got_profile = False
+            got_contact = False
+            got_access = False
+            for a in links:
+                href = (a.get("href") or "").strip()
+                text = (a.get_text(" ", strip=True) or "").strip()
+                blob = f"{href} {text}".lower()
+                if not got_profile and any(k in blob for k in ("会社概要", "企業情報", "会社情報", "about", "corporate", "profile", "overview")):
+                    got_profile = True
+                if not got_contact and any(k in blob for k in ("お問い合わせ", "お問合せ", "問合せ", "contact", "inquiry")):
+                    got_contact = True
+                if not got_access and any(k in blob for k in ("アクセス", "所在地", "map", "access")):
+                    got_access = True
+                if got_profile and got_contact and got_access:
+                    break
+            if got_profile:
+                score += 2
+                evidence.append("link:profile")
+            if got_contact:
+                score += 2
+                evidence.append("link:contact")
+            if got_access:
+                score += 1
+                evidence.append("link:access")
+
+        # フッター由来の社名/©
+        footer_text = ""
+        try:
+            footer = soup.find("footer")
+            footer_text = footer.get_text(" ", strip=True) if footer else ""
+        except Exception:
+            footer_text = ""
+        footer_text_norm = unicodedata.normalize("NFKC", footer_text or "")
+        if any(nv in footer_text_norm for nv in name_variants):
+            score += 2
+            evidence.append("footer:name")
+        if re.search(r"(©|copyright|all rights reserved)", footer_text_norm, flags=re.I):
+            score += 1
+            evidence.append("footer:copyright")
+
+        # URLがroot/浅いパスほど公式トップ寄り（強い根拠ではないので軽微に加点）
+        try:
+            depth = max((urllib.parse.urlparse(url).path or "/").strip("/").count("/") + 1, 0)
+        except Exception:
+            depth = 0
+        if depth <= 1:
+            score += 1
+            evidence.append("url:shallow")
+
+        return {"official_evidence_score": int(score), "official_evidence": evidence[:12]}
+
     def is_likely_official_site(
         self,
         company_name: str,
@@ -1468,6 +1774,11 @@ class CompanyScraper:
             host_value: str = "",
             blocked_host: bool = False,
             prefecture_mismatch: bool = False,
+            official_evidence_score: int = 0,
+            official_evidence: Optional[List[str]] = None,
+            directory_like: bool = False,
+            directory_score: int = 0,
+            directory_reasons: Optional[List[str]] = None,
         ) -> bool | Dict[str, Any]:
             payload = {
                 "is_official": is_official,
@@ -1485,6 +1796,11 @@ class CompanyScraper:
                 "host": host_value,
                 "blocked_host": blocked_host,
                 "prefecture_mismatch": prefecture_mismatch,
+                "official_evidence_score": official_evidence_score,
+                "official_evidence": official_evidence or [],
+                "directory_like": directory_like,
+                "directory_score": directory_score,
+                "directory_reasons": directory_reasons or [],
             }
             return payload if return_details else payload["is_official"]
 
@@ -1562,6 +1878,13 @@ class CompanyScraper:
 
         norm_name = self._normalize_company_name(company_name)
         text_snippet, html = self._page_hints(page_info)
+        directory = self._detect_directory_like(url, text=text_snippet or "", html=html or "")
+        directory_like = bool(directory.get("is_directory_like"))
+        directory_score = int(directory.get("directory_score") or 0)
+        directory_reasons = directory.get("directory_reasons") or []
+        evidence = self._compute_official_evidence(company_name, url=url, html=html or "")
+        official_evidence_score = int(evidence.get("official_evidence_score") or 0)
+        official_evidence = evidence.get("official_evidence") or []
         meta_snippet = self._meta_strings(html)
         combined = f"{text_snippet}\n{meta_snippet}".strip()
         lowered = combined.lower()
@@ -1609,6 +1932,31 @@ class CompanyScraper:
         elif name_match.partial_only:
             score -= 4
 
+        # 企業DB/ディレクトリ系は強制除外（社名/住所一致しても公式扱いしない）
+        if directory_like:
+            return finalize(
+                False,
+                score=min(score, -10),
+                name_present=name_present_flag,
+                strong_domain=False,
+                address_match=False,
+                prefecture_match=False,
+                postal_code_match=False,
+                name_match_ratio=name_match.ratio,
+                name_match_exact=name_match.exact,
+                name_match_partial_only=name_match.partial_only,
+                name_match_source=name_match.best_source,
+                domain_score=domain_match_score,
+                host_value=host,
+                blocked_host=False,
+                prefecture_mismatch=False,
+                official_evidence_score=official_evidence_score,
+                official_evidence=official_evidence,
+                directory_like=True,
+                directory_score=directory_score,
+                directory_reasons=directory_reasons,
+            )
+
         # 入力住所がある場合、ページ側の都道府県が明確に不一致なら低スコア
         pref_mismatch = False
         expected_city = ""
@@ -1650,6 +1998,11 @@ class CompanyScraper:
                     host_value=host,
                     blocked_host=False,
                     prefecture_mismatch=pref_mismatch,
+                    official_evidence_score=official_evidence_score,
+                    official_evidence=official_evidence,
+                    directory_like=directory_like,
+                    directory_score=directory_score,
+                    directory_reasons=directory_reasons,
                 )
 
         address_hit = False
@@ -1707,6 +2060,11 @@ class CompanyScraper:
                     host_value=host,
                     blocked_host=False,
                     prefecture_mismatch=(pref_mismatch or pref_mismatch_in_address),
+                    official_evidence_score=official_evidence_score,
+                    official_evidence=official_evidence,
+                    directory_like=directory_like,
+                    directory_score=directory_score,
+                    directory_reasons=directory_reasons,
                 )
         if generic_tld and not whitelist_hit and not is_google_sites:
             name_ok = name_present_flag or domain_match_score >= 4 or host_token_hit
@@ -1728,8 +2086,47 @@ class CompanyScraper:
                     host_value=host,
                     blocked_host=False,
                     prefecture_mismatch=(pref_mismatch or pref_mismatch_in_address),
+                    official_evidence_score=official_evidence_score,
+                    official_evidence=official_evidence,
+                    directory_like=directory_like,
+                    directory_score=directory_score,
+                    directory_reasons=directory_reasons,
                 )
             if expected_address and not (address_hit or pref_hit or postal_hit) and not strong_generic_ok:
+                strong_name_for_evidence = name_match.exact or (name_match.ratio >= 0.92 and not name_match.partial_only)
+                if not (strong_name_for_evidence and official_evidence_score >= 9):
+                    return finalize(
+                        False,
+                        score=score,
+                        name_present=name_present_flag,
+                        strong_domain=strong_domain_flag,
+                        address_match=address_hit,
+                        prefecture_match=pref_hit,
+                        postal_code_match=postal_hit,
+                        name_match_ratio=name_match.ratio,
+                        name_match_exact=name_match.exact,
+                        name_match_partial_only=name_match.partial_only,
+                        name_match_source=name_match.best_source,
+                        domain_score=domain_match_score,
+                        host_value=host,
+                        blocked_host=False,
+                        prefecture_mismatch=(pref_mismatch or pref_mismatch_in_address),
+                        official_evidence_score=official_evidence_score,
+                        official_evidence=official_evidence,
+                        directory_like=directory_like,
+                        directory_score=directory_score,
+                        directory_reasons=directory_reasons,
+                    )
+
+        if allowed_tld and host_token_hit and company_has_corp and score < 4:
+            score = 4
+
+        if expected_address and not (address_hit or pref_hit or postal_hit):
+            strong_name_for_evidence = name_match.exact or (name_match.ratio >= 0.92 and not name_match.partial_only)
+            if strong_name_for_evidence and official_evidence_score >= 9:
+                # 住所が本文から取れないケースでも、タイトル/JSON-LD/フッター等の根拠が強ければ公式として残す
+                pass
+            else:
                 return finalize(
                     False,
                     score=score,
@@ -1744,30 +2141,13 @@ class CompanyScraper:
                     name_match_source=name_match.best_source,
                     domain_score=domain_match_score,
                     host_value=host,
-                    blocked_host=False,
                     prefecture_mismatch=(pref_mismatch or pref_mismatch_in_address),
+                    official_evidence_score=official_evidence_score,
+                    official_evidence=official_evidence,
+                    directory_like=directory_like,
+                    directory_score=directory_score,
+                    directory_reasons=directory_reasons,
                 )
-
-        if allowed_tld and host_token_hit and company_has_corp and score < 4:
-            score = 4
-
-        if expected_address and not (address_hit or pref_hit or postal_hit):
-            return finalize(
-                False,
-                score=score,
-                name_present=name_present_flag,
-                strong_domain=strong_domain_flag,
-                address_match=address_hit,
-                prefecture_match=pref_hit,
-                postal_code_match=postal_hit,
-                name_match_ratio=name_match.ratio,
-                name_match_exact=name_match.exact,
-                name_match_partial_only=name_match.partial_only,
-                name_match_source=name_match.best_source,
-                domain_score=domain_match_score,
-                host_value=host,
-                prefecture_mismatch=(pref_mismatch or pref_mismatch_in_address),
-            )
 
         if (address_hit or pref_hit or postal_hit) and (allowed_tld or whitelist_hit or is_google_sites):
             return finalize(
@@ -1785,6 +2165,11 @@ class CompanyScraper:
                 domain_score=domain_match_score,
                 host_value=host,
                 prefecture_mismatch=(pref_mismatch or pref_mismatch_in_address),
+                official_evidence_score=official_evidence_score,
+                official_evidence=official_evidence,
+                directory_like=directory_like,
+                directory_score=directory_score,
+                directory_reasons=directory_reasons,
             )
 
         if allowed_tld and company_has_corp and (host_token_hit or domain_match_score >= 3 or name_present_flag):
@@ -1804,6 +2189,11 @@ class CompanyScraper:
                     domain_score=domain_match_score,
                     host_value=host,
                     prefecture_mismatch=(pref_mismatch or pref_mismatch_in_address),
+                    official_evidence_score=official_evidence_score,
+                    official_evidence=official_evidence,
+                    directory_like=directory_like,
+                    directory_score=directory_score,
+                    directory_reasons=directory_reasons,
                 )
             return finalize(
                 True,
@@ -1820,6 +2210,11 @@ class CompanyScraper:
                 domain_score=domain_match_score,
                 host_value=host,
                 prefecture_mismatch=(pref_mismatch or pref_mismatch_in_address),
+                official_evidence_score=official_evidence_score,
+                official_evidence=official_evidence,
+                directory_like=directory_like,
+                directory_score=directory_score,
+                directory_reasons=directory_reasons,
             )
 
         if whitelist_hit and expected_address:
@@ -1840,26 +2235,40 @@ class CompanyScraper:
                 domain_score=domain_match_score,
                 host_value=host,
                 prefecture_mismatch=(pref_mismatch or pref_mismatch_in_address),
+                official_evidence_score=official_evidence_score,
+                official_evidence=official_evidence,
+                directory_like=directory_like,
+                directory_score=directory_score,
+                directory_reasons=directory_reasons,
             )
 
         # ドメインが弱いものは住所等の裏付けが無ければ公式扱いしない
         if not (address_hit or pref_hit or postal_hit) and domain_match_score < 2:
-            return finalize(
-                False,
-                score=score,
-                name_present=name_present_flag,
-                strong_domain=False,
-                address_match=address_hit,
-                prefecture_match=pref_hit,
-                postal_code_match=postal_hit,
-                name_match_ratio=name_match.ratio,
-                name_match_exact=name_match.exact,
-                name_match_partial_only=name_match.partial_only,
-                name_match_source=name_match.best_source,
-                domain_score=domain_match_score,
-                host_value=host,
-                prefecture_mismatch=(pref_mismatch or pref_mismatch_in_address),
-            )
+            if official_evidence_score >= 10 and (name_match.exact or name_match.ratio >= 0.92) and allowed_tld:
+                # ドメインスコアが極端に低くても、JSON-LD/タイトル等の根拠が強い場合は残す
+                pass
+            else:
+                return finalize(
+                    False,
+                    score=score,
+                    name_present=name_present_flag,
+                    strong_domain=False,
+                    address_match=address_hit,
+                    prefecture_match=pref_hit,
+                    postal_code_match=postal_hit,
+                    name_match_ratio=name_match.ratio,
+                    name_match_exact=name_match.exact,
+                    name_match_partial_only=name_match.partial_only,
+                    name_match_source=name_match.best_source,
+                    domain_score=domain_match_score,
+                    host_value=host,
+                    prefecture_mismatch=(pref_mismatch or pref_mismatch_in_address),
+                    official_evidence_score=official_evidence_score,
+                    official_evidence=official_evidence,
+                    directory_like=directory_like,
+                    directory_score=directory_score,
+                    directory_reasons=directory_reasons,
+                )
 
         name_present = name_present_flag
         strong_domain = strong_domain_flag
@@ -1879,6 +2288,11 @@ class CompanyScraper:
                 domain_score=domain_match_score,
                 host_value=host,
                 prefecture_mismatch=(pref_mismatch or pref_mismatch_in_address),
+                official_evidence_score=official_evidence_score,
+                official_evidence=official_evidence,
+                directory_like=directory_like,
+                directory_score=directory_score,
+                directory_reasons=directory_reasons,
             )
         # ドメイン一致が弱く、名前も住所も見つからない場合は非公式扱い
         if not (name_present or address_hit or pref_hit or postal_hit) and domain_match_score < 4:
@@ -1897,6 +2311,11 @@ class CompanyScraper:
                 domain_score=domain_match_score,
                 host_value=host,
                 prefecture_mismatch=(pref_mismatch or pref_mismatch_in_address),
+                official_evidence_score=official_evidence_score,
+                official_evidence=official_evidence,
+                directory_like=directory_like,
+                directory_score=directory_score,
+                directory_reasons=directory_reasons,
             )
         result = score >= 4
         return finalize(
@@ -1914,6 +2333,11 @@ class CompanyScraper:
             domain_score=domain_match_score,
             host_value=host,
             prefecture_mismatch=(pref_mismatch or pref_mismatch_in_address),
+            official_evidence_score=official_evidence_score,
+            official_evidence=official_evidence,
+            directory_like=directory_like,
+            directory_score=directory_score,
+            directory_reasons=directory_reasons,
         )
 
     @staticmethod

@@ -353,9 +353,10 @@ def _official_signal_ok(
     domain_score: int,
     name_hit: bool,
     address_ok: bool,
+    official_evidence_score: int = 0,
 ) -> bool:
     strong_domain = host_token_hit or strong_domain_host or domain_score >= 4
-    name_or_addr = name_hit or address_ok or host_token_hit
+    name_or_addr = name_hit or address_ok or host_token_hit or official_evidence_score >= 9
     return bool(strong_domain and name_or_addr)
 
 def pick_best_address(expected_addr: str | None, candidates: list[str]) -> str | None:
@@ -1231,10 +1232,12 @@ async def process():
                             rule_details = {"is_official": bool(rule_details), "score": 0.0}
                         try:
                             log.info(
-                                "[%s] official_candidate url=%s rule_score=%.1f domain_score=%s name_ratio=%.2f exact=%s partial_only=%s pref_mismatch=%s addr_hit=%s pref_hit=%s zip_hit=%s",
+                                "[%s] official_candidate url=%s rule_score=%.1f evidence=%s directory=%s domain_score=%s name_ratio=%.2f exact=%s partial_only=%s pref_mismatch=%s addr_hit=%s pref_hit=%s zip_hit=%s",
                                 cid,
                                 candidate,
                                 float(rule_details.get("score") or 0.0),
+                                int(rule_details.get("official_evidence_score") or 0),
+                                bool(rule_details.get("directory_like")),
                                 domain_score_for_flag,
                                 float(rule_details.get("name_match_ratio") or 0.0),
                                 bool(rule_details.get("name_match_exact")),
@@ -1438,7 +1441,12 @@ async def process():
                                 ai_time_spent += time.monotonic() - ai_started
                                 ai_official_attempted = True
                                 if ai_verdict and ai_verdict.get("is_official") and domain_score < 4 and not record.get("rule", {}).get("address_match"):
-                                    ai_verdict["is_official"] = False
+                                    rule = record.get("rule", {}) or {}
+                                    evidence_score = int(rule.get("official_evidence_score") or 0)
+                                    directory_like = bool(rule.get("directory_like"))
+                                    # ドメインスコアが低くても根拠が強い（title/JSON-LD等）ならAI公式を潰さない
+                                    if directory_like or evidence_score < 9:
+                                        ai_verdict["is_official"] = False
                                 return ai_verdict
 
                         def _attach_ai_task(record: dict[str, Any]) -> None:
@@ -1481,11 +1489,55 @@ async def process():
                         zip_hit = bool(rule_details.get("postal_code_match"))
                         address_ok = (not addr) or addr_hit or pref_hit or zip_hit
                         name_hit = bool(rule_details.get("name_present")) or domain_score >= 5
+                        evidence_score = int(rule_details.get("official_evidence_score") or 0)
+                        directory_like = bool(rule_details.get("directory_like"))
                         host_name, _, allowed_tld, whitelist_host, _ = CompanyScraper._allowed_official_host(normalized_url or "")
-                        content_strong = name_hit and address_ok
+                        content_strong = name_hit and (address_ok or evidence_score >= 9)
                         ai_judge = record.get("ai_judge")
                         flag_info = record.get("flag_info")
+
+                        if directory_like:
+                            manager.upsert_url_flag(
+                                normalized_url,
+                                is_official=False,
+                                source="rule",
+                                reason="directory_like",
+                                confidence=rule_details.get("directory_score"),
+                            )
+                            fallback_cands.append((record.get("url"), extracted))
+                            log.info("[%s] 企業DB/ディレクトリ判定のため除外: %s", cid, record.get("url"))
+                            continue
+
                         if ai_judge:
+                            ai_is_official = ai_judge.get("is_official_site")
+                            if ai_is_official is None:
+                                ai_is_official = ai_judge.get("is_official")
+                            ai_conf = ai_judge.get("official_confidence")
+                            if ai_conf is None:
+                                ai_conf = ai_judge.get("confidence")
+                            try:
+                                ai_conf_f = float(ai_conf) if ai_conf is not None else 0.0
+                            except Exception:
+                                ai_conf_f = 0.0
+                            # AIが非公式 or 低confidence の場合は候補URLを落として次へ（企業DBが勝たないようにする）
+                            if (ai_is_official is False) or (ai_conf_f < AI_VERIFY_MIN_CONFIDENCE):
+                                manager.upsert_url_flag(
+                                    normalized_url,
+                                    is_official=False,
+                                    source="ai",
+                                    reason=ai_judge.get("reason", "") or "ai_low_confidence_or_not_official",
+                                    confidence=ai_conf_f,
+                                )
+                                fallback_cands.append((record.get("url"), extracted))
+                                log.info(
+                                    "[%s] AI判定で除外: %s (is_official=%s confidence=%.2f)",
+                                    cid,
+                                    record.get("url"),
+                                    ai_is_official,
+                                    ai_conf_f,
+                                )
+                                continue
+
                             fast_phone_hit = bool(extracted.get("phone_numbers"))
                             fast_address_ok = address_ok or bool(rule_details.get("address_match"))
                             fast_domain_ok = (
@@ -1495,7 +1547,7 @@ async def process():
                                 or rule_details.get("strong_domain")
                             )
                             ai_content_ok = fast_address_ok or fast_phone_hit or name_hit or host_token_hit
-                            if ai_judge.get("is_official") is True:
+                            if ai_is_official is True:
                                 if input_addr_pref_only and not ai_content_ok:
                                     manager.upsert_url_flag(
                                         normalized_url,
@@ -1527,12 +1579,14 @@ async def process():
                                 selected_candidate_record = record
                                 if not fast_domain_ok or (addr and not address_ok):
                                     force_review = True
-                                if _is_free_host(homepage) or not _official_signal_ok(
+                                free_host = _is_free_host(homepage)
+                                if (free_host and evidence_score < 10) or not _official_signal_ok(
                                     host_token_hit=host_token_hit,
                                     strong_domain_host=strong_domain_host,
                                     domain_score=domain_score,
                                     name_hit=name_hit,
                                     address_ok=address_ok,
+                                    official_evidence_score=evidence_score,
                                 ):
                                     homepage_official_flag = 0
                                     homepage_official_source = "provisional_freehost"
@@ -1563,26 +1617,6 @@ async def process():
                                     force_review,
                                 )
                                 break
-                            else:
-                                ai_override = (
-                                    strong_domain_host
-                                    or rule_details.get("name_present")
-                                    or address_ok
-                                    or (domain_score >= 5 and host_token_hit)
-                                )
-                                if ai_override:
-                                    log.info("[%s] AI非公式だが強ドメイン/名称/住所一致のためAI否定を無視: %s", cid, record.get("url"))
-                                else:
-                                    manager.upsert_url_flag(
-                                        normalized_url,
-                                        is_official=False,
-                                        source="ai",
-                                        reason=ai_judge.get("reason", ""),
-                                        confidence=ai_judge.get("confidence"),
-                                    )
-                                    fallback_cands.append((record.get("url"), extracted))
-                                    log.info("[%s] AIが非公式判定: %s", cid, record.get("url"))
-                                    continue
 
                         brand_allowed = (allowed_tld or whitelist_host) and not host_token_hit
                         if (
@@ -1711,12 +1745,14 @@ async def process():
                             homepage_official_source = "rule"
                             homepage_official_score = float(rule_details.get("score") or 0.0)
                             chosen_domain_score = domain_score
-                            if _is_free_host(homepage) or not _official_signal_ok(
+                            free_host = _is_free_host(homepage)
+                            if (free_host and evidence_score < 10) or not _official_signal_ok(
                                 host_token_hit=host_token_hit,
                                 strong_domain_host=strong_domain_host,
                                 domain_score=domain_score,
                                 name_hit=name_hit,
                                 address_ok=address_ok,
+                                official_evidence_score=evidence_score,
                             ):
                                 homepage_official_flag = 0
                                 homepage_official_source = "provisional_freehost"
@@ -1758,6 +1794,8 @@ async def process():
                         for record in candidate_records:
                             normalized_url = record.get("normalized_url") or record.get("url")
                             rule_details = record.get("rule") or {}
+                            if rule_details.get("directory_like"):
+                                continue
                             domain_score = int(record.get("domain_score") or 0)
                             if normalized_url and domain_score == 0:
                                 domain_score = scraper._domain_score(company_tokens, normalized_url)  # type: ignore
@@ -1769,11 +1807,13 @@ async def process():
                             pref_hit = bool(rule_details.get("prefecture_match"))
                             zip_hit = bool(rule_details.get("postal_code_match"))
                             address_ok = (not addr) or addr_hit or pref_hit or zip_hit
+                            evidence_score = int(rule_details.get("official_evidence_score") or 0)
                             allow_without_host = (
                                 strong_domain_host
                                 or name_present
                                 or domain_score >= 4
                                 or (address_ok and domain_score >= 3)
+                                or evidence_score >= 10
                             )
                             if not host_token_hit and not allow_without_host:
                                 continue
@@ -1781,6 +1821,7 @@ async def process():
                                 domain_score * 2
                                 + (3 if address_ok else 0)
                                 + float(rule_details.get("score") or 0.0)
+                                + min(6.0, evidence_score / 2.0)
                                 + (4 if strong_domain_host else 0)
                             )
                             if score > best_score:

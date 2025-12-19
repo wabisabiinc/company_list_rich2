@@ -557,7 +557,8 @@ class AIVerifier:
             "あなたは企業サイトの審査官です。候補URLが公式ホームページかどうかを判定してください。\n"
             "以下を根拠に、true/false と理由、信頼度(0-1)をJSONのみで出力してください。説明やマークダウンは禁止。\n"
             "出力フォーマット:\n"
-            "{\\\"is_official\\\": true/false, \\\"confidence\\\": 0.0-1.0, \\\"reason\\\": \"簡潔な根拠\"}\n"
+            "{\\\"is_official\\\": true/false, \\\"confidence\\\": 0.0-1.0, \\\"reason\\\": \"簡潔な根拠\","
+            " \\\"is_official_site\\\": true/false, \\\"official_confidence\\\": 0.0-1.0, \\\"official_evidence\\\": [\"根拠\", ...]}\n"
             "判断基準:\n"
             "- 企業名・所在地・サービス内容の一致を確認。\n"
             "- 口コミ/求人/まとめサイト・予約サイトは false。\n"
@@ -605,10 +606,28 @@ class AIVerifier:
                 reason = reason.strip()
             else:
                 reason = ""
+            official_verdict = result.get("is_official_site")
+            if isinstance(official_verdict, bool):
+                is_official_site = official_verdict
+            else:
+                is_official_site = bool(verdict)
+            official_conf_val = result.get("official_confidence")
+            try:
+                official_confidence = float(official_conf_val) if official_conf_val is not None else confidence
+            except Exception:
+                official_confidence = confidence
+            official_evidence = result.get("official_evidence")
+            if isinstance(official_evidence, list):
+                official_evidence_list = [str(x) for x in official_evidence if str(x).strip()][:8]
+            else:
+                official_evidence_list = [reason] if reason else []
             return {
                 "is_official": bool(verdict),
                 "confidence": confidence,
                 "reason": reason,
+                "is_official_site": bool(is_official_site),
+                "official_confidence": official_confidence,
+                "official_evidence": official_evidence_list,
             }
         except Exception as exc:  # pylint: disable=broad-except
             log.warning(f"judge_official_homepage failed for {company_name} ({url}) with image: {exc}")
@@ -638,8 +657,26 @@ class AIVerifier:
                 reason = reason.strip()
             else:
                 reason = ""
+            official_verdict = result.get("is_official_site")
+            if isinstance(official_verdict, bool):
+                is_official_site = official_verdict
+            else:
+                is_official_site = bool(verdict)
+            official_conf_val = result.get("official_confidence")
+            try:
+                official_confidence = float(official_conf_val) if official_conf_val is not None else confidence
+            except Exception:
+                official_confidence = confidence
+            official_evidence = result.get("official_evidence")
+            if isinstance(official_evidence, list):
+                official_evidence_list = [str(x) for x in official_evidence if str(x).strip()][:8]
+            else:
+                official_evidence_list = [reason] if reason else []
             return {
                 "is_official": bool(verdict),
                 "confidence": confidence,
                 "reason": reason,
+                "is_official_site": bool(is_official_site),
+                "official_confidence": official_confidence,
+                "official_evidence": official_evidence_list,
             }

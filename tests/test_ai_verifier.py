@@ -80,3 +80,5 @@ async def test_judge_official_homepage_parses_json():
     assert result is not None
     assert result["is_official"] is True
     assert abs(result["confidence"] - 0.85) < 1e-6
+    assert result["is_official_site"] is True
+    assert abs(result["official_confidence"] - 0.85) < 1e-6

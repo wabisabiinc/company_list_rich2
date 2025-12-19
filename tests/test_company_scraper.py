@@ -259,6 +259,60 @@ def test_is_likely_official_site_partial_address(scraper):
     )
 
 
+def test_is_likely_official_site_excludes_directory_url_even_if_name_and_address(scraper):
+    html = """
+    <html>
+      <head><title>株式会社Example | 企業情報</title></head>
+      <body>
+        株式会社Example
+        〒100-0001 東京都千代田区1-1-1
+        掲載企業一覧 / 企業検索 / 企業データベース
+      </body>
+    </html>
+    """
+    details = scraper.is_likely_official_site(
+        "株式会社Example",
+        "https://some-directory.example.com/companies/12345",
+        {"text": "株式会社Example 〒100-0001 東京都千代田区1-1-1 掲載企業 一覧 検索", "html": html},
+        "〒100-0001 東京都千代田区1-1-1",
+        {"addresses": ["〒100-0001 東京都千代田区1-1-1"]},
+        return_details=True,
+    )
+    assert isinstance(details, dict)
+    assert details["directory_like"] is True
+    assert details["is_official"] is False
+
+
+def test_is_likely_official_site_brand_domain_rescued_by_evidence(scraper):
+    html = """
+    <html>
+      <head>
+        <title>株式会社Example</title>
+        <meta property="og:site_name" content="株式会社Example" />
+        <script type="application/ld+json">
+          {"@context":"https://schema.org","@type":"Organization","name":"株式会社Example","telephone":"03-0000-0000"}
+        </script>
+      </head>
+      <body>
+        <h1>株式会社Example</h1>
+        <footer>© 株式会社Example</footer>
+      </body>
+    </html>
+    """
+    details = scraper.is_likely_official_site(
+        "株式会社Example",
+        "https://brand-example.com/",
+        {"text": "株式会社Example 公式サイト", "html": html},
+        "〒100-0001 東京都千代田区1-1-1",
+        {"addresses": []},
+        return_details=True,
+    )
+    assert isinstance(details, dict)
+    assert details["official_evidence_score"] >= 9
+    assert details["directory_like"] is False
+    assert details["is_official"] is True
+
+
 def test_is_likely_official_site_excludes_note(scraper):
     text = "[公式] 甘養亭製菓店の最新情報"
     assert not scraper.is_likely_official_site(
