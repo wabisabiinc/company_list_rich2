@@ -882,6 +882,28 @@ class CompanyScraper:
         arrow_idx = min([idx for idx in (val.find("→"), val.find("⇒")) if idx >= 0], default=-1)
         if arrow_idx >= 0:
             val = val[:arrow_idx]
+        # 先頭に「住所/所在地」などのラベルが混入したケースを除去
+        for _ in range(3):
+            cleaned = re.sub(r"^(?:【\s*)?(?:本社|本店)?(?:所在地|住所)(?:】\s*)?\s*[:：]?\s*", "", val).strip()
+            if cleaned == val:
+                break
+            val = cleaned
+        # 住所の後ろに付くことが多い非住所要素（従業員/許可/設立など）で打ち切る
+        tail_re = re.compile(
+            r"\s*(?:"
+            r"従業員(?:数)?|社員(?:数)?|職員(?:数)?|スタッフ(?:数)?|人数|"
+            r"営業時間|受付時間|定休日|"
+            r"代表者|代表取締役|取締役|社長|会長|理事長|"
+            r"資本金|設立|創業|沿革|"
+            r"(?:一般|特定)?(?:貨物|運送|建設|産廃|産業廃棄物|古物)?(?:業)?(?:許可|免許|登録|届出)|"
+            r"事業内容|サービス|"
+            r"お問い合わせ|お問合せ|問い合わせ|採用|求人"
+            r")\b",
+            re.IGNORECASE,
+        )
+        m_tail = tail_re.search(val)
+        if m_tail:
+            val = val[: m_tail.start()].strip()
         val = re.sub(r"\s+", " ", val).strip(" \"'")
         # 地図・マップ系が出たらそこまででカット
         m_map = re.search(r"(地図アプリ|マップ|Google\s*マップ|地図|map)", val, flags=re.I)
@@ -3415,59 +3437,64 @@ class CompanyScraper:
             if cand:
                 phones.append(cand)
 
-        for zm in ZIP_RE.finditer(text or ""):
-            zip_code = f"〒{zm.group(1).replace('〒', '').strip()}-{zm.group(2)}"
-            cursor = zm.end()
-            snippet = (text or "")[cursor:cursor + 200]
-            snippet = snippet.replace("\n", " ").replace("\r", " ").replace("\u3000", " ")
-            snippet = re.split(
-                r"(地図アプリ|地図で見る|マップ|Google\s*マップ|地図|map|アクセス|ルート|拡大地図|gac?\.push|gtag|_gaq)",
-                snippet,
-                maxsplit=1,
-            )[0]
-            if ADDR_HINT.search(snippet):
-                cleaned = re.split(r"[。．、,，;；｜|/]", snippet, maxsplit=1)[0]
-                cleaned = re.sub(r"\s+", " ", cleaned)
-                parts = [
-                    part.strip(" ：:・-‐―－ー〜~()（）[]{}<>")
-                    for part in re.split(r"[ \t]+", cleaned)
-                    if part.strip(" ：:・-‐―－ー〜~()（）[]{}<>")
-                ]
-                if parts:
-                    seg = " ".join(parts[:8]).strip()
-                    if seg:
-                        norm_addr = self._normalize_address_candidate(f"{zip_code} {seg}")
-                        if norm_addr and self._looks_like_full_address(norm_addr):
-                            addrs.append(norm_addr)
+        def _extract_addrs_from_text() -> None:
+            added_any = False
+            for zm in ZIP_RE.finditer(text or ""):
+                zip_code = f"〒{zm.group(1).replace('〒', '').strip()}-{zm.group(2)}"
+                cursor = zm.end()
+                snippet = (text or "")[cursor:cursor + 200]
+                snippet = snippet.replace("\n", " ").replace("\r", " ").replace("\u3000", " ")
+                snippet = re.split(
+                    r"(地図アプリ|地図で見る|マップ|Google\s*マップ|地図|map|アクセス|ルート|拡大地図|gac?\.push|gtag|_gaq)",
+                    snippet,
+                    maxsplit=1,
+                )[0]
+                if ADDR_HINT.search(snippet):
+                    cleaned = re.split(r"[。．、,，;；｜|/]", snippet, maxsplit=1)[0]
+                    cleaned = re.sub(r"\s+", " ", cleaned)
+                    parts = [
+                        part.strip(" ：:・-‐―－ー〜~()（）[]{}<>")
+                        for part in re.split(r"[ \t]+", cleaned)
+                        if part.strip(" ：:・-‐―－ー〜~()（）[]{}<>")
+                    ]
+                    if parts:
+                        seg = " ".join(parts[:8]).strip()
+                        if seg:
+                            norm_addr = self._normalize_address_candidate(f"{zip_code} {seg}")
+                            if norm_addr and self._looks_like_full_address(norm_addr):
+                                addrs.append(f"[TEXT]{norm_addr}")
+                                added_any = True
 
-        if not addrs:
-            for cand in ADDR_FALLBACK_RE.findall(text or ""):
-                norm = self._normalize_address_candidate(cand)
-                if norm and self._looks_like_full_address(norm):
-                    addrs.append(norm)
+            if not added_any:
+                for cand in ADDR_FALLBACK_RE.findall(text or ""):
+                    norm = self._normalize_address_candidate(cand)
+                    if norm and self._looks_like_full_address(norm):
+                        addrs.append(f"[TEXT]{norm}")
+                        added_any = True
 
-        # ZIP行と近傍行を縦持ちでも拾うフォールバック
-        if not addrs:
-            lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
-            for idx, ln in enumerate(lines):
-                m = ZIP_RE.search(ln)
-                if not m:
-                    continue
-                zip_code = f"〒{m.group(1).replace('〒', '').strip()}-{m.group(2)}"
-                # 直後1〜2行を結合して住所本体とみなす
-                body_parts: list[str] = []
-                for offset in (1, 2):
-                    if idx + offset < len(lines):
-                        body_parts.append(lines[idx + offset])
-                if not body_parts and idx > 0:
-                    body_parts.append(lines[idx - 1])  # 前行も一応参照
-                body = " ".join(body_parts).strip()
-                if not body:
-                    continue
-                cand_addr = f"{zip_code} {body}".strip()
-                norm = self._normalize_address_candidate(cand_addr)
-                if norm and self._looks_like_full_address(norm):
-                    addrs.append(norm)
+            # ZIP行と近傍行を縦持ちでも拾うフォールバック
+            if not added_any:
+                lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+                for idx, ln in enumerate(lines):
+                    m = ZIP_RE.search(ln)
+                    if not m:
+                        continue
+                    zip_code = f"〒{m.group(1).replace('〒', '').strip()}-{m.group(2)}"
+                    # 直後1〜2行を結合して住所本体とみなす
+                    body_parts: list[str] = []
+                    for offset in (1, 2):
+                        if idx + offset < len(lines):
+                            body_parts.append(lines[idx + offset])
+                    if not body_parts and idx > 0:
+                        body_parts.append(lines[idx - 1])  # 前行も一応参照
+                    body = " ".join(body_parts).strip()
+                    if not body:
+                        continue
+                    cand_addr = f"{zip_code} {body}".strip()
+                    norm = self._normalize_address_candidate(cand_addr)
+                    if norm and self._looks_like_full_address(norm):
+                        addrs.append(f"[TEXT]{norm}")
+                        added_any = True
 
         for rm in REP_RE.finditer(text or ""):
             cleaned = self.clean_rep_name(rm.group(1))
@@ -3502,6 +3529,53 @@ class CompanyScraper:
             except Exception:
                 soup = None
             if soup:
+                # フッター/隅の情報に住所だけが載っているケース対策:
+                # table/dl のラベル抽出に乗らない住所を <footer>/<address> 等から拾う
+                try:
+                    extra_blobs: list[str] = []
+                    for node in soup.find_all(["address", "footer"]):
+                        txt = node.get_text(separator=" ", strip=True)
+                        if txt:
+                            extra_blobs.append(txt)
+                    for node in soup.find_all(attrs={"role": "contentinfo"}):
+                        txt = node.get_text(separator=" ", strip=True)
+                        if txt:
+                            extra_blobs.append(txt)
+                    # microdata (itemprop) のPostalAddress断片も拾う
+                    parts: list[str] = []
+                    for prop in ("postalCode", "addressRegion", "addressLocality", "streetAddress"):
+                        for node in soup.find_all(attrs={"itemprop": prop}):
+                            txt = node.get_text(separator=" ", strip=True)
+                            if txt:
+                                parts.append(txt)
+                    if parts:
+                        extra_blobs.append(" ".join(parts))
+
+                    for blob in extra_blobs:
+                        for zm in ZIP_RE.finditer(blob or ""):
+                            zip_code = f"〒{zm.group(1).replace('〒', '').strip()}-{zm.group(2)}"
+                            cursor = zm.end()
+                            snippet = (blob or "")[cursor:cursor + 220]
+                            snippet = snippet.replace("\n", " ").replace("\r", " ").replace("\u3000", " ")
+                            snippet = re.split(
+                                r"(地図アプリ|地図で見る|マップ|Google\s*マップ|地図|map|アクセス|ルート|拡大地図|gac?\.push|gtag|_gaq)",
+                                snippet,
+                                maxsplit=1,
+                            )[0]
+                            if ADDR_HINT.search(snippet):
+                                cleaned = re.split(r"[。．、,，;；｜|/]", snippet, maxsplit=1)[0]
+                                cleaned = re.sub(r"\s+", " ", cleaned)
+                                seg = " ".join(cleaned.split()[:10]).strip()
+                                if seg:
+                                    norm_addr = self._normalize_address_candidate(f"{zip_code} {seg}")
+                                    if norm_addr and self._looks_like_full_address(norm_addr):
+                                        addrs.append(f"[FOOTER]{norm_addr}")
+                        for cand in ADDR_FALLBACK_RE.findall(blob or ""):
+                            norm = self._normalize_address_candidate(cand)
+                            if norm and self._looks_like_full_address(norm):
+                                addrs.append(f"[FOOTER]{norm}")
+                except Exception:
+                    pass
                 for table in soup.find_all("table"):
                     for row in table.find_all("tr"):
                         cells = row.find_all(["th", "td"])
@@ -3629,7 +3703,7 @@ class CompanyScraper:
                     elif field == "addresses":
                         norm_addr = self._normalize_address_candidate(raw_value)
                         if norm_addr and self.looks_like_address(norm_addr):
-                            addrs.append(norm_addr if not is_table_pair else f"[TABLE]{norm_addr}")
+                            addrs.append(f"[TABLE]{norm_addr}" if is_table_pair else f"[LABEL]{norm_addr}")
                             matched = True
                     elif field == "listing":
                         listings.append(raw_value if not is_table_pair else f"[TABLE]{raw_value}")
@@ -3697,7 +3771,9 @@ class CompanyScraper:
                             parts = [addr.get(k, "") for k in ("postalCode", "addressRegion", "addressLocality", "streetAddress")]
                             joined = " ".join([p for p in parts if p])
                             if joined:
-                                addrs.append(self._normalize_address_candidate(joined))
+                                norm_addr = self._normalize_address_candidate(joined)
+                                if norm_addr:
+                                    addrs.append(f"[JSONLD]{norm_addr}")
                         founder = entity.get("founder")
                         founders = entity.get("founders")
                         founder_vals: List[str] = []
@@ -3740,6 +3816,17 @@ class CompanyScraper:
                 except Exception:
                     continue
                 walk_ld(data)
+
+        # 住所は「構造抽出」を優先し、強い候補（JSON-LD/テーブル/ラベル）が無いときのみテキスト拾いを許可する
+        if not addrs:
+            _extract_addrs_from_text()
+        else:
+            has_strong = any(
+                isinstance(a, str) and (a.startswith("[JSONLD]") or a.startswith("[TABLE]") or a.startswith("[LABEL]"))
+                for a in addrs
+            )
+            if not has_strong:
+                _extract_addrs_from_text()
 
         for lm in LISTING_RE.finditer(text or ""):
             val = lm.group(1).strip()

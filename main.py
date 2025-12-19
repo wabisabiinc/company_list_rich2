@@ -177,6 +177,34 @@ def normalize_phone(s: str | None) -> str | None:
 def normalize_address(s: str | None) -> str | None:
     if not s:
         return None
+    def _strip_address_label(text: str) -> str:
+        out = text.strip()
+        for _ in range(3):
+            out2 = re.sub(r"^(?:【\s*)?(?:本社|本店)?(?:所在地|住所)(?:】\s*)?\s*[:：]?\s*", "", out)
+            if out2 == out:
+                break
+            out = out2.strip()
+        return out
+
+    def _cut_trailing_non_address(text: str) -> str:
+        out = text
+        tail_re = re.compile(
+            r"\s*(?:"
+            r"従業員(?:数)?|社員(?:数)?|職員(?:数)?|スタッフ(?:数)?|人数|"
+            r"営業時間|受付時間|定休日|"
+            r"代表者|代表取締役|取締役|社長|会長|理事長|"
+            r"資本金|設立|創業|沿革|"
+            r"(?:一般|特定)?(?:貨物|運送|建設|産廃|産業廃棄物|古物)?(?:業)?(?:許可|免許|登録|届出)|"
+            r"事業内容|サービス|"
+            r"お問い合わせ|お問合せ|問い合わせ|採用|求人"
+            r")\b",
+            re.IGNORECASE,
+        )
+        m_tail = tail_re.search(out)
+        if m_tail:
+            out = out[: m_tail.start()].strip()
+        out = out.strip(" 　\t,，;；。．|｜/／・-‐―－ー:：")
+        return out
     s = s.strip().replace("　", " ")
     s = re.sub(r"<[^>]+>", " ", s)
     # CSSスタイル断片の除去（スクレイプ時に混入する background: などを落とす）
@@ -225,6 +253,8 @@ def normalize_address(s: str | None) -> str | None:
     s = re.sub(r"[‐―－ー]+", "-", s)
     s = re.sub(r"\s+", " ", s)
     s = re.sub(r"^〒\s*", "〒", s)
+    s = _strip_address_label(s)
+    s = _cut_trailing_non_address(s)
     # 住所入力フォームのラベル/候補一覧が混入したケースを除外
     if ADDRESS_FORM_NOISE_RE.search(s):
         return None
@@ -238,7 +268,7 @@ def normalize_address(s: str | None) -> str | None:
         return None
     m = re.search(r"(\d{3}-\d{4})\s*(.*)", s)
     if m:
-        body = m.group(2).strip()
+        body = _cut_trailing_non_address(m.group(2).strip())
         # 郵便番号だけの場合は住所とみなさない
         if not body:
             return None
@@ -360,13 +390,41 @@ def _official_signal_ok(
     return bool(strong_domain and name_or_addr)
 
 def pick_best_address(expected_addr: str | None, candidates: list[str]) -> str | None:
-    normalized_candidates = []
+    def _parse_source(raw: str) -> tuple[str, str]:
+        if not raw:
+            return "OTHER", ""
+        s = str(raw).strip()
+        m = re.match(r"^\[(JSONLD|TABLE|LABEL|FOOTER|TEXT)\]", s)
+        if m:
+            return m.group(1), s[m.end():].strip()
+        return "OTHER", s
+
+    source_bonus = {
+        "JSONLD": 6.0,
+        "TABLE": 5.0,
+        "LABEL": 4.0,
+        "FOOTER": 3.0,
+        "TEXT": 0.0,
+        "OTHER": 0.0,
+    }
+
+    normalized_candidates: list[tuple[str, str]] = []  # (normalized, source)
     for cand in candidates:
-        norm = normalize_address(cand)
+        source, raw_val = _parse_source(cand)
+        norm = normalize_address(raw_val)
         if norm:
-            normalized_candidates.append(norm)
+            normalized_candidates.append((norm, source))
     if not normalized_candidates:
         return None
+    # dedupe while keeping the best source bonus for the same normalized address
+    best_by_norm: dict[str, str] = {}
+    for norm, src in normalized_candidates:
+        if norm not in best_by_norm:
+            best_by_norm[norm] = src
+            continue
+        if source_bonus.get(src, 0.0) > source_bonus.get(best_by_norm[norm], 0.0):
+            best_by_norm[norm] = src
+    normalized_candidates = [(n, s) for n, s in best_by_norm.items()]
     if not expected_addr:
         # 郵便番号/市区町村/丁目を多く含むものを優先
         def _score(addr: str) -> int:
@@ -380,12 +438,16 @@ def pick_best_address(expected_addr: str | None, candidates: list[str]) -> str |
             if re.search(r"(ビル|マンション)", addr):
                 score += 1
             return score
-        normalized_candidates.sort(key=lambda a: (_score(a), len(a)), reverse=True)
-        return normalized_candidates[0]
+        normalized_candidates.sort(
+            key=lambda pair: (_score(pair[0]) + source_bonus.get(pair[1], 0.0), len(pair[0])),
+            reverse=True,
+        )
+        return normalized_candidates[0][0]
 
     expected_norm = normalize_address(expected_addr)
     if not expected_norm:
-        return normalized_candidates[0]
+        normalized_candidates.sort(key=lambda pair: source_bonus.get(pair[1], 0.0), reverse=True)
+        return normalized_candidates[0][0]
 
     expected_pref = CompanyScraper._extract_prefecture(expected_norm)
     expected_key = CompanyScraper._addr_key(expected_norm)
@@ -393,10 +455,10 @@ def pick_best_address(expected_addr: str | None, candidates: list[str]) -> str |
     expected_zip = expected_zip_match.group(1) if expected_zip_match else ""
     expected_tokens = KANJI_TOKEN_RE.findall(expected_norm)
 
-    best = normalized_candidates[0]
+    best = normalized_candidates[0][0]
     best_score = float("-inf")
     scored_any = False
-    for cand in normalized_candidates:
+    for cand, src in normalized_candidates:
         if expected_pref and expected_pref not in cand:
             continue
         scored_any = True
@@ -417,6 +479,7 @@ def pick_best_address(expected_addr: str | None, candidates: list[str]) -> str |
             if token and token in cand:
                 score += min(len(token), 4)
                 break
+        score += source_bonus.get(src, 0.0)
         if score > best_score:
             best_score = score
             best = cand
@@ -2469,15 +2532,20 @@ async def process():
                     missing_contact, missing_extra = refresh_need_flags()
                     if need_description and verifier is not None and info_dict and not timed_out and has_time_for_ai():
                         desc_source = select_relevant_paragraphs(info_dict.get("text", "") or "")
-                        ai_desc = await asyncio.wait_for(
-                            verifier.generate_description(
-                                build_ai_text_payload(desc_source),
-                                info_dict.get("screenshot"),
-                                name,
-                                addr,
-                            ),
-                            timeout=clamp_timeout(max(ai_call_timeout, 5.0)),
-                        )
+                        try:
+                            ai_desc = await asyncio.wait_for(
+                                verifier.generate_description(
+                                    build_ai_text_payload(desc_source),
+                                    info_dict.get("screenshot"),
+                                    name,
+                                    addr,
+                                ),
+                                timeout=clamp_timeout(max(ai_call_timeout, 5.0)),
+                            )
+                        except asyncio.TimeoutError:
+                            ai_desc = None
+                        except Exception:
+                            ai_desc = None
                         if ai_desc:
                             description_val = ai_desc
                             need_description = False
@@ -2566,10 +2634,15 @@ async def process():
                             combined_sources = [select_relevant_paragraphs(v.get("text", "") or "") for v in priority_docs.values()]
                             combined_text = build_ai_text_payload(*combined_sources)
                             screenshot_payload = (info_dict or {}).get("screenshot") if info_dict else None
-                            ai_desc2 = await asyncio.wait_for(
-                                verifier.generate_description(combined_text, screenshot_payload, name, addr),
-                                timeout=clamp_timeout(max(ai_call_timeout, 5.0)),
-                            )
+                            try:
+                                ai_desc2 = await asyncio.wait_for(
+                                    verifier.generate_description(combined_text, screenshot_payload, name, addr),
+                                    timeout=clamp_timeout(max(ai_call_timeout, 5.0)),
+                                )
+                            except asyncio.TimeoutError:
+                                ai_desc2 = None
+                            except Exception:
+                                ai_desc2 = None
                             if ai_desc2:
                                 description_val = ai_desc2
                                 need_description = False

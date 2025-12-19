@@ -291,7 +291,7 @@ class AIVerifier:
             log.warning(f"AIVerifier: failed to load system prompt from %s: %s", path, e)
             return None
 
-    async def _generate_with_timeout(self, content: list[Any]) -> Any:
+    async def _generate_with_timeout(self, content: list[Any], timeout_sec: float | None = None) -> Any:
         """
         Gemini呼び出しに上限時間を設け、ハングでワーカー全体が止まらないようにする。
         """
@@ -304,11 +304,15 @@ class AIVerifier:
             except TypeError:
                 return await self.model.generate_content_async(content)
 
-        if AI_CALL_TIMEOUT_SEC > 0:
+        timeout = AI_CALL_TIMEOUT_SEC if timeout_sec is None else float(timeout_sec)
+        # 外側の asyncio.wait_for と同値タイムアウトを使うと境界で競合して TimeoutError が
+        # 伝播することがあるため、少し短めにして余裕を作る。
+        if timeout > 0:
+            timeout = max(0.1, timeout - 0.5)
             try:
-                return await asyncio.wait_for(_call(), timeout=AI_CALL_TIMEOUT_SEC)
+                return await asyncio.wait_for(_call(), timeout=timeout)
             except asyncio.TimeoutError:
-                log.warning(f"Gemini call timed out after {AI_CALL_TIMEOUT_SEC}s")
+                log.warning(f"Gemini call timed out after {timeout:.1f}s")
                 return None
         return await _call()
 
@@ -514,18 +518,40 @@ class AIVerifier:
             return None
 
         prompt = self._build_description_prompt(text, company_name, address)
-        payload: list[Any] = [prompt]
-        if screenshot:
-            try:
-                b64 = base64.b64encode(screenshot).decode("utf-8")
-                payload.append({"inline_data": {"mime_type": "image/png", "data": b64}})
-            except Exception:
-                pass
 
+        def _build_content(use_image: bool) -> list[Any]:
+            payload: list[Any] = []
+            if self.system_prompt:
+                payload.append(self.system_prompt)
+            payload.append(prompt)
+            if use_image and screenshot:
+                try:
+                    b64 = base64.b64encode(screenshot).decode("utf-8")
+                    payload.append({"inline_data": {"mime_type": "image/png", "data": b64}})
+                except Exception:
+                    pass
+            return payload
+
+        content: list[Any] = _build_content(True)
         try:
-            resp = await self.model.generate_content_async(payload, safety_settings=None)  # type: ignore
-        except TypeError:
-            resp = await self.model.generate_content_async(payload)  # type: ignore
+            resp = await self._generate_with_timeout(content)
+            if resp is None and screenshot:
+                log.warning(
+                    "generate_description timed out/failed for %s (%s); retrying text-only.",
+                    company_name,
+                    address,
+                )
+                resp = await self._generate_with_timeout(_build_content(False))
+            if resp is None:
+                return None
+        except GoogleAPIError as e:
+            log.warning("Google API error in generate_description for %s (%s): %s", company_name, address, e)
+            try:
+                resp = await self._generate_with_timeout(_build_content(False))
+            except Exception:
+                return None
+            if resp is None:
+                return None
         except Exception:
             return None
 

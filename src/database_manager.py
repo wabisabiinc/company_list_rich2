@@ -567,6 +567,12 @@ class DatabaseManager:
             s = s.replace("　", " ")
             s = re.sub(r"<[^>]+>", " ", s)
             s = re.sub(r"[\x00-\x1f\x7f]", " ", s)
+            # 先頭に「住所/所在地」などのラベルが混入したケースを除去
+            for _ in range(3):
+                cleaned = re.sub(r"^(?:【\s*)?(?:本社|本店)?(?:所在地|住所)(?:】\s*)?\s*[:：]?\s*", "", s).strip()
+                if cleaned == s:
+                    break
+                s = cleaned
             # 住所入力フォームのラベル/候補一覧が混入した場合は破棄
             if re.search(r"(住所検索|都道府県|市区町村|マンション・?ビル名|郵便番号\\s*[（(]?\s*半角)", s, flags=re.I):
                 return ""
@@ -582,12 +588,28 @@ class DatabaseManager:
             arrow_idx = min([idx for idx in (s.find("→"), s.find("⇒")) if idx >= 0], default=-1)
             if arrow_idx >= 0:
                 s = s[:arrow_idx]
+            # 住所の後ろに付くことが多い非住所要素（従業員/許可/設立など）で打ち切る
+            tail_re = re.compile(
+                r"\s*(?:"
+                r"従業員(?:数)?|社員(?:数)?|職員(?:数)?|スタッフ(?:数)?|人数|"
+                r"営業時間|受付時間|定休日|"
+                r"代表者|代表取締役|取締役|社長|会長|理事長|"
+                r"資本金|設立|創業|沿革|"
+                r"(?:一般|特定)?(?:貨物|運送|建設|産廃|産業廃棄物|古物)?(?:業)?(?:許可|免許|登録|届出)|"
+                r"事業内容|サービス|"
+                r"お問い合わせ|お問合せ|問い合わせ|採用|求人"
+                r")\b",
+                re.IGNORECASE,
+            )
+            m_tail = tail_re.search(s)
+            if m_tail:
+                s = s[: m_tail.start()].strip()
             s = s.translate(str.maketrans("０１２３４５６７８９－ー―‐／", "0123456789----/"))
             s = re.sub(r"\s+", " ", s)
             s = s.replace("〒 ", "〒").replace("〒", "〒")
             if re.search(r"[ãÂ�]{2,}", s):
                 return ""
-            return s.strip()
+            return s.strip(" 　\t,，;；。．|｜/／・-‐―－ー:：")
 
         def set_value(column: str, value: Any) -> None:
             if column in cols:

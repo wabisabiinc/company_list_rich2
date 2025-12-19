@@ -19,3 +19,13 @@ def test_normalize_address_rejects_address_form_noise():
         "秋田県 山形県 福島県 市区町村・番地 マンション・ビル名"
     )
     assert normalize_address(raw) is None
+
+
+def test_normalize_address_strips_employee_and_permit_tail():
+    raw = "〒520-0867 滋賀県大津市大平1丁目3-20 従業員 14名 一般貨物運送許可 可搬運送"
+    assert normalize_address(raw) == "〒520-0867 滋賀県大津市大平1丁目3-20"
+
+
+def test_normalize_address_strips_leading_label():
+    raw = "住所：〒671-2232 兵庫県姫路市御国野町御着86-6"
+    assert normalize_address(raw) == "〒671-2232 兵庫県姫路市御国野町御着86-6"
