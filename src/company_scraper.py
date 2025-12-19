@@ -2518,6 +2518,9 @@ class CompanyScraper:
         max_links: int = 4,
         concurrency: int = 3,
         target_types: Optional[list[str]] = None,
+        *,
+        allow_slow: bool = False,
+        exclude_urls: Optional[set[str]] = None,
     ) -> Dict[str, Dict[str, Any]]:
         docs: Dict[str, Dict[str, Any]] = {}
         if not base_url:
@@ -2527,11 +2530,15 @@ class CompanyScraper:
         initial_info: Optional[Dict[str, Any]] = None
         if not html:
             try:
-                initial_info = await self.get_page_info(base_url)
+                initial_info = await self.get_page_info(base_url, allow_slow=allow_slow)
                 html = initial_info.get("html", "")
             except Exception:
                 html = ""
         links = self._find_priority_links(base_url, html, max_links=max_links, target_types=target_types)
+        if not links:
+            return docs
+        if exclude_urls:
+            links = [url for url in links if url not in exclude_urls]
         if not links:
             return docs
 
@@ -2539,7 +2546,7 @@ class CompanyScraper:
 
         async def fetch(link: str):
             async with sem:
-                info = await self.get_page_info(link, allow_slow=True)
+                info = await self.get_page_info(link, allow_slow=allow_slow)
             return link, info
 
         tasks = [asyncio.create_task(fetch(link)) for link in links]

@@ -8,7 +8,7 @@ import random
 import time
 import html as html_mod
 from difflib import SequenceMatcher
-from typing import Any
+from typing import Any, Dict
 from urllib.parse import urlparse
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
@@ -68,6 +68,7 @@ TIME_LIMIT_DEEP = float(os.getenv("TIME_LIMIT_DEEP", "45"))  # 深掘り専用�
 GLOBAL_HARD_TIMEOUT_SEC = float(os.getenv("GLOBAL_HARD_TIMEOUT_SEC", "60"))
 # 単社処理のハード上限（candidate取得で固まるのを避けるための保険、0で無効）
 COMPANY_HARD_TIMEOUT_SEC = float(os.getenv("COMPANY_HARD_TIMEOUT_SEC", "60"))
+DEEP_PHASE_TIMEOUT_SEC = float(os.getenv("DEEP_PHASE_TIMEOUT_SEC", "120"))
 OFFICIAL_AI_USE_SCREENSHOT = os.getenv("OFFICIAL_AI_USE_SCREENSHOT", "true").lower() == "true"
 AI_ADDRESS_ENABLED = os.getenv("AI_ADDRESS_ENABLED", "false").lower() == "true"
 SECOND_PASS_ENABLED = os.getenv("SECOND_PASS_ENABLED", "false").lower() == "true"
@@ -995,9 +996,14 @@ async def process():
             def over_after_official() -> bool:
                 return TIME_LIMIT_WITH_OFFICIAL > 0 and homepage and elapsed() > TIME_LIMIT_WITH_OFFICIAL
 
+            deep_phase_deadline: float | None = None
+
             def over_deep_limit() -> bool:
                 # 深掘りフェーズの専用上限（公式確定後）
                 return TIME_LIMIT_DEEP > 0 and homepage and elapsed() > TIME_LIMIT_DEEP
+
+            def over_deep_phase_deadline() -> bool:
+                return deep_phase_deadline is not None and time.monotonic() > deep_phase_deadline
 
             try:
                 candidate_limit = SEARCH_CANDIDATE_LIMIT
@@ -1246,6 +1252,7 @@ async def process():
                     continue
 
                 ai_official_attempted = False
+                selected_candidate_record: dict[str, Any] | None = None
                 if USE_AI and verifier is not None and hasattr(verifier, "judge_official_homepage"):
                     ai_tasks: list[asyncio.Task] = []
                     ai_sem = asyncio.Semaphore(2)
@@ -1347,6 +1354,44 @@ async def process():
                         log.info("[%s] 除外ホスト(%s)をスキップ: %s", cid, rule_details.get("host"), record.get("url"))
                         continue
                     if ai_judge:
+                        fast_phone_hit = bool(extracted.get("phone_numbers"))
+                        fast_address_ok = address_ok or bool(rule_details.get("address_match"))
+                        fast_domain_ok = (
+                            domain_score >= 4
+                            or host_token_hit
+                            or strong_domain_host
+                            or rule_details.get("strong_domain")
+                        )
+                        if (
+                            ai_judge.get("is_official") is True
+                            and fast_domain_ok
+                            and (fast_address_ok or fast_phone_hit)
+                        ):
+                            homepage = normalized_url
+                            info = record.get("info")
+                            primary_cands = extracted
+                            homepage_official_flag = 1
+                            homepage_official_source = "ai_fast"
+                            homepage_official_score = float(rule_details.get("score") or 0.0)
+                            chosen_domain_score = domain_score
+                            selected_candidate_record = record
+                            manager.upsert_url_flag(
+                                normalized_url,
+                                is_official=True,
+                                source="ai_fast",
+                                reason=ai_judge.get("reason", ""),
+                                confidence=ai_judge.get("confidence"),
+                            )
+                            log.info(
+                                "[%s] AI判定で早期公式採用: %s (domain=%s host=%s addr=%s phone=%s)",
+                                cid,
+                                normalized_url,
+                                domain_score,
+                                host_token_hit,
+                                fast_address_ok,
+                                fast_phone_hit,
+                            )
+                            break
                         if ai_judge.get("is_official") is False:
                             ai_override = (
                                 strong_domain_host
@@ -1445,6 +1490,7 @@ async def process():
                             homepage = normalized_url
                             info = record.get("info")
                             primary_cands = extracted
+                            selected_candidate_record = record
                             homepage_official_flag = 1
                             homepage_official_source = "ai"
                             homepage_official_score = float(rule_details.get("score") or 0.0)
@@ -1544,6 +1590,7 @@ async def process():
                         homepage = normalized_url
                         info = record.get("info")
                         primary_cands = extracted
+                        selected_candidate_record = record
                         homepage_official_flag = 1
                         homepage_official_source = "rule"
                         homepage_official_score = float(rule_details.get("score") or 0.0)
@@ -1684,6 +1731,7 @@ async def process():
                         homepage = provisional_homepage
                         info = provisional_info
                         primary_cands = provisional_cands
+                        selected_candidate_record = best_record
                         homepage_official_flag = 0
                         homepage_official_source = homepage_official_source or "provisional"
                         homepage_official_score = 0.0
@@ -1713,6 +1761,7 @@ async def process():
                             homepage = normalized_url
                             info = best_record.get("info")
                             primary_cands = best_record.get("extracted") or {}
+                            selected_candidate_record = best_record
                             homepage_official_flag = 0
                             homepage_official_source = homepage_official_source or "provisional_timeout"
                             homepage_official_score = float(rule_details.get("score") or 0.0)
@@ -1720,7 +1769,31 @@ async def process():
                             force_review = True
 
                 official_phase_end = elapsed()
+                deep_phase_deadline = time.monotonic() + DEEP_PHASE_TIMEOUT_SEC if DEEP_PHASE_TIMEOUT_SEC > 0 else None
                 priority_docs: dict[str, dict[str, Any]] = {}
+                if selected_candidate_record:
+                    preload_docs = selected_candidate_record.get("profile_docs") or {}
+                    for url, pdata in preload_docs.items():
+                        priority_docs[url] = {
+                            "text": (pdata.get("text", "") or ""),
+                            "html": (pdata.get("html", "") or ""),
+                        }
+                    if priority_docs:
+                        for url, pdata in priority_docs.items():
+                            absorb_doc_data(url, pdata)
+                # 候補フェーズで取得した profile_docs があれば再利用し、不要な巡回を減らす
+                if homepage:
+                    for rec in candidate_records:
+                        normalized_url = rec.get("normalized_url") or rec.get("url") or ""
+                        if normalized_url != homepage:
+                            continue
+                        preload_docs = rec.get("profile_docs") or {}
+                        for url, pdata in preload_docs.items():
+                            priority_docs[url] = {
+                                "text": (pdata.get("text", "") or ""),
+                                "html": (pdata.get("html", "") or ""),
+                            }
+                        break
 
                 phone = ""
                 found_address = ""
@@ -1924,7 +1997,7 @@ async def process():
                     info_dict = info or {}
                     info_url = info_dict.get("url") or homepage
                     # まず「会社概要/企業情報/会社情報」系の優先リンクを先に巡回して主要情報を拾う
-                    if over_hard_deadline() or over_time_limit():
+                    if over_hard_deadline() or over_time_limit() or over_deep_phase_deadline():
                         timed_out = True
                         priority_docs = {}
                     else:
@@ -1946,6 +2019,7 @@ async def process():
                                     max_links=3 if should_fetch_priority else 0,
                                     concurrency=FETCH_CONCURRENCY,
                                     target_types=["about", "contact", "finance"] if should_fetch_priority else None,
+                                    exclude_urls=set(priority_docs.keys()) if priority_docs else None,
                                 ),
                                 timeout=PAGE_FETCH_TIMEOUT_SEC,
                             ) if should_fetch_priority else {}
@@ -1954,8 +2028,6 @@ async def process():
                         for url, pdata in early_priority_docs.items():
                             priority_docs[url] = pdata
                             absorb_doc_data(url, pdata)
-                        if site_docs := {}:
-                            priority_docs.update(site_docs)
                     if timed_out:
                         missing_contact, missing_extra = refresh_need_flags()
                         fully_filled = False
@@ -2033,7 +2105,7 @@ async def process():
                         priority_limit = 0
                         # 不足項目に応じて深掘り対象リンクを絞り込む
                         target_types: list[str] = []
-                        if not timed_out and not fully_filled:
+                        if not timed_out and not fully_filled and not over_deep_phase_deadline():
                             if missing_contact > 0:
                                 priority_limit = 3
                                 target_types.append("contact")
@@ -2044,8 +2116,8 @@ async def process():
                                 priority_limit = max(priority_limit, 2)
                                 target_types.append("finance")
                         site_docs = {}
-                        # early_priority_docs で取得済みの場合は重複を避ける
-                        if priority_limit > 0 and not priority_docs:
+                        # 既取得URLは除外しつつ不足がある場合のみ追加巡回する
+                        if priority_limit > 0 and not over_deep_phase_deadline():
                             site_docs = await asyncio.wait_for(
                                 scraper.fetch_priority_documents(
                                     homepage,
@@ -2053,7 +2125,8 @@ async def process():
                                     max_links=priority_limit,
                                     concurrency=FETCH_CONCURRENCY,
                                     target_types=target_types or None,
-                                    allow_slow=True,
+                                    allow_slow=missing_contact > 0,
+                                    exclude_urls=set(priority_docs.keys()) if priority_docs else None,
                                 ),
                                 timeout=PAGE_FETCH_TIMEOUT_SEC,
                             )
@@ -2310,7 +2383,7 @@ async def process():
                             and not provisional_address_ok
                         )
                         if not weak_provisional_target and not timed_out and ((missing_contact > 0) or need_extra_fields):
-                            if over_time_limit() or over_deep_limit() or over_hard_deadline():
+                            if over_time_limit() or over_deep_limit() or over_hard_deadline() or over_deep_phase_deadline():
                                 timed_out = True
                             else:
                                 max_hops = RELATED_MAX_HOPS_PHONE if need_phone else RELATED_MAX_HOPS_BASE
@@ -2402,7 +2475,7 @@ async def process():
                             ):
                                 break
 
-                    if homepage and (need_addr or not found_address) and not timed_out and not priority_docs:
+                    if homepage and (need_addr or not found_address) and not timed_out and not over_deep_phase_deadline():
                         try:
                             extra_docs = await asyncio.wait_for(
                                 scraper.fetch_priority_documents(
@@ -2410,6 +2483,8 @@ async def process():
                                     info_dict.get("html", ""),
                                     max_links=3,
                                     concurrency=FETCH_CONCURRENCY,
+                                    allow_slow=need_addr,
+                                    exclude_urls=set(priority_docs.keys()) if priority_docs else None,
                                 ),
                                 timeout=PAGE_FETCH_TIMEOUT_SEC,
                             )
@@ -2432,6 +2507,7 @@ async def process():
                         and (phone or rule_phone or found_address or addr or rule_address)
                         and (not verify_result.get("phone_ok") or not verify_result.get("address_ok"))
                         and not over_after_official()
+                        and not over_deep_phase_deadline()
                     )
                     if need_online_verify:
                         try:
