@@ -1123,12 +1123,41 @@ class CompanyScraper:
         base_name = (company_name or "").strip()
         if not base_name:
             return []
-        queries = [
+        # 住所は「都道府県+市区町村」程度に圧縮して検索精度を上げる（誤った住所が混ざる場合に備え、住所無しクエリも併用）
+        loc = ""
+        addr_norm = unicodedata.normalize("NFKC", address or "").strip()
+        if addr_norm:
+            pref = self._extract_prefecture(addr_norm)
+            city_match = CITY_RE.search(addr_norm)
+            city = city_match.group(1) if city_match else ""
+            if pref and city and city.startswith(pref):
+                loc = city.strip()
+            else:
+                loc = "".join([pref, city]).strip()
+
+        base_queries = [
             f"{base_name} 会社概要 公式",
             f"{base_name} 企業情報 公式",
             f"{base_name} 会社情報 公式",
         ]
-        return [re.sub(r"\s+", " ", q).strip() for q in queries if q.strip()]
+        if loc:
+            base_queries.extend(
+                [
+                    f"{base_name} {loc} 会社概要 公式",
+                    f"{base_name} {loc} 企業情報 公式",
+                    f"{base_name} {loc} 会社情報 公式",
+                ]
+            )
+        # 末尾/重複を正規化しつつ、順序を維持して重複排除
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for q in base_queries:
+            qn = re.sub(r"\s+", " ", q).strip()
+            if not qn or qn in seen:
+                continue
+            seen.add(qn)
+            ordered.append(qn)
+        return ordered
 
     @staticmethod
     def _domain_tokens(url: str) -> List[str]:

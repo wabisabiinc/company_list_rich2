@@ -1620,7 +1620,23 @@ async def process():
                         pref_hit = bool(rule_details.get("prefecture_match"))
                         zip_hit = bool(rule_details.get("postal_code_match"))
                         address_ok = (not addr) or addr_hit or pref_hit or zip_hit
-                        name_hit = bool(rule_details.get("name_present")) or domain_score >= 5
+                        # ドメイン一致だけで「社名一致」と扱うと誤採用しやすいので、ページ内の社名シグナルを重視する
+                        name_present = bool(rule_details.get("name_present"))
+                        name_match_exact = bool(rule_details.get("name_match_exact"))
+                        name_match_partial_only = bool(rule_details.get("name_match_partial_only"))
+                        try:
+                            name_match_ratio = float(rule_details.get("name_match_ratio") or 0.0)
+                        except Exception:
+                            name_match_ratio = 0.0
+                        official_evidence = rule_details.get("official_evidence") or []
+                        strong_name_hit = bool(
+                            name_match_exact
+                            or ("jsonld:org_name" in official_evidence)
+                            or ("h1" in official_evidence)
+                            or ("title" in official_evidence)
+                            or (name_match_ratio >= 0.92 and not name_match_partial_only)
+                        )
+                        name_hit = strong_name_hit
                         evidence_score = int(rule_details.get("official_evidence_score") or 0)
                         directory_like = bool(rule_details.get("directory_like"))
                         host_name, _, allowed_tld, whitelist_host, _ = CompanyScraper._allowed_official_host(normalized_url or "")

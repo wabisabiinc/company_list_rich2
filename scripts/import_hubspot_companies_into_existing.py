@@ -234,6 +234,29 @@ def find_by_company_address(cur, name, address):
     )
     return cur.fetchone()
 
+def find_by_corporate_number(cur, corporate_number_norm, corporate_number, cols):
+    """
+    既に別IDで登録されているレコードを、法人番号で名寄せして取り出す。
+    - 取り込みデータの pk が法人番号であっても、DB側の id が別形式/別値のことがあるため。
+    """
+    if corporate_number_norm and "corporate_number_norm" in cols:
+        cur.execute(
+            "SELECT * FROM companies WHERE corporate_number_norm=? LIMIT 1",
+            (corporate_number_norm,),
+        )
+        row = cur.fetchone()
+        if row:
+            return row
+    if corporate_number and "corporate_number" in cols:
+        cur.execute(
+            "SELECT * FROM companies WHERE corporate_number=? LIMIT 1",
+            (corporate_number,),
+        )
+        row = cur.fetchone()
+        if row:
+            return row
+    return None
+
 
 def update_existing(cur, target_id, existing, data, cols, employee_col, csv_name):
     updates = []
@@ -330,6 +353,11 @@ def insert_new(cur, target_id, data, cols, employee_col, csv_name):
 def upsert_row(cur, data, cols, employee_col, csv_name):
     existing = fetch_existing(cur, data["pk"])
     target_id = data["pk"]
+    if not existing:
+        match = find_by_corporate_number(cur, data.get("corporate_number_norm"), data.get("corporate_number"), cols)
+        if match:
+            existing = match
+            target_id = match["id"]
     if not existing and data.get("company_name") and data.get("address") and {"company_name", "address"}.issubset(cols):
         match = find_by_company_address(cur, data["company_name"], data["address"])
         if match:
