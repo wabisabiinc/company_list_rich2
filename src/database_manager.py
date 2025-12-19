@@ -567,6 +567,11 @@ class DatabaseManager:
             s = s.replace("　", " ")
             s = re.sub(r"<[^>]+>", " ", s)
             s = re.sub(r"[\x00-\x1f\x7f]", " ", s)
+            # 住所入力フォームのラベル/候補一覧が混入した場合は破棄
+            if re.search(r"(住所検索|都道府県|市区町村|マンション・?ビル名|郵便番号\\s*[（(]?\s*半角)", s, flags=re.I):
+                return ""
+            if ("郵便番号" in s) and not re.search(r"\d{3}-\d{4}", s):
+                return ""
             contact_pattern = re.compile(r"(TEL|電話|☎|℡|FAX|ファックス|メール|E[-\s]?mail)", re.IGNORECASE)
             contact_match = contact_pattern.search(s)
             if contact_match:

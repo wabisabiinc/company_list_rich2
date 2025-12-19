@@ -304,3 +304,14 @@ def test_extract_candidates_securities_code(scraper):
     cands = scraper.extract_candidates(text)
     assert any("1234" in l for l in cands["listings"])
     assert any("9101" in l for l in cands["listings"])
+
+
+def test_extract_candidates_rejects_address_form_noise(scraper):
+    text = (
+        "住所\n"
+        "Japan 郵便番号 (半角数字) 住所検索 都道府県 北海道 青森県 岩手県 宮城県 秋田県 "
+        "山形県 福島県 茨城県 栃木県 群馬県 埼玉県 千葉県 東京都 神奈川県 "
+        "市区町村・番地 マンション・ビル名\n"
+    )
+    cands = scraper.extract_candidates(text)
+    assert cands["addresses"] == []

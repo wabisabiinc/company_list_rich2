@@ -178,6 +178,10 @@ ADDR_FALLBACK_RE = re.compile(
     r"(〒\d{3}-\d{4}[^\n。]{1,}|[一-龥]{2,3}[都道府県][^。\n]{0,120}[市区町村郡][^。\n]{0,140})"
 )
 CITY_RE = re.compile(r"([一-龥]{2,6}(?:市|区|町|村|郡))")
+ADDRESS_FORM_NOISE_RE = re.compile(
+    r"(住所検索|都道府県|市区町村|マンション・?ビル名|郵便番号\s*[（(]?\s*半角)",
+    re.IGNORECASE,
+)
 _BINARY_EXTS = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx")
 REP_RE = re.compile(
     r"(?:代表者|代表取締役|理事長|学長|院長|組合長|会頭|会長|社長)"
@@ -802,6 +806,23 @@ class CompanyScraper:
         return None
 
     @staticmethod
+    def _is_address_form_noise(text: str) -> bool:
+        if not text:
+            return False
+        s = unicodedata.normalize("NFKC", str(text)).strip()
+        if not s:
+            return False
+        if ADDRESS_FORM_NOISE_RE.search(s):
+            return True
+        if "郵便番号" in s and not ZIP_RE.search(s):
+            return True
+        try:
+            pref_hits = sum(1 for pref in PREFECTURE_NAMES if pref and pref in s)
+        except Exception:
+            pref_hits = 0
+        return pref_hits >= 3
+
+    @staticmethod
     def _normalize_address_candidate(val: str) -> str:
         if not val:
             return ""
@@ -838,6 +859,8 @@ class CompanyScraper:
             val = val[: m_map.start()].strip()
         if not val:
             return ""
+        if CompanyScraper._is_address_form_noise(val):
+            return ""
         return val
 
     @staticmethod
@@ -869,18 +892,15 @@ class CompanyScraper:
         s = text.strip()
         if not s:
             return False
+        if CompanyScraper._is_address_form_noise(s):
+            return False
         if ZIP_RE.search(s):
             return True
-        try:
-            if any(pref in s for pref in PREFECTURE_NAMES):
-                return True
-        except Exception:
-            pass
-        if PREFECTURE_NAME_RE.search(s):
+        pref = CompanyScraper._extract_prefecture(s) or (PREFECTURE_NAME_RE.search(s).group(0) if PREFECTURE_NAME_RE.search(s) else "")
+        has_city = bool(CITY_RE.search(s))
+        if pref and has_city:
             return True
-        if CITY_RE.search(s):
-            return True
-        if re.search(r"(丁目|番地|号|ビル|マンション)", s):
+        if (pref or has_city) and re.search(r"(丁目|番地|号|ビル|マンション)", s) and re.search(r"\d", s):
             return True
         return False
 
@@ -910,6 +930,8 @@ class CompanyScraper:
             return False
         s = text.strip()
         if not s:
+            return False
+        if CompanyScraper._is_address_form_noise(s):
             return False
         m = ZIP_RE.search(s)
         if m:

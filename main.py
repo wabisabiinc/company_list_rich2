@@ -121,6 +121,10 @@ ADDRESS_JS_NOISE_RE = re.compile(
     r"(window\.\w+|dataLayer\s*=|gtm\.|googletagmanager|nr-data\.net|newrelic|bam\.nr-data\.net|function\s*\(|<script|</script>)",
     re.IGNORECASE,
 )
+ADDRESS_FORM_NOISE_RE = re.compile(
+    r"(住所検索|都道府県|市区町村|マンション・?ビル名|郵便番号\s*[（(]?\s*半角)",
+    re.IGNORECASE,
+)
 KANJI_TOKEN_RE = re.compile(r"[一-龥]{2,}")
 LISTING_ALLOWED_KEYWORDS = [
     "上場", "未上場", "非上場", "東証", "名証", "札証", "福証", "JASDAQ",
@@ -221,6 +225,17 @@ def normalize_address(s: str | None) -> str | None:
     s = re.sub(r"[‐―－ー]+", "-", s)
     s = re.sub(r"\s+", " ", s)
     s = re.sub(r"^〒\s*", "〒", s)
+    # 住所入力フォームのラベル/候補一覧が混入したケースを除外
+    if ADDRESS_FORM_NOISE_RE.search(s):
+        return None
+    if ("郵便番号" in s) and not ZIP_CODE_RE.search(s):
+        return None
+    try:
+        pref_hits = sum(1 for pref in CompanyScraper.PREFECTURE_NAMES if pref in s)
+    except Exception:
+        pref_hits = 0
+    if pref_hits >= 3:
+        return None
     m = re.search(r"(\d{3}-\d{4})\s*(.*)", s)
     if m:
         body = m.group(2).strip()
@@ -280,6 +295,16 @@ def looks_like_address(text: str | None) -> bool:
     s = (text or "").strip()
     if not s:
         return False
+    if ADDRESS_FORM_NOISE_RE.search(s):
+        return False
+    if ("郵便番号" in s) and not ZIP_CODE_RE.search(s):
+        return False
+    try:
+        pref_hits = sum(1 for pref in CompanyScraper.PREFECTURE_NAMES if pref in s)
+    except Exception:
+        pref_hits = 0
+    if pref_hits >= 3:
+        return False
     if ZIP_CODE_RE.search(s):
         return True
     has_pref = False
@@ -291,9 +316,9 @@ def looks_like_address(text: str | None) -> bool:
     if has_pref and has_city:
         return True
 
-    if (has_pref or has_city) and re.search(r"(丁目|番地|号)", s):
+    if (has_pref or has_city) and re.search(r"(丁目|番地|号)", s) and re.search(r"\d", s):
         return True
-    if (has_pref or has_city) and re.search(r"(ビル|マンション)", s):
+    if (has_pref or has_city) and re.search(r"(ビル|マンション)", s) and re.search(r"\d", s):
         return True
     return False
 
