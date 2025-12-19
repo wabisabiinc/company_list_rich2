@@ -1431,8 +1431,140 @@ async def process():
                         zip_hit = bool(rule_details.get("postal_code_match"))
                         address_ok = (not addr) or addr_hit or pref_hit or zip_hit
                         name_hit = bool(rule_details.get("name_present")) or domain_score >= 5
+                        host_name, _, allowed_tld, whitelist_host, _ = CompanyScraper._allowed_official_host(normalized_url or "")
+                        content_strong = name_hit and address_ok
                         ai_judge = record.get("ai_judge")
                         flag_info = record.get("flag_info")
+                        if ai_judge:
+                            fast_phone_hit = bool(extracted.get("phone_numbers"))
+                            fast_address_ok = address_ok or bool(rule_details.get("address_match"))
+                            fast_domain_ok = (
+                                domain_score >= 4
+                                or host_token_hit
+                                or strong_domain_host
+                                or rule_details.get("strong_domain")
+                            )
+                            ai_content_ok = fast_address_ok or fast_phone_hit or name_hit or host_token_hit
+                            if ai_judge.get("is_official") is True:
+                                if input_addr_pref_only and not ai_content_ok:
+                                    manager.upsert_url_flag(
+                                        normalized_url,
+                                        is_official=False,
+                                        source="rule",
+                                        reason="pref_only_input_no_name_host",
+                                    )
+                                    fallback_cands.append((record.get("url"), extracted))
+                                    log.info("[%s] AI公式だが都道府県のみ＆根拠不足のため除外: %s", cid, record.get("url"))
+                                    continue
+                                if not ai_content_ok:
+                                    manager.upsert_url_flag(
+                                        normalized_url,
+                                        is_official=False,
+                                        source="ai",
+                                        reason="ai_no_content_signal",
+                                        confidence=ai_judge.get("confidence"),
+                                    )
+                                    fallback_cands.append((record.get("url"), extracted))
+                                    log.info("[%s] AI公式でもコンテンツ根拠が乏しいため除外: %s", cid, record.get("url"))
+                                    continue
+                                info = record.get("info")
+                                primary_cands = extracted
+                                homepage = normalized_url
+                                homepage_official_flag = 1
+                                homepage_official_source = "ai_fast" if fast_domain_ok else "ai_review"
+                                homepage_official_score = float(rule_details.get("score") or 0.0)
+                                chosen_domain_score = domain_score
+                                selected_candidate_record = record
+                                if not fast_domain_ok or (addr and not address_ok):
+                                    force_review = True
+                                if _is_free_host(homepage) or not _official_signal_ok(
+                                    host_token_hit=host_token_hit,
+                                    strong_domain_host=strong_domain_host,
+                                    domain_score=domain_score,
+                                    name_hit=name_hit,
+                                    address_ok=address_ok,
+                                ):
+                                    homepage_official_flag = 0
+                                    homepage_official_source = "provisional_freehost"
+                                    force_review = True
+                                    manager.upsert_url_flag(
+                                        normalized_url,
+                                        is_official=False,
+                                        source="rule",
+                                        reason="free_host_or_weak_signals",
+                                    )
+                                else:
+                                    manager.upsert_url_flag(
+                                        normalized_url,
+                                        is_official=True,
+                                        source=homepage_official_source,
+                                        reason=ai_judge.get("reason", ""),
+                                        confidence=ai_judge.get("confidence"),
+                                    )
+                                log.info(
+                                    "[%s] AI公式採用: %s (source=%s domain=%s host=%s addr=%s phone=%s review=%s)",
+                                    cid,
+                                    normalized_url,
+                                    homepage_official_source,
+                                    domain_score,
+                                    host_token_hit,
+                                    fast_address_ok,
+                                    fast_phone_hit,
+                                    force_review,
+                                )
+                                break
+                            else:
+                                ai_override = (
+                                    strong_domain_host
+                                    or rule_details.get("name_present")
+                                    or address_ok
+                                    or (domain_score >= 5 and host_token_hit)
+                                )
+                                if ai_override:
+                                    log.info("[%s] AI非公式だが強ドメイン/名称/住所一致のためAI否定を無視: %s", cid, record.get("url"))
+                                else:
+                                    manager.upsert_url_flag(
+                                        normalized_url,
+                                        is_official=False,
+                                        source="ai",
+                                        reason=ai_judge.get("reason", ""),
+                                        confidence=ai_judge.get("confidence"),
+                                    )
+                                    fallback_cands.append((record.get("url"), extracted))
+                                    log.info("[%s] AIが非公式判定: %s", cid, record.get("url"))
+                                    continue
+
+                        brand_allowed = (allowed_tld or whitelist_host) and not host_token_hit
+                        if (
+                            not homepage
+                            and brand_allowed
+                            and content_strong
+                            and not flag_info
+                        ):
+                            homepage = normalized_url
+                            info = record.get("info")
+                            primary_cands = extracted
+                            homepage_official_flag = 1
+                            homepage_official_source = "name_addr"
+                            homepage_official_score = float(rule_details.get("score") or 0.0)
+                            chosen_domain_score = domain_score
+                            selected_candidate_record = record
+                            force_review = True
+                            manager.upsert_url_flag(
+                                normalized_url,
+                                is_official=True,
+                                source="name_addr",
+                                reason="name_address_match_brand_host",
+                                confidence=rule_details.get("score"),
+                            )
+                            log.info(
+                                "[%s] 名前+住所一致（ブランドドメイン）でreview保存: %s host=%s",
+                                cid,
+                                normalized_url,
+                                host_name,
+                            )
+                            break
+
                         # 社名トークンなし＆住所一致だけの候補は公式扱いしない
                         if not host_token_hit and not name_hit and address_ok:
                             manager.upsert_url_flag(
@@ -1455,174 +1587,6 @@ async def process():
                             fallback_cands.append((record.get("url"), extracted))
                             log.info("[%s] 除外ホスト(%s)をスキップ: %s", cid, rule_details.get("host"), record.get("url"))
                             continue
-                        if ai_judge:
-                            fast_phone_hit = bool(extracted.get("phone_numbers"))
-                            fast_address_ok = address_ok or bool(rule_details.get("address_match"))
-                            fast_domain_ok = (
-                                domain_score >= 4
-                                or host_token_hit
-                                or strong_domain_host
-                                or rule_details.get("strong_domain")
-                            )
-                            if (
-                                ai_judge.get("is_official") is True
-                                and fast_domain_ok
-                                and (fast_address_ok or fast_phone_hit)
-                            ):
-                                homepage = normalized_url
-                                info = record.get("info")
-                                primary_cands = extracted
-                                homepage_official_flag = 1
-                                homepage_official_source = "ai_fast"
-                                homepage_official_score = float(rule_details.get("score") or 0.0)
-                                chosen_domain_score = domain_score
-                                selected_candidate_record = record
-                                manager.upsert_url_flag(
-                                    normalized_url,
-                                    is_official=True,
-                                    source="ai_fast",
-                                    reason=ai_judge.get("reason", ""),
-                                    confidence=ai_judge.get("confidence"),
-                                )
-                                log.info(
-                                    "[%s] AI判定で早期公式採用: %s (domain=%s host=%s addr=%s phone=%s)",
-                                    cid,
-                                    normalized_url,
-                                    domain_score,
-                                    host_token_hit,
-                                    fast_address_ok,
-                                    fast_phone_hit,
-                                )
-                                break
-                            if ai_judge.get("is_official") is False:
-                                ai_override = (
-                                    strong_domain_host
-                                    or rule_details.get("name_present")
-                                    or address_ok
-                                    or (domain_score >= 5 and host_token_hit)
-                                )
-                                if ai_override:
-                                    log.info("[%s] AI非公式だが強ドメイン/名称/住所一致のためAI否定を無視: %s", cid, record.get("url"))
-                                else:
-                                    manager.upsert_url_flag(
-                                        normalized_url,
-                                        is_official=False,
-                                        source="ai",
-                                        reason=ai_judge.get("reason", ""),
-                                        confidence=ai_judge.get("confidence"),
-                                    )
-                                    fallback_cands.append((record.get("url"), extracted))
-                                    log.info("[%s] AIが非公式判定: %s", cid, record.get("url"))
-                                    continue
-                            if ai_judge.get("is_official") is True:
-                                if input_addr_pref_only and not (host_token_hit or name_hit or strong_domain_host or domain_score >= 4):
-                                    manager.upsert_url_flag(
-                                        normalized_url,
-                                        is_official=False,
-                                        source="rule",
-                                        reason="pref_only_input_no_name_host",
-                                    )
-                                    fallback_cands.append((record.get("url"), extracted))
-                                    log.info("[%s] AI公式だが都道府県だけの入力で社名/ホスト根拠なしのため除外: %s", cid, record.get("url"))
-                                    continue
-                                if addr and not address_ok:
-                                    # AI公式なら住所不一致でも公式候補は維持し、reviewに回す
-                                    force_review = True
-                                    log.info("[%s] AI公式だが入力住所と一致せず -> 公式維持でreview: %s", cid, record.get("url"))
-                                # ホストに社名トークンも名称ヒットも無ければ公式にしない
-                                if not host_token_hit and not name_hit:
-                                    manager.upsert_url_flag(
-                                        normalized_url,
-                                        is_official=False,
-                                        source="rule",
-                                        reason="no_host_token_no_name",
-                                    )
-                                    fallback_cands.append((record.get("url"), extracted))
-                                    log.info("[%s] AI公式でも社名トークン/名称なしのためスキップ: %s", cid, record.get("url"))
-                                    continue
-                                # ホストに社名トークンが無く住所根拠も無い場合は採用しない（パスだけ名称一致を防ぐ）
-                                if not host_token_hit and not address_ok:
-                                    manager.upsert_url_flag(
-                                        normalized_url,
-                                        is_official=False,
-                                        source="rule",
-                                        reason="host_no_name_no_address",
-                                    )
-                                    fallback_cands.append((record.get("url"), extracted))
-                                    log.info("[%s] AI公式でもホストに社名なし・住所根拠なしのためスキップ: %s", cid, record.get("url"))
-                                    continue
-                                # ドメイン/住所/名称一致が弱い公式判定は採用しない
-                                if (not host_token_hit) and domain_score < 3 and not address_ok:
-                                    manager.upsert_url_flag(
-                                        normalized_url,
-                                        is_official=False,
-                                        source="rule",
-                                        reason="weak_domain_no_address",
-                                    )
-                                    fallback_cands.append((record.get("url"), extracted))
-                                    log.info("[%s] AI公式でもドメイン/住所一致なしのためスキップ: %s", cid, record.get("url"))
-                                    continue
-                                name_or_domain_ok = (
-                                    name_hit
-                                    or strong_domain_host
-                                    or rule_details.get("strong_domain")
-                                    or domain_score >= 3
-                                )
-                                if not (name_or_domain_ok or address_ok):
-                                    manager.upsert_url_flag(
-                                        normalized_url,
-                                        is_official=False,
-                                        source="rule",
-                                        reason="name_domain_mismatch",
-                                    )
-                                    fallback_cands.append((record.get("url"), extracted))
-                                    log.info("[%s] AI公式でも名称/ドメイン一致弱のためスキップ: %s", cid, record.get("url"))
-                                    continue
-                                # 低ドメイン一致は name/address/host が強い場合のみ採用
-                                if domain_score < 3 and not strong_domain_host and not rule_details.get("strong_domain") and not address_ok and not name_hit and not host_token_hit:
-                                    manager.upsert_url_flag(
-                                        normalized_url,
-                                        is_official=False,
-                                        source="rule",
-                                        reason="domain_score_low",
-                                    )
-                                    fallback_cands.append((record.get("url"), extracted))
-                                    log.info("[%s] AI公式でもドメインスコア不足のためスキップ: %s", cid, record.get("url"))
-                                    continue
-                                homepage = normalized_url
-                                info = record.get("info")
-                                primary_cands = extracted
-                                selected_candidate_record = record
-                                homepage_official_flag = 1
-                                homepage_official_source = "ai"
-                                homepage_official_score = float(rule_details.get("score") or 0.0)
-                                chosen_domain_score = domain_score
-                                if _is_free_host(homepage) or not _official_signal_ok(
-                                    host_token_hit=host_token_hit,
-                                    strong_domain_host=strong_domain_host,
-                                    domain_score=domain_score,
-                                    name_hit=name_hit,
-                                    address_ok=address_ok,
-                                ):
-                                    homepage_official_flag = 0
-                                    homepage_official_source = "provisional_freehost"
-                                    force_review = True
-                                    manager.upsert_url_flag(
-                                        normalized_url,
-                                        is_official=False,
-                                        source="rule",
-                                        reason="free_host_or_weak_signals",
-                                    )
-                                if not name_hit and not address_ok:
-                                    force_review = True
-                                manager.upsert_url_flag(
-                                    normalized_url,
-                                    is_official=True,
-                                    source="ai",
-                                    reason=ai_judge.get("reason", ""),
-                                    confidence=ai_judge.get("confidence"),
-                                )
-                                break
                         # キャッシュ公式は採用しない（参考のみ）
                         if rule_details.get("is_official"):
                             if input_addr_pref_only and not (host_token_hit or name_hit or strong_domain_host or domain_score >= 4):
