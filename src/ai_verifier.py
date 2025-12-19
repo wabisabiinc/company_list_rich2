@@ -59,6 +59,25 @@ log = logging.getLogger(__name__)
 log.info(f"[ai_verifier] AI_ENABLED={AI_ENABLED}, USE_AI={USE_AI}, KEY_SET={bool(API_KEY)}, GEN_OK={generativeai is not None}")
 AI_CALL_TIMEOUT_SEC = float(os.getenv("AI_CALL_TIMEOUT_SEC", "20") or 0)
 
+# ---- compiled regex (noise filters) -----------------------------
+_NOISE_LITERALS = (
+    "cookie",
+    "privacy",
+    "プライバシ",
+    "利用規約",
+    "サイトマップ",
+    "copyright",
+    "©",
+    "nav",
+    "menu",
+    "footer",
+    "javascript",
+)
+_NOISE_RE = re.compile(
+    rf"(?:{'|'.join(re.escape(w) for w in _NOISE_LITERALS)}|function\s*\()",
+    flags=re.IGNORECASE,
+)
+
 # ---- utils ------------------------------------------------------
 def _extract_first_json(text: str) -> Optional[Dict[str, Any]]:
     if not text:
@@ -403,7 +422,7 @@ class AIVerifier:
                     return False
                 if "<" in a or ">" in a:
                     return False
-                if re.search(r"(cookie|privacy|プライバシ|利用規約|サイトマップ|copyright|©|nav|menu|footer|javascript|function\\s*\\()", a, flags=re.I):
+                if _NOISE_RE.search(a):
                     return False
                 has_zip = bool(re.search(r"\d{3}-\d{4}", a))
                 has_pref_city = bool(re.search(r"(都|道|府|県).+?(市|区|郡|町|村)", a))
