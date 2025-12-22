@@ -75,6 +75,7 @@ AI_OFFICIAL_CANDIDATE_LIMIT = int(os.getenv("AI_OFFICIAL_CANDIDATE_LIMIT", "0"))
 AI_OFFICIAL_CONCURRENCY = max(1, int(os.getenv("AI_OFFICIAL_CONCURRENCY", "2")))
 # description はAIで常時生成（verify_infoで同時生成）。追加の説明専用AI呼び出しを有効にしたい場合のみ true。
 USE_AI_DESCRIPTION = os.getenv("USE_AI_DESCRIPTION", "false").lower() == "true"
+AI_FINAL_WITH_OFFICIAL = os.getenv("AI_FINAL_WITH_OFFICIAL", "false").lower() == "true"
 WORKER_ID = os.getenv("WORKER_ID", "w1")  # 並列識別子
 COMPANIES_DB_PATH = os.getenv("COMPANIES_DB_PATH", "data/companies.db")
 
@@ -149,6 +150,8 @@ if REFERENCE_CSVS:
         log.exception("Reference data loading failed")
 
 ZIP_CODE_RE = re.compile(r"(\d{3}-\d{4})")
+JAPANESE_RE = re.compile(r"[ぁ-んァ-ン一-龥]")
+MOJIBAKE_LATIN_RE = re.compile(r"[ÃÂãâæçïðñöøûüÿ]")
 ADDRESS_JS_NOISE_RE = re.compile(
     r"(window\.\w+|dataLayer\s*=|gtm\.|googletagmanager|nr-data\.net|newrelic|bam\.nr-data\.net|function\s*\(|<script|</script>)",
     re.IGNORECASE,
@@ -191,6 +194,20 @@ DESCRIPTION_BIZ_KEYWORDS = (
     "基盤", "ソフトウェア", "ハードウェア", "ロボット", "IoT", "モビリティ", "物流DX",
 )
 
+def looks_mojibake(text: str | None) -> bool:
+    if not text:
+        return False
+    if "\ufffd" in text:
+        return True
+    s = str(text)
+    if JAPANESE_RE.search(s):
+        # Japanese is present; only reject if obvious mojibake markers are also present.
+        return bool(MOJIBAKE_LATIN_RE.search(s)) and s.count("\ufffd") >= 1
+    latin_count = sum(1 for ch in s if "\u00c0" <= ch <= "\u00ff")
+    if latin_count >= 3 and latin_count / max(len(s), 1) >= 0.15:
+        return True
+    return bool(MOJIBAKE_LATIN_RE.search(s) and latin_count >= 2)
+
 # --------------------------------------------------
 # 正規化 & 一致判定
 # --------------------------------------------------
@@ -218,6 +235,8 @@ def normalize_phone(s: str | None) -> str | None:
 
 def normalize_address(s: str | None) -> str | None:
     if not s:
+        return None
+    if looks_mojibake(s):
         return None
     def _strip_address_label(text: str) -> str:
         out = text.strip()
@@ -387,7 +406,7 @@ def sanitize_text_block(text: str | None) -> str:
     t = re.sub(r"\s+", " ", t)
     t = t.strip()
     # 典型的なUTF-8モジバケを検知したら破棄
-    if re.search(r"[ãÂ�]{2,}", t):
+    if looks_mojibake(t):
         return ""
     # 「地図/マップ/アクセス」やスクリプト断片が出たらそこまででカット
     map_noise_re = re.compile(
@@ -473,6 +492,8 @@ def should_skip_by_url_flag(flag_info: dict | None) -> bool:
     if flag_info.get("is_official") is not False:
         return False
     source = (flag_info.get("judge_source") or "").strip().lower()
+    if source.startswith("ai_provisional"):
+        return False
     conf = flag_info.get("confidence")
     try:
         conf_f = float(conf) if conf is not None else None
@@ -493,7 +514,7 @@ def _official_signal_ok(
     official_evidence_score: int = 0,
 ) -> bool:
     strong_domain = host_token_hit or strong_domain_host or domain_score >= 4
-    name_or_addr = name_hit or address_ok or host_token_hit or official_evidence_score >= 9
+    name_or_addr = name_hit or address_ok or official_evidence_score >= 9
     return bool(strong_domain and name_or_addr)
 
 def pick_best_address(expected_addr: str | None, candidates: list[str]) -> str | None:
@@ -607,6 +628,123 @@ def pick_best_address(expected_addr: str | None, candidates: list[str]) -> str |
             best_score = score
             best = cand
     return best
+
+def _strip_leading_tags(value: str) -> str:
+    out = value or ""
+    while True:
+        m = re.match(r"^\[[A-Z_]+\]", out)
+        if not m:
+            break
+        out = out[m.end():].lstrip()
+    return out
+
+def _candidate_address_norms(candidates: list[str]) -> list[str]:
+    norms: list[str] = []
+    for raw in candidates:
+        if not raw:
+            continue
+        norm = normalize_address(_strip_leading_tags(str(raw)))
+        if norm:
+            norms.append(norm)
+    return norms
+
+def _has_hq_tag_for_address(candidates: list[str], target_norm: str) -> bool:
+    for raw in candidates:
+        if isinstance(raw, str) and "[HQ]" in raw:
+            norm = normalize_address(_strip_leading_tags(raw))
+            if norm and norm == target_norm:
+                return True
+    return False
+
+def _address_candidate_ok(
+    candidate_norm: str,
+    candidates: list[str],
+    page_type: str,
+    input_addr: str,
+    ai_official_selected: bool,
+) -> tuple[bool, str]:
+    if not candidate_norm:
+        return False, "no_valid_address"
+    if ai_official_selected:
+        return True, ""
+    has_hq_tag = _has_hq_tag_for_address(candidates, candidate_norm)
+    if has_hq_tag:
+        return True, ""
+    addr_match = bool(input_addr) and addr_compatible(input_addr, candidate_norm)
+    has_zip = bool(ZIP_CODE_RE.search(candidate_norm))
+    has_city = bool(CITY_RE.search(candidate_norm))
+    only_one = len(set(_candidate_address_norms(candidates))) == 1
+    page_ok = page_type in {"COMPANY_PROFILE", "ACCESS_CONTACT"}
+    if addr_match and (page_ok or has_zip or has_city):
+        return True, ""
+    if page_ok and only_one and (has_zip or has_city):
+        return True, ""
+    return False, "no_hq_marker"
+
+def _strip_rep_tags(value: str) -> tuple[str, list[str]]:
+    out = value or ""
+    tags: list[str] = []
+    while True:
+        m = re.match(r"^\[([A-Z_]+)\]", out)
+        if not m:
+            break
+        tags.append(m.group(1))
+        out = out[m.end():].lstrip()
+    out = re.sub(r"\s+", " ", out).strip()
+    return out, tags
+
+def _rep_candidate_meta(candidates: list[str], chosen: str) -> dict[str, bool]:
+    chosen_norm = re.sub(r"\s+", " ", chosen or "").strip()
+    if not chosen_norm:
+        return {"low_role": False, "table": False, "label": False, "role": False}
+    for raw in candidates:
+        base, tags = _strip_rep_tags(str(raw))
+        if base == chosen_norm:
+            tag_set = set(tags)
+            return {
+                "low_role": "LOWROLE" in tag_set,
+                "table": "TABLE" in tag_set,
+                "label": "LABEL" in tag_set,
+                "role": "ROLE" in tag_set,
+            }
+    return {"low_role": False, "table": False, "label": False, "role": False}
+
+def _is_profile_like_url(url: str | None) -> bool:
+    if not url:
+        return False
+    try:
+        path = urlparse(url).path.lower()
+    except Exception:
+        return False
+    return any(seg in path for seg in ("/company", "/about", "/corporate", "/profile", "/overview", "/gaiyo", "/gaiyou"))
+
+def _rep_candidate_ok(
+    chosen: str | None,
+    candidates: list[str],
+    page_type: str,
+    source_url: str | None,
+) -> tuple[bool, str]:
+    if not chosen:
+        return False, "no_rep"
+    meta = _rep_candidate_meta(candidates, chosen)
+    low_role = meta.get("low_role", False)
+    profile_like = _is_profile_like_url(source_url)
+    strong_source = meta.get("table", False) or meta.get("label", False) or meta.get("role", False)
+    if page_type == "COMPANY_PROFILE":
+        return True, ""
+    if page_type == "ACCESS_CONTACT":
+        if low_role:
+            return False, "low_role_contact"
+        if profile_like or strong_source:
+            return True, ""
+        return False, "contact_not_profile"
+    if page_type == "OTHER":
+        if low_role:
+            return False, "low_role_other"
+        if profile_like or strong_source:
+            return True, ""
+        return False, "other_not_profile"
+    return False, f"not_profile:{page_type}"
 
 def pick_best_phone(candidates: list[str]) -> str | None:
     best: str | None = None
@@ -1438,6 +1576,7 @@ async def process():
             homepage_official_flag = int(company.get("homepage_official_flag") or 0)
             homepage_official_source = company.get("homepage_official_source", "") or ""
             homepage_official_score = float(company.get("homepage_official_score") or 0.0)
+            ai_official_selected = False
             ai_time_spent = 0.0
             chosen_domain_score = 0
             search_phase_end = 0.0
@@ -1771,6 +1910,17 @@ async def process():
                                     allow_slow,
                                     candidate,
                                 )
+                                try:
+                                    http_info = await scraper._fetch_http_info(candidate)
+                                    if http_info and (http_info.get("text") or http_info.get("html")):
+                                        return {
+                                            "url": candidate,
+                                            "text": http_info.get("text", "") or "",
+                                            "html": http_info.get("html", "") or "",
+                                            "screenshot": b"",
+                                        }
+                                except Exception:
+                                    pass
                                 return None
                             except Exception:
                                 log.warning("[%s] get_page_info failure -> %s", cid, candidate, exc_info=True)
@@ -2125,7 +2275,6 @@ async def process():
                         addr_hit = bool(rule_details.get("address_match"))
                         pref_hit = bool(rule_details.get("prefecture_match"))
                         zip_hit = bool(rule_details.get("postal_code_match"))
-                        address_ok = (not addr) or addr_hit or pref_hit or zip_hit
                         # ドメイン一致だけで「社名一致」と扱うと誤採用しやすいので、ページ内の社名シグナルを重視する
                         name_present = bool(rule_details.get("name_present"))
                         name_match_exact = bool(rule_details.get("name_match_exact"))
@@ -2134,15 +2283,27 @@ async def process():
                             name_match_ratio = float(rule_details.get("name_match_ratio") or 0.0)
                         except Exception:
                             name_match_ratio = 0.0
+                        name_match_source = str(rule_details.get("name_match_source") or "")
+                        high_signal_sources = {"title", "h1", "og_site_name", "og_title", "app_name"}
                         official_evidence = rule_details.get("official_evidence") or []
                         strong_name_hit = bool(
                             name_match_exact
                             or ("jsonld:org_name" in official_evidence)
                             or ("h1" in official_evidence)
                             or ("title" in official_evidence)
-                            or (name_match_ratio >= 0.92 and not name_match_partial_only)
+                            or (
+                                name_match_ratio >= 0.92
+                                and not name_match_partial_only
+                                and name_match_source in high_signal_sources
+                            )
                         )
                         name_hit = strong_name_hit
+                        pref_only_ok = bool(
+                            input_addr_pref_only
+                            and pref_hit
+                            and (name_hit or strong_domain_host or host_token_hit or domain_score >= 4)
+                        )
+                        address_ok = bool(addr) and (addr_hit or zip_hit or pref_only_ok)
                         evidence_score = int(rule_details.get("official_evidence_score") or 0)
                         directory_like = bool(rule_details.get("directory_like"))
                         host_name, _, allowed_tld, whitelist_host, _ = CompanyScraper._allowed_official_host(normalized_url or "")
@@ -2248,26 +2409,32 @@ async def process():
                             or rule_details.get("strong_domain")
                         )
                         ai_content_ok = fast_address_ok or fast_phone_hit or name_hit or host_token_hit
+                        ai_provisional = False
                         if ai_is_official_effective is True:
                             if input_addr_pref_only and not ai_content_ok:
                                 # AI公式は探索起点として正義：除外せず provisional として保持する（確定公式にはしない）
                                 record["ai_official_provisional"] = True
                                 record["ai_official_provisional_reason"] = "pref_only_input_no_name_host"
+                                ai_provisional = True
                                 force_review = True
                                 log.info("[%s] AI公式だが都道府県のみ＆根拠不足 -> provisional保持: %s", cid, record.get("url"))
                             if not ai_content_ok:
                                 # AI公式は除外しない（確定公式にもせず、deep起点として扱う）
                                 record["ai_official_provisional"] = True
                                 record["ai_official_provisional_reason"] = "ai_no_content_signal"
+                                ai_provisional = True
                                 force_review = True
                                 log.info("[%s] AI公式だがコンテンツ根拠が乏しい -> provisional保持: %s", cid, record.get("url"))
                             info = record.get("info")
                             primary_cands = extracted
                             homepage = normalized_url
-                            homepage_official_flag = 1
-                            homepage_official_source = "ai_fast" if fast_domain_ok else "ai_review"
+                            homepage_official_flag = 0 if ai_provisional else 1
+                            homepage_official_source = (
+                                "ai_provisional" if ai_provisional else ("ai_fast" if fast_domain_ok else "ai_review")
+                            )
                             homepage_official_score = float(rule_details.get("score") or 0.0)
-                            ai_official_description = ai_judge.get("description") if isinstance(ai_judge, dict) else None
+                            if not ai_provisional:
+                                ai_official_description = ai_judge.get("description") if isinstance(ai_judge, dict) else None
                             chosen_domain_score = domain_score
                             selected_candidate_record = record
                             if not fast_domain_ok or (addr and not address_ok):
@@ -2290,7 +2457,7 @@ async def process():
                                     forced_provisional_reason = "ai_official_but_weak_signals"
                                     manager.upsert_url_flag(
                                         normalized_url,
-                                        is_official=True,
+                                        is_official=False,
                                         source="ai_provisional",
                                         reason="ai_official_but_weak_signals",
                                         confidence=ai_judge.get("confidence"),
@@ -2303,7 +2470,7 @@ async def process():
                                         source="rule",
                                         reason="free_host_or_weak_signals",
                                     )
-                            else:
+                            elif not ai_provisional:
                                 manager.upsert_url_flag(
                                     normalized_url,
                                     is_official=True,
@@ -2527,7 +2694,12 @@ async def process():
                             addr_hit = bool(rule_details.get("address_match"))
                             pref_hit = bool(rule_details.get("prefecture_match"))
                             zip_hit = bool(rule_details.get("postal_code_match"))
-                            address_ok = (not addr) or addr_hit or pref_hit or zip_hit
+                            pref_only_ok = bool(
+                                input_addr_pref_only
+                                and pref_hit
+                                and (name_present or strong_domain_host or host_token_hit or domain_score >= 4)
+                            )
+                            address_ok = bool(addr) and (addr_hit or zip_hit or pref_only_ok)
                             evidence_score = int(rule_details.get("official_evidence_score") or 0)
                             ai_bonus = 0.0
                             aj = record.get("ai_judge")
@@ -2788,6 +2960,7 @@ async def process():
                     drop_details_by_url: dict[str, dict[str, str]] = {}
                     ai_official_selected = bool(
                         homepage
+                        and homepage_official_flag == 1
                         and isinstance(homepage_official_source, str)
                         and homepage_official_source.startswith("ai")
                     )
@@ -2820,40 +2993,39 @@ async def process():
                                     src_phone = url
                                 else:
                                     drop_reasons["phone"] = drop_reasons.get("phone") or f"not_profile:{pt}"
-                            if cc.get("addresses"):
-                                cand_addr = pick_best_address(None if ai_official_selected else addr, cc["addresses"])
-                                if cand_addr and not rule_address:
-                                    cand_norm = normalize_address(cand_addr) or cand_addr
-                                # [HQ]タグがある同一正規化住所が存在する場合のみ採用
-                                def _strip_leading_tags(s: str) -> str:
-                                    out = s or ""
-                                    while True:
-                                        m = re.match(r"^\\[[A-Z_]+\\]", out)
-                                        if not m:
-                                            break
-                                        out = out[m.end():].lstrip()
-                                    return out
-                                    has_hq_tag = any(
-                                        isinstance(raw, str)
-                                        and "[HQ]" in raw
-                                        and (normalize_address(_strip_leading_tags(raw)) or "") == cand_norm
-                                        for raw in (cc.get("addresses") or [])
-                                    )
-                                    if pt in {"COMPANY_PROFILE", "ACCESS_CONTACT"} and (has_hq_tag or ai_official_selected):
-                                        rule_address = cand_norm
-                                        src_addr = url
-                                    else:
-                                        drop_reasons["address"] = drop_reasons.get("address") or f"no_hq_marker:{pt}"
+                        if cc.get("addresses"):
+                            cand_addr = pick_best_address(None if ai_official_selected else addr, cc["addresses"])
+                            if cand_addr and not rule_address:
+                                cand_norm = normalize_address(cand_addr) or cand_addr
+                                ok, reason = _address_candidate_ok(
+                                    cand_norm,
+                                    cc.get("addresses") or [],
+                                    pt,
+                                    addr,
+                                    ai_official_selected,
+                                )
+                                if ok:
+                                    rule_address = cand_norm
+                                    src_addr = url
+                                else:
+                                    reason = reason or "no_hq_marker"
+                                    drop_reasons["address"] = drop_reasons.get("address") or f"{reason}:{pt}"
                         if cc.get("rep_names"):
                             cand_rep = pick_best_rep(cc["rep_names"], url)
                             cand_rep = scraper.clean_rep_name(cand_rep) if cand_rep else None
                             if cand_rep:
-                                if pt == "COMPANY_PROFILE":
+                                rep_ok, rep_reason = _rep_candidate_ok(
+                                    cand_rep,
+                                    cc.get("rep_names") or [],
+                                    pt,
+                                    url,
+                                )
+                                if rep_ok:
                                     if not rule_rep or len(cand_rep) > len(rule_rep):
                                         rule_rep = cand_rep
                                         src_rep = url
                                 else:
-                                    drop_reasons["rep"] = drop_reasons.get("rep") or f"not_profile:{pt}"
+                                    drop_reasons["rep"] = drop_reasons.get("rep") or rep_reason
                         if cc.get("listings"):
                             candidate = pick_best_listing(cc["listings"])
                             if candidate and not listing_val:
@@ -2916,6 +3088,8 @@ async def process():
                         cleaned = clean_description_value(candidate)
                         if not cleaned:
                             return False
+                        if looks_mojibake(cleaned):
+                            return False
                         banned_terms = (
                             "お問い合わせ",
                             "お問合せ",
@@ -2946,7 +3120,7 @@ async def process():
                         return True
 
                     # AI公式採用のときは、同じAI呼び出し(judge_official_homepage)で生成された description を優先採用する
-                    if homepage_official_source.startswith("ai") and isinstance(ai_official_description, str) and ai_official_description.strip():
+                    if homepage_official_flag == 1 and homepage_official_source.startswith("ai") and isinstance(ai_official_description, str) and ai_official_description.strip():
                         prev_desc = description_val
                         description_val = ""
                         if not update_description_candidate(ai_official_description):
@@ -3048,27 +3222,32 @@ async def process():
                             cand_addr = pick_best_address(None if ai_official_selected else addr, addrs)
                             if cand_addr:
                                 cand_norm = normalize_address(cand_addr) or cand_addr
-                                def _strip_leading_tags2(s: str) -> str:
-                                    out = s or ""
-                                    while True:
-                                        m = re.match(r"^\\[[A-Z_]+\\]", out)
-                                        if not m:
-                                            break
-                                        out = out[m.end():].lstrip()
-                                    return out
-                                has_hq_tag = any(
-                                    isinstance(raw, str)
-                                    and "[HQ]" in raw
-                                    and (normalize_address(_strip_leading_tags2(raw)) or "") == cand_norm
-                                    for raw in addrs
+                                ok, reason = _address_candidate_ok(
+                                    cand_norm,
+                                    addrs,
+                                    pt_info,
+                                    addr,
+                                    ai_official_selected,
                                 )
-                                if pt_info in {"COMPANY_PROFILE", "ACCESS_CONTACT"} and (has_hq_tag or ai_official_selected):
+                                if ok:
                                     rule_address = cand_norm
                                 else:
-                                    drop_reasons["address"] = drop_reasons.get("address") or f"no_hq_marker:{pt_info}"
-                        if reps and not rule_rep and pt_info == "COMPANY_PROFILE":
-                            rule_rep = pick_best_rep(reps, info_url)
-                            rule_rep = scraper.clean_rep_name(rule_rep) if rule_rep else None
+                                    reason = reason or "no_hq_marker"
+                                    drop_reasons["address"] = drop_reasons.get("address") or f"{reason}:{pt_info}"
+                        if reps and not rule_rep:
+                            cand_rep = pick_best_rep(reps, info_url)
+                            cand_rep = scraper.clean_rep_name(cand_rep) if cand_rep else None
+                            if cand_rep:
+                                rep_ok, rep_reason = _rep_candidate_ok(
+                                    cand_rep,
+                                    reps,
+                                    pt_info,
+                                    info_url,
+                                )
+                                if rep_ok:
+                                    rule_rep = cand_rep
+                                else:
+                                    drop_reasons["rep"] = drop_reasons.get("rep") or rep_reason
                         if rule_phone and not src_phone:
                             src_phone = info_url
                         if rule_address and not src_addr:
@@ -3376,28 +3555,22 @@ async def process():
                                         cand_addr = pick_best_address(None if ai_official_selected else addr, cc["addresses"])
                                         if cand_addr:
                                             cand_norm = normalize_address(cand_addr) or cand_addr
-                                            def _strip_leading_tags3(s: str) -> str:
-                                                out = s or ""
-                                                while True:
-                                                    m = re.match(r"^\\[[A-Z_]+\\]", out)
-                                                    if not m:
-                                                        break
-                                                    out = out[m.end():].lstrip()
-                                                return out
-                                            has_hq_tag = any(
-                                                isinstance(raw, str)
-                                                and "[HQ]" in raw
-                                                and (normalize_address(_strip_leading_tags3(raw)) or "") == cand_norm
-                                                for raw in (cc.get("addresses") or [])
+                                            ok, reason = _address_candidate_ok(
+                                                cand_norm,
+                                                cc.get("addresses") or [],
+                                                pt,
+                                                addr,
+                                                ai_official_selected,
                                             )
-                                            if pt in {"COMPANY_PROFILE", "ACCESS_CONTACT"} and (has_hq_tag or ai_official_selected):
+                                            if ok:
                                                 found_address = cand_norm
                                                 address_source = "rule"
                                                 src_addr = url
                                                 need_addr = False
                                                 log.info("[%s] deep_crawl picked address=%s url=%s", cid, cand_norm, url)
                                             else:
-                                                reason = f"no_hq_marker:{pt}"
+                                                reason = (reason or "no_hq_marker")
+                                                reason = f"{reason}:{pt}"
                                                 drop_reasons["address"] = drop_reasons.get("address") or reason
                                                 drop_details_by_url.setdefault(url, {})["address"] = reason
                                                 log.info("[%s] deep_crawl rejected address reason=%s url=%s cand=%s", cid, reason, url, cand_norm)
@@ -3416,13 +3589,19 @@ async def process():
                                         cand_rep = pick_best_rep(cc["rep_names"], url)
                                         cand_rep = scraper.clean_rep_name(cand_rep) if cand_rep else None
                                         if cand_rep:
-                                            if pt == "COMPANY_PROFILE":
+                                            rep_ok, rep_reason = _rep_candidate_ok(
+                                                cand_rep,
+                                                cc.get("rep_names") or [],
+                                                pt,
+                                                url,
+                                            )
+                                            if rep_ok:
                                                 rep_name_val = cand_rep
                                                 src_rep = url
                                                 need_rep = False
                                                 log.info("[%s] deep_crawl picked rep=%s url=%s", cid, cand_rep, url)
                                             else:
-                                                reason = f"not_profile:{pt}"
+                                                reason = rep_reason or f"not_profile:{pt}"
                                                 drop_reasons["rep"] = drop_reasons.get("rep") or reason
                                                 drop_details_by_url.setdefault(url, {})["rep"] = reason
                                                 log.info("[%s] deep_crawl rejected rep reason=%s url=%s cand=%s", cid, reason, url, cand_rep)
@@ -3492,10 +3671,10 @@ async def process():
                             ai_need_final = bool(
                                 homepage
                                 and USE_AI
-                                and not USE_AI_OFFICIAL
                                 and verifier is not None
                                 and not timed_out
                                 and has_time_for_ai()
+                                and (not USE_AI_OFFICIAL or AI_FINAL_WITH_OFFICIAL)
                                 and (
                                     missing_contact > 0
                                     or missing_extra > 0
@@ -3600,7 +3779,7 @@ async def process():
                                     def _strip_tags_for_ai(raw: str) -> str:
                                         out = raw or ""
                                         while True:
-                                            m = re.match(r"^\\[[A-Z_]+\\]", out)
+                                            m = re.match(r"^\[[A-Z_]+\]", out)
                                             if not m:
                                                 break
                                             out = out[m.end():].lstrip()
@@ -3767,8 +3946,18 @@ async def process():
                                     cand_rep = pick_best_rep(data["rep_names"], url)
                                     cand_rep = scraper.clean_rep_name(cand_rep) if cand_rep else None
                                     if cand_rep:
-                                        rep_name_val = cand_rep
-                                        src_rep = url
+                                        pt_fallback = page_type_per_url.get(url) or "OTHER"
+                                        rep_ok, rep_reason = _rep_candidate_ok(
+                                            cand_rep,
+                                            data.get("rep_names") or [],
+                                            pt_fallback,
+                                            url,
+                                        )
+                                        if rep_ok:
+                                            rep_name_val = cand_rep
+                                            src_rep = url
+                                        else:
+                                            drop_reasons["rep"] = drop_reasons.get("rep") or rep_reason
                                 if phone and found_address and rep_name_val:
                                     break
 
@@ -3825,12 +4014,12 @@ async def process():
                             found_address = rule_address
                         if found_address and not looks_like_address(found_address):
                             found_address = ""
-                            normalized_found_address = normalize_address(found_address) if found_address else ""
-                            if not normalized_found_address and addr:
-                                normalized_found_address = normalize_address(addr) or ""
-                            if ai_official_selected and normalized_found_address and (address_source or "") != "none":
-                                company["address"] = normalized_found_address
-                            csv_pref = CompanyScraper._extract_prefecture(addr) if addr else ""
+                        normalized_found_address = normalize_address(found_address) if found_address else ""
+                        if not normalized_found_address and addr:
+                            normalized_found_address = normalize_address(addr) or ""
+                        if ai_official_selected and normalized_found_address and (address_source or "") != "none":
+                            company["address"] = normalized_found_address
+                        csv_pref = CompanyScraper._extract_prefecture(addr) if addr else ""
                         hp_pref = CompanyScraper._extract_prefecture(normalized_found_address) if normalized_found_address else ""
                         pref_match = int(bool(csv_pref and hp_pref and csv_pref == hp_pref)) if (csv_pref and hp_pref) else None
                         csv_city_m = CITY_RE.search(addr or "")
@@ -4027,19 +4216,20 @@ async def process():
                             # 暫定URLで検証できない場合でも、深掘り/AI結果があれば保持し、ホームページは空に戻さない
                             pass
 
-                            if status == "done":
-                                strong_official = bool(
-                                    homepage
-                                    and homepage_official_flag == 1
-                                    and (chosen_domain_score or 0) >= 4
-                                    and (
-                                        ai_official_selected
-                                        or (not addr or not found_address or addr_compatible(addr, found_address))
-                                    )
-                                    and (
-                                        not had_verify_target
-                                        or verify_result.get("phone_ok")
-                                        or verify_result.get("address_ok")
+                        strong_official = False
+                        if status == "done":
+                            strong_official = bool(
+                                homepage
+                                and homepage_official_flag == 1
+                                and (chosen_domain_score or 0) >= 4
+                                and (
+                                    ai_official_selected
+                                    or (not addr or not found_address or addr_compatible(addr, found_address))
+                                )
+                                and (
+                                    not had_verify_target
+                                    or verify_result.get("phone_ok")
+                                    or verify_result.get("address_ok")
                                 )
                             )
                             if not strong_official:

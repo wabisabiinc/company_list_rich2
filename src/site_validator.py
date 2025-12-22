@@ -37,6 +37,7 @@ _CORP_SUFFIXES = (
 _TITLE_SPLIT_RE = re.compile(r"\s*(?://|\||｜|/| - | – | — |:|：)\s*")
 _WS_RE = re.compile(r"\s+")
 _PUNCT_STRIP_RE = re.compile(r"[　\\s\\-‐―－ー–—\\|｜/:：,，.。・･…\\(\\)（）\\[\\]【】<>＜＞]+")
+_JP_CHAR_RE = re.compile(r"[\u3040-\u30ff\u4e00-\u9fff]")
 
 
 def normalize_company_name(name: str) -> str:
@@ -147,6 +148,10 @@ def score_name_match(company_name: str, signals: dict[str, str]) -> NameMatchRes
         # 「部分一致しかしていない」ケースの過大評価を抑える
         if partial and len(company_norm) >= 3 and len(cand_norm) >= 3:
             ratio = min(ratio, 0.69)
+        if not exact and not partial:
+            if _JP_CHAR_RE.search(company_norm) and _JP_CHAR_RE.search(cand_norm):
+                if abs(len(company_norm) - len(cand_norm)) <= 1 and ratio >= 0.9:
+                    ratio = min(ratio, 0.88)
 
         if exact:
             ratio = 1.0

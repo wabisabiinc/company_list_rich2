@@ -642,6 +642,18 @@ class DatabaseManager:
         updates: list[str] = []
         params: list[Any] = []
 
+        def _looks_mojibake(text: str) -> bool:
+            if not text:
+                return False
+            if "\ufffd" in text:
+                return True
+            if re.search(r"[ぁ-んァ-ン一-龥]", text):
+                return False
+            latin_count = sum(1 for ch in text if "\u00c0" <= ch <= "\u00ff")
+            if latin_count >= 3 and latin_count / max(len(text), 1) >= 0.15:
+                return True
+            return bool(re.search(r"[ÃÂãâæçïðñöøûüÿ]", text) and latin_count >= 2)
+
         def _clean_phone(raw: Any) -> str:
             s = (raw or "").strip()
             hyphen_match = re.search(
@@ -709,7 +721,7 @@ class DatabaseManager:
             s = s.translate(str.maketrans("０１２３４５６７８９－ー―‐／", "0123456789----/"))
             s = re.sub(r"\s+", " ", s)
             s = s.replace("〒 ", "〒").replace("〒", "〒")
-            if re.search(r"[ãÂ�]{2,}", s):
+            if _looks_mojibake(s):
                 return ""
             return s.strip(" 　\t,，;；。．|｜/／・-‐―－ー:：")
 
@@ -773,6 +785,10 @@ class DatabaseManager:
         evidence = (company.get("address_evidence") or "").strip()
         hq_markers = ("本社所在地", "本店所在地", "本社", "本店")
         has_hq_evidence = any(m in evidence for m in hq_markers)
+        try:
+            hq_conf_min = float(os.getenv("ADDRESS_HQ_CONFIDENCE_MIN", "0.88"))
+        except Exception:
+            hq_conf_min = 0.88
 
         src_url_addr = (company.get("source_url_address") or "").strip()
         src_url_phone = (company.get("source_url_phone") or "").strip()
@@ -811,11 +827,31 @@ class DatabaseManager:
                 allow_overwrite = bool(
                     strong_official
                     and addr_source == "ai"
-                    and (address_conf_f is not None and address_conf_f >= 0.90)
+                    and (address_conf_f is not None and address_conf_f >= hq_conf_min)
                     and has_hq_evidence
                     and phone_same_page
                     and _page_type_ok(src_url_addr)
                 )
+                if not allow_overwrite:
+                    found_has_zip = bool(re.search(r"\d{3}-\d{4}", found_addr))
+                    found_has_city = bool(re.search(r"(\u5e02|\u533a|\u753a|\u6751|\u90e1)", found_addr))
+                    base_has_zip = bool(re.search(r"\d{3}-\d{4}", baseline_address))
+                    base_has_city = bool(re.search(r"(\u5e02|\u533a|\u753a|\u6751|\u90e1)", baseline_address))
+                    baseline_weak = (not base_has_zip or not base_has_city)
+                    strong_source_ok = (
+                        addr_source in {"rule", "official"}
+                        or (addr_source == "ai" and (address_conf_f is not None and address_conf_f >= hq_conf_min))
+                    )
+                    if (
+                        baseline_weak
+                        and strong_official
+                        and _page_type_ok(src_url_addr)
+                        and found_has_zip
+                        and found_has_city
+                        and (phone_same_page or has_hq_evidence or strong_source_ok)
+                    ):
+                        allow_overwrite = True
+                        conflict_level = "pref_mismatch_overwritten"
                 # 追加オプション：CSV住所が誤っているケース救済（危険なのでデフォルト無効）
                 # - 公式採用（strong_official）で、HP側住所が郵便番号+市区町村を含むなど十分に具体的
                 # - 取得元URLが会社概要系（_page_type_ok）で、CSV側が情報不足（郵便番号/市区町村が欠ける等）

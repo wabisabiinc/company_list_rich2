@@ -115,6 +115,7 @@ REP_NAME_SUBSTR_BLOCKLIST = (
 )
 REP_NAME_EXACT_BLOCKLIST_LOWER = {s.lower() for s in REP_NAME_EXACT_BLOCKLIST}
 NAME_CHUNK_RE = re.compile(r"[一-龥]{1,3}(?:[・･\s]{0,1}[一-龥]{1,3})+")
+KANA_NAME_RE = re.compile(r"[?-?]{2,}(?:[??\s][?-?]{2,})+")
 REP_BUSINESS_TERMS = (
     "事業",
     "経営",
@@ -859,6 +860,19 @@ class CompanyScraper:
         return None
 
     @staticmethod
+    def _looks_mojibake(text: str) -> bool:
+        if not text:
+            return False
+        if "\ufffd" in text:
+            return True
+        if re.search(r"[ぁ-んァ-ン一-龥]", text):
+            return False
+        latin_count = sum(1 for ch in text if "\u00c0" <= ch <= "\u00ff")
+        if latin_count >= 3 and latin_count / max(len(text), 1) >= 0.15:
+            return True
+        return bool(re.search(r"[ÃÂãâæçïðñöøûüÿ]", text) and latin_count >= 2)
+
+    @staticmethod
     def _is_address_form_noise(text: str) -> bool:
         if not text:
             return False
@@ -878,6 +892,8 @@ class CompanyScraper:
     @staticmethod
     def _normalize_address_candidate(val: str) -> str:
         if not val:
+            return ""
+        if CompanyScraper._looks_mojibake(str(val)):
             return ""
         val = unicodedata.normalize("NFKC", val)
         # HTML断片を除去
@@ -992,7 +1008,7 @@ class CompanyScraper:
             return False
         if re.search(r"[0-9@]", name):
             return False
-        return bool(NAME_CHUNK_RE.search(name))
+        return bool(NAME_CHUNK_RE.search(name) or KANA_NAME_RE.search(name))
 
     @staticmethod
     def _looks_like_full_address(text: str) -> bool:
@@ -1167,7 +1183,7 @@ class CompanyScraper:
         if re.fullmatch(r"(取締役|執行役(?:員)?|監査役|役員|部長|課長|主任|係長|担当|マネージャ|manager|director)", text, flags=re.I):
             return None
         # 氏名らしさチェック（1文字姓も許容: 例「関 進」「東 太郎」）
-        if not NAME_CHUNK_RE.search(text):
+        if not (NAME_CHUNK_RE.search(text) or KANA_NAME_RE.search(text)):
             return None
         tokens = [tok for tok in re.split(r"\s+", text) if tok]
         if len(tokens) > 4:
@@ -1272,18 +1288,18 @@ class CompanyScraper:
                 return True
             # ローマ字表記揺れ（echo/eiko/eiko-sha等）を許容するゆるい類似判定
             for dt in domain_tokens:
-                if len(token) >= 3 and len(dt) >= 3:
+                if dt in generic_tokens:
+                    continue
+                if len(token) >= 4 and len(dt) >= 4:
                     try:
                         ratio = SequenceMatcher(None, token, dt).ratio()
                     except Exception:
                         ratio = 0.0
-                    if ratio >= 0.75:
+                    if ratio >= 0.85:
                         return True
-                # 会社名ローマ字に施設種別が付いているだけのケースを許容（例: umezono + ryokan）
                 if (
                     len(token) >= 4
                     and len(dt) >= 4
-                    and dt not in generic_tokens
                     and (token.startswith(dt) or dt.startswith(token))
                 ):
                     return True
@@ -1312,6 +1328,8 @@ class CompanyScraper:
             if not token:
                 continue
             token_len = len(token)
+            if token_len <= 2:
+                continue
             exact = token in host_no_port or token in host_compact
             if exact:
                 score += 6
@@ -1319,13 +1337,15 @@ class CompanyScraper:
                 score += 4
             if token in path_lower:
                 score += 3
-            if token_len >= 4:
+            if token_len >= 5:
                 for dt in domain_tokens:
+                    if dt in generic_tokens:
+                        continue
                     try:
                         ratio = SequenceMatcher(None, token, dt).ratio()
                     except Exception:
                         ratio = 0
-                    if ratio >= 0.8:
+                    if ratio >= 0.88:
                         score += 2
                         break
 
@@ -1997,6 +2017,9 @@ class CompanyScraper:
         is_prefecture_exact = base_name in PREFECTURE_NAMES
         expected_pref = self._extract_prefecture(expected_address or "")
         expected_zip = self._extract_postal_code(expected_address or "")
+        expected_city_match = CITY_RE.search(expected_address or "")
+        expected_city = expected_city_match.group(1) if expected_city_match else ""
+        input_addr_weak = bool(expected_pref and not expected_city and not expected_zip)
         if is_prefecture_exact:
             allowed_suffixes = self.ENTITY_SITE_SUFFIXES.get("gov", ())
             if not any(self._host_matches_suffix(host, suffix) for suffix in allowed_suffixes):
@@ -2074,7 +2097,7 @@ class CompanyScraper:
         company_has_corp = any(suffix in (company_name or "") for suffix in self.CORP_SUFFIXES) or bool(entity_tags)
         host_token_hit = self._host_token_hit(company_tokens, url)
         if not company_tokens:
-            host_token_hit = True  # Fallback when romaji tokens cannot be generated
+            host_token_hit = False  # Avoid treating unknown tokens as strong evidence
         loose_host_hit = host_token_hit or (company_has_corp and allowed_tld and domain_match_score >= 3)
         name_present_flag = (
             bool(norm_name and norm_name in combined)
@@ -2132,8 +2155,7 @@ class CompanyScraper:
 
         # 入力住所がある場合、ページ側の都道府県が明確に不一致なら低スコア
         pref_mismatch = False
-        expected_city = ""
-        if expected_pref:
+        if expected_pref and not input_addr_weak:
             expected_city_match = CITY_RE.search(expected_address or "")
             expected_city = expected_city_match.group(1) if expected_city_match else ""
             found_prefs = set(PREFECTURE_NAME_RE.findall(combined or ""))
@@ -2194,7 +2216,7 @@ class CompanyScraper:
                 pref_ok = bool(expected_pref and cand_pref and expected_pref == cand_pref)
                 zip_ok = bool(expected_zip and cand_zip and expected_zip == cand_zip)
                 addr_ok = self._address_matches(expected_address, cand)
-                if expected_pref and cand_pref and not pref_ok:
+                if expected_pref and cand_pref and not pref_ok and not input_addr_weak:
                     pref_mismatch_in_address = True
                     score -= 6
                 if expected_city and cand and expected_city not in cand:
@@ -2214,8 +2236,20 @@ class CompanyScraper:
                     score += 1
                     pref_hit = True
 
+        address_strong = address_hit or postal_hit
+        pref_hit_strong = (
+            pref_hit
+            and not address_strong
+            and (
+                name_match.exact
+                or (name_match.ratio >= 0.92 and not name_match.partial_only)
+                or official_evidence_score >= 9
+            )
+            and (strong_domain_flag or host_token_hit or domain_match_score >= 3 or whitelist_hit or is_google_sites)
+        )
+
         # 住所シグナルがあり、法人TLD (.co.jp 等) ならドメイントークンが弱くても公式として許容する
-        if allowed_tld and (address_hit or pref_hit or postal_hit):
+        if allowed_tld and (address_strong or pref_hit_strong):
             if domain_match_score >= 2 or host_token_hit:
                 return finalize(
                     True,
@@ -2322,7 +2356,7 @@ class CompanyScraper:
                     directory_reasons=directory_reasons,
                 )
 
-        if (address_hit or pref_hit or postal_hit) and (allowed_tld or whitelist_hit or is_google_sites):
+        if (address_strong or pref_hit_strong) and (allowed_tld or whitelist_hit or is_google_sites):
             return finalize(
                 True,
                 score=score,

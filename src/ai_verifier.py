@@ -80,6 +80,18 @@ _NOISE_RE = re.compile(
 )
 
 # ---- utils ------------------------------------------------------
+def _looks_mojibake(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    if "\ufffd" in text:
+        return True
+    if re.search(r"[ぁ-んァ-ン一-龥]", text):
+        return False
+    latin_count = sum(1 for ch in text if "\u00c0" <= ch <= "\u00ff")
+    if latin_count >= 3 and latin_count / max(len(text), 1) >= 0.15:
+        return True
+    return bool(re.search(r"[ÃÂãâæçïðñöøûüÿ]", text) and latin_count >= 2)
+
 def _extract_first_json(text: str) -> Optional[Dict[str, Any]]:
     if not text:
         return None
@@ -115,6 +127,8 @@ def _normalize_phone(s: Optional[str]) -> Optional[str]:
 
 def _normalize_address(addr: Optional[str]) -> Optional[str]:
     if not addr:
+        return None
+    if _looks_mojibake(addr):
         return None
     a = re.sub(r"\s+", " ", addr.strip())
     # 住所の後ろに混入しがちな付帯情報をカット（AI出力の誤混入対策）
@@ -377,6 +391,8 @@ class AIVerifier:
     def _validate_description(desc: Optional[str]) -> Optional[str]:
         if not desc:
             return None
+        if _looks_mojibake(desc):
+            return None
         if "http://" in desc or "https://" in desc or "＠" in desc or "@" in desc:
             return None
         desc = re.sub(r"\s+", " ", desc.strip())
@@ -391,6 +407,8 @@ class AIVerifier:
     @staticmethod
     def _validate_rich_description(desc: Optional[str]) -> Optional[str]:
         if not desc:
+            return None
+        if _looks_mojibake(desc):
             return None
         if "http://" in desc or "https://" in desc or "＠" in desc or "@" in desc:
             return None

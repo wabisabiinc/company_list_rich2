@@ -42,7 +42,9 @@ def apply_provisional_homepage_policy(
         )
 
     source = (homepage_official_source or "").strip()
-    if int(homepage_official_flag or 0) != 0 or not source.startswith("provisional"):
+    if int(homepage_official_flag or 0) != 0 or not (
+        source.startswith("provisional") or source.startswith("ai_provisional")
+    ):
         return HomepageDecision(
             homepage=homepage,
             homepage_official_flag=int(homepage_official_flag or 0),
