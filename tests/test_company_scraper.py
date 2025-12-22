@@ -200,6 +200,10 @@ def test_clean_rep_name_handles_chairman_title(scraper):
     assert scraper.clean_rep_name("会長 佐藤太郎") == "佐藤太郎"
     assert scraper.clean_rep_name("会長") is None
 
+def test_clean_rep_name_allows_single_kanji_tokens(scraper):
+    assert scraper.clean_rep_name("関 進") == "関 進"
+    assert scraper.clean_rep_name("関進") == "関進"
+
 
 def test_extract_candidates_keeps_full_rep_name(scraper):
     text = "会社概要\n代表取締役会長　飯野　靖司\n所在地 東京都千代田区"
@@ -210,6 +214,17 @@ def test_extract_candidates_rep_name_then_role(scraper):
     text = "役員紹介\n平野井 順一\n代表取締役社長\n所在地 東京都千代田区"
     cands = scraper.extract_candidates(text)
     assert any(name.replace(" ", "") == "平野井順一" for name in cands["rep_names"])
+
+def test_extract_candidates_rep_picks_ceo_when_multiple(scraper):
+    text = "企業情報\n代表者 代表取締役会長 関 進、代表取締役社長 関 裕之\n電話番号 044-210-1000（代）"
+    html = """
+    <table>
+      <tr><th>代表者</th><td>代表取締役会長 関 進、代表取締役社長 関 裕之</td></tr>
+      <tr><th>電話番号</th><td>044-210-1000（代）</td></tr>
+    </table>
+    """
+    cands = scraper.extract_candidates(text, html=html)
+    assert any(name.replace(" ", "").endswith("関裕之") for name in cands["rep_names"])
 
 
 def test_extract_candidates_finance_inline_variations(scraper):

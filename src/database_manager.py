@@ -709,6 +709,9 @@ class DatabaseManager:
                         or (has_zip and not raw_has_zip)
                         or (has_city and not raw_has_city)
                     )
+                    # CSVに都道府県があるのに、取得住所に都道府県が無い場合は品質劣化のため上書きしない
+                    if allow_overwrite and csv_pref and not hp_pref and raw_address:
+                        allow_overwrite = False
             else:
                 conflict_level = "pref_mismatch"
                 # 都道府県不一致は原則上書き禁止。例外は「本社/本店の明示 + 代表電話同ページ + 高confidence + ページ種別OK」

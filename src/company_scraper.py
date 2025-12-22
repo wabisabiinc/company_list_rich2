@@ -1095,9 +1095,11 @@ class CompanyScraper:
             return None
         if "@" in text or re.search(r"https?://", text):
             return None
-        # 氏名らしさチェック（漢字2-5文字の塊を優先）
-        name_like = re.findall(r"[一-龥]{2,5}", text)
-        if not name_like:
+        # 役職だけ（取締役/部長等）が残っているケースを除外
+        if re.search(r"(取締役|執行役|監査役|役員|部長|課長|主任|係長|担当|マネージャ|manager|director)", text, flags=re.I):
+            return None
+        # 氏名らしさチェック（1文字姓も許容: 例「関 進」「東 太郎」）
+        if not NAME_CHUNK_RE.search(text):
             return None
         tokens = [tok for tok in re.split(r"\s+", text) if tok]
         if len(tokens) > 4:
@@ -3571,7 +3573,9 @@ class CompanyScraper:
         # 追加の代表者抽出: キーワードの近傍にある漢字氏名を拾う
         if not reps:
             rep_kw_pattern = re.compile(
-                r"(代表取締役社長|代表取締役会長|代表取締役|代表理事長|代表理事|代表者|社長|会長|理事長|組合長|院長|学長|園長|校長)[^\n\r]{0,20}?([一-龥]{2,5}(?:\s*[一-龥]{2,5})?)"
+                r"(代表取締役社長|代表取締役会長|代表取締役|代表理事長|代表理事|代表者|社長|会長|理事長|組合長|院長|学長|園長|校長)"
+                r"[^\n\r]{0,20}?"
+                r"([一-龥]{1,3}(?:[・･ \u3000]{0,1}[一-龥]{1,3})+)"
             )
             for m in rep_kw_pattern.finditer(text or ""):
                 name_cand = m.group(2)
@@ -3581,16 +3585,20 @@ class CompanyScraper:
 
         # 追加の代表者抽出: 氏名 → 役職 の並び（カードUI等）に対応
         if not reps:
-            rep_name_then_role_pattern = re.compile(
-                r"([一-龥]{2,5}(?:\s*[一-龥]{2,5})?)"
-                r"[\s\u3000\r\n]{0,8}"
-                r"(代表取締役社長|代表取締役会長|代表取締役|代表執行役社長|代表執行役|代表理事長|代表理事|代表社員|代表者|代表)"
+            lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+            role_re = re.compile(
+                r"(代表取締役社長|代表執行役社長|代表取締役会長|代表取締役|代表理事長|代表理事|代表社員|代表者|代表|社長|会長|CEO)",
+                flags=re.I,
             )
-            for m in rep_name_then_role_pattern.finditer(text or ""):
-                name_cand = m.group(1)
-                cleaned = self.clean_rep_name(name_cand)
-                if cleaned:
+            for idx in range(len(lines) - 1):
+                cand_line = lines[idx]
+                role_line = lines[idx + 1]
+                if not role_re.search(role_line):
+                    continue
+                cleaned = self.clean_rep_name(cand_line)
+                if cleaned and self._looks_like_person_name(cleaned):
                     reps.append(cleaned)
+                    break
 
         listings: List[str] = []
         capitals: List[str] = []
@@ -3764,9 +3772,51 @@ class CompanyScraper:
             for field, keywords in TABLE_LABEL_MAP.items():
                 if any(keyword in norm_label for keyword in keywords):
                     if field == "rep_names":
-                        cleaned = self.clean_rep_name(raw_value)
-                        if cleaned and self._looks_like_person_name(cleaned):
-                            strong_role = bool(re.search(r"(代表取締役|代表者|社長|会長|理事長)", raw_value))
+                        def _pick_best_rep_name(val: str) -> tuple[str | None, bool]:
+                            if not val:
+                                return None, False
+                            # 複数列挙（例: 代表取締役会長A、代表取締役社長B）から強い役職を優先して拾う
+                            role_priority = {
+                                "代表取締役社長": 100,
+                                "CEO": 95,
+                                "代表執行役社長": 90,
+                                "代表取締役": 85,
+                                "代表理事長": 80,
+                                "代表理事": 75,
+                                "社長": 70,
+                                "代表取締役会長": 60,
+                                "会長": 55,
+                                "代表社員": 50,
+                                "代表者": 45,
+                                "代表": 40,
+                            }
+                            role_name_re = re.compile(
+                                r"(代表取締役社長|代表執行役社長|代表取締役会長|代表取締役|代表理事長|代表理事|代表社員|代表者|代表|社長|会長|CEO)"
+                                r"[\s\u3000:：・]{0,4}"
+                                r"([一-龥]{1,3}(?:[・･ \u3000]{0,1}[一-龥]{1,3})+)"
+                            )
+                            best: tuple[int, str] | None = None
+                            for m in role_name_re.finditer(val):
+                                role = m.group(1)
+                                name = m.group(2)
+                                cleaned_name = self.clean_rep_name(name) or self.clean_rep_name(f"{role} {name}")
+                                if not cleaned_name or not self._looks_like_person_name(cleaned_name):
+                                    continue
+                                prio = int(role_priority.get(role, 0))
+                                cand = (prio, cleaned_name)
+                                if best is None or cand[0] > best[0]:
+                                    best = cand
+                            if best is not None:
+                                strong = best[0] >= 70
+                                return best[1], strong
+                            cleaned = self.clean_rep_name(val)
+                            if cleaned and self._looks_like_person_name(cleaned):
+                                strong = bool(re.search(r"(代表取締役|代表執行役|代表理事|社長|CEO)", val))
+                                return cleaned, strong
+                            return None, False
+
+                        cleaned, strong_role = _pick_best_rep_name(raw_value)
+                        if cleaned:
                             normalized_rep = cleaned if not is_table_pair else f"[TABLE]{cleaned}"
                             if ("役員" in norm_label) and not strong_role:
                                 normalized_rep = f"[LOWROLE]{normalized_rep}"
