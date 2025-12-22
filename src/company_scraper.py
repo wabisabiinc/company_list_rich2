@@ -1024,6 +1024,7 @@ class CompanyScraper:
         titles = (
             "代表取締役社長", "代表取締役副社長", "代表取締役会長", "代表取締役",
             "代表社員", "代表理事", "代表理事長", "代表執行役", "代表執行役社長",
+            "代表取締役社長執行役員",
             "代表執行役社長兼CEO", "代表取締役社長兼CEO", "代表取締役社長CEO",
             "代表取締役社長兼COO", "代表取締役社長兼社長執行役員",
             "代表者", "代表", "代表主宰", "代表校長",
@@ -1040,6 +1041,35 @@ class CompanyScraper:
             if not removed:
                 break
         text = text.strip(" 　")
+        # 代表者欄は役職が重なりやすいので、先頭/末尾の役職語を追加で剥がす
+        role_words = (
+            "社長執行役員",
+            "執行役員",
+            "取締役社長",
+            "取締役会長",
+            "取締役副社長",
+            "専務取締役",
+            "常務取締役",
+            "取締役",
+            "執行役",
+            "監査役",
+            "非常勤取締役",
+            "常勤監査役",
+            "会長",
+            "社長",
+            "CEO",
+            "COO",
+            "CFO",
+            "CTO",
+        )
+        while True:
+            before = text
+            for w in role_words:
+                text = re.sub(rf"^{re.escape(w)}[\\s　]*", "", text)
+                text = re.sub(rf"[\\s　]*{re.escape(w)}$", "", text)
+            text = text.strip(" 　")
+            if text == before:
+                break
         if text.endswith(("氏", "様")):
             text = text[:-1]
         text = re.sub(r"(と申します|といたします|になります|させていただきます|いたします|いたしました)$", "", text)
@@ -1050,7 +1080,25 @@ class CompanyScraper:
             return None
         if len(text) < 2 or len(text) > 40:
             return None
-        generic_words = {"氏名", "お名前", "名前", "name", "Name", "NAME", "役職", "役名", "役割", "担当", "担当者", "選任", "代表者", "代表者名"}
+        generic_words = {
+            "氏名",
+            "お名前",
+            "名前",
+            "name",
+            "Name",
+            "NAME",
+            "役職",
+            "役名",
+            "役割",
+            "担当",
+            "担当者",
+            "選任",
+            "代表者",
+            "代表者名",
+            "企業",
+            "法人",
+            "会社",
+        }
         if text in generic_words:
             return None
         if re.search(r"(氏名|お名前|名前|役職|役名|役割|担当|担当者|選任|代表者)", text):
@@ -1097,8 +1145,14 @@ class CompanyScraper:
             return None
         if "@" in text or re.search(r"https?://", text):
             return None
-        # 役職だけ（取締役/部長等）が残っているケースを除外
-        if re.search(r"(取締役|執行役|監査役|役員|部長|課長|主任|係長|担当|マネージャ|manager|director)", text, flags=re.I):
+        # 役職語が残る場合は「氏名だけ」に寄せてから再判定（代表者欄の表記ゆれ対策）
+        text = re.sub(r"^(?:取締役|執行役(?:員)?|監査役|役員)\\s*", "", text)
+        text = re.sub(r"\\s*(?:取締役|執行役(?:員)?|監査役|役員)$", "", text)
+        text = text.strip(" 　")
+        if not text:
+            return None
+        # 役職だけ（取締役/部長等）になってしまったケースを除外
+        if re.fullmatch(r"(取締役|執行役(?:員)?|監査役|役員|部長|課長|主任|係長|担当|マネージャ|manager|director)", text, flags=re.I):
             return None
         # 氏名らしさチェック（1文字姓も許容: 例「関 進」「東 太郎」）
         if not NAME_CHUNK_RE.search(text):
@@ -1505,7 +1559,16 @@ class CompanyScraper:
         try:
             soup = BeautifulSoup(html, "html.parser")
         except Exception:
-            return cls._filter_noise_lines(fallback_text or "")
+            # BeautifulSoup が落ちる/壊れたHTMLのとき、raw HTML をそのまま流すと
+            # <div...> 等の断片が住所に混入しやすいので、雑にタグを落としてから通す。
+            raw = html or fallback_text or ""
+            raw = re.sub(r"(?is)<script[^>]*>.*?</script>", " ", raw)
+            raw = re.sub(r"(?is)<style[^>]*>.*?</style>", " ", raw)
+            raw = re.sub(r"(?is)<!--.*?-->", " ", raw)
+            raw = re.sub(r"<[^>]+>", "\n", raw)
+            raw = raw.replace("&nbsp;", " ").replace("&#160;", " ")
+            raw = re.sub(r"\n{3,}", "\n\n", raw)
+            return cls._filter_noise_lines(raw)
 
         for tag in soup.find_all(["script", "style", "nav", "footer", "header", "aside", "noscript", "svg", "canvas", "iframe", "form", "button"]):
             tag.decompose()
@@ -3553,12 +3616,17 @@ class CompanyScraper:
                 if len(queue) + len(results) >= max_pages + concurrency:
                     break
 
+        # キューに残ったTask（max_pages到達などで未回収）を必ず回収して例外ログを抑制する
+        leftover_tasks: list[asyncio.Task] = []
         for _, _, payload in queue:
             if isinstance(payload, asyncio.Task):
-                payload.cancel()
-        for task in pending_tasks:
+                leftover_tasks.append(payload)
+        leftover_tasks.extend([t for t in pending_tasks if isinstance(t, asyncio.Task)])
+        for task in leftover_tasks:
             if not task.done():
                 task.cancel()
+        if leftover_tasks:
+            await asyncio.gather(*leftover_tasks, return_exceptions=True)
         meta["pages_visited"] = len(results)
         meta["urls_visited"] = list(results.keys())
         if not meta.get("stop_reason"):

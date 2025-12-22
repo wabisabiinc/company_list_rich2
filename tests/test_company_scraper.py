@@ -200,6 +200,13 @@ def test_clean_rep_name_handles_chairman_title(scraper):
     assert scraper.clean_rep_name("会長 佐藤太郎") == "佐藤太郎"
     assert scraper.clean_rep_name("会長") is None
 
+def test_clean_rep_name_strips_exec_officer_variants(scraper):
+    assert scraper.clean_rep_name("代表取締役社長執行役員 塩津伸男") == "塩津伸男"
+    assert scraper.clean_rep_name("代表取締役社長 執行役員 塩津伸男") == "塩津伸男"
+
+def test_clean_rep_name_rejects_generic_company_word(scraper):
+    assert scraper.clean_rep_name("企業") is None
+
 def test_clean_rep_name_allows_single_kanji_tokens(scraper):
     assert scraper.clean_rep_name("関 進") == "関 進"
     assert scraper.clean_rep_name("関進") == "関進"

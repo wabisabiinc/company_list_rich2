@@ -34,6 +34,11 @@ class HardTimeout(Exception):
     """Raised when the per-company hard time limit is exceeded."""
     pass
 
+
+class SkipCompany(Exception):
+    """Raised to skip remaining processing for the current company."""
+    pass
+
 # --------------------------------------------------
 # ロギング設定
 # --------------------------------------------------
@@ -217,6 +222,11 @@ def normalize_address(s: str | None) -> str | None:
         return out
     s = s.strip().replace("　", " ")
     s = re.sub(r"<[^>]+>", " ", s)
+    # タグが壊れている/途中で切れている場合の残骸を軽く除去（div/nav 等）
+    s = s.replace("<", " ").replace(">", " ")
+    s = re.sub(r"\b(?:div|nav|footer|header|main|section|article|span|ul|li|br|href|class|id|style)\b", " ", s, flags=re.I)
+    s = re.sub(r"=\s*(?:\"[^\"]*\"|'[^']*'|\\\"[^\\\"]*\\\")", " ", s)
+    s = re.sub(r"\s*=\s*", " ", s)
     # CSSスタイル断片の除去（スクレイプ時に混入する background: などを落とす）
     s = re.sub(r"(background|color|font-family|font-size|display|position)\s*:\s*[^;]+;?", " ", s, flags=re.I)
     # JSやトラッキング断片をカット（window.dataLayer 等が混入するケース対策）
@@ -727,6 +737,22 @@ def clean_description_value(val: str) -> str:
     stripped = text.strip("・-—‐－ー")
     if "<" in stripped or "class=" in stripped or "svg" in stripped:
         return ""
+    # 企業DB/まとめサイトの定型文を除外
+    if ("サイト" in stripped or "ページ" in stripped) and any(
+        w in stripped
+        for w in (
+            "データベース",
+            "登録企業",
+            "掲載",
+            "企業詳細",
+            "会社情報を掲載",
+            "企業情報を掲載",
+            "口コミ",
+            "評判",
+            "ランキング",
+        )
+    ):
+        return ""
     # URL/メール/TEL系は説明にしない
     if re.search(r"https?://|mailto:|@|＠|tel[:：]|電話|ＴＥＬ|ＴＥＬ：", stripped, flags=re.I):
         return ""
@@ -754,10 +780,43 @@ def clean_description_value(val: str) -> str:
         return ""
     if re.fullmatch(r"(会社概要|事業概要|法人概要|沿革|会社案内|企業情報)", stripped):
         return ""
-    # 事業内容を示すキーワードが全く無い場合だけ除外
-    if not any(k in stripped for k in DESCRIPTION_BIZ_KEYWORDS):
-        return ""
-    return _truncate_description(stripped)
+    # 複数文の場合、使える1文だけを拾う（末尾に採用/問い合わせ等が付いても落としすぎない）
+    candidates = [stripped]
+    if "。" in stripped or "．" in stripped:
+        parts = [p.strip() for p in re.split(r"[。．]", stripped) if p.strip()]
+        candidates = parts or candidates
+
+    for cand in candidates:
+        if cand in GENERIC_DESCRIPTION_TERMS:
+            continue
+        if len(cand) < DESCRIPTION_MIN_LEN:
+            continue
+        if any(term in cand for term in ("お問い合わせ", "お問合せ", "アクセス", "予約", "営業時間")):
+            continue
+        if any(word in cand for word in policy_blocks):
+            continue
+        if ("サイト" in cand or "ページ" in cand) and any(
+            w in cand
+            for w in (
+                "データベース",
+                "登録企業",
+                "掲載",
+                "企業詳細",
+                "会社情報を掲載",
+                "企業情報を掲載",
+                "口コミ",
+                "評判",
+                "ランキング",
+            )
+        ):
+            continue
+        if re.search(r"https?://|mailto:|@|＠|tel[:：]|電話|ＴＥＬ|ＴＥＬ：", cand, flags=re.I):
+            continue
+        # 事業内容を示すキーワードが全く無い場合だけ除外
+        if not any(k in cand for k in DESCRIPTION_BIZ_KEYWORDS):
+            continue
+        return _truncate_description(cand)
+    return ""
 
 def clean_fiscal_month(val: str) -> str:
     text = (val or "").strip().replace("　", " ")
@@ -1342,7 +1401,92 @@ async def process():
                 except Exception:
                     log.warning("[%s] timeout partial save failed", cid, exc_info=True)
 
+            def save_no_homepage(reason: str) -> None:
+                nonlocal timeout_saved
+                if timeout_saved:
+                    return
+                try:
+                    top3_urls = list(urls or [])[:3]
+                    top3_records = sorted(candidate_records or [], key=lambda r: r.get("search_rank", 1e9))[:3]
+                    all_directory_like = bool(top3_records) and all(
+                        bool((r.get("rule") or {}).get("directory_like")) for r in top3_records
+                    )
+                    if not top3_urls:
+                        skip_reason = "no_search_results_or_prefiltered"
+                    elif all_directory_like:
+                        skip_reason = "top3_all_directory_like"
+                    else:
+                        skip_reason = reason or "no_official_in_top3"
+                    if not (company.get("error_code") or "").strip():
+                        company["error_code"] = skip_reason
+                    append_jsonl(
+                        NO_OFFICIAL_LOG_PATH,
+                        {
+                            "id": cid,
+                            "company_name": name,
+                            "csv_address": addr,
+                            "skip_reason": skip_reason,
+                            "top3_urls": top3_urls,
+                            "top3_candidates": [
+                                {
+                                    "url": (r.get("normalized_url") or r.get("url") or ""),
+                                    "search_rank": int(r.get("search_rank") or 0),
+                                    "domain_score": int(r.get("domain_score") or 0),
+                                    "rule_score": float(((r.get("rule") or {}).get("score")) or 0.0),
+                                    "directory_like": bool((r.get("rule") or {}).get("directory_like")),
+                                    "directory_score": int((r.get("rule") or {}).get("directory_score") or 0),
+                                    "directory_reasons": list((r.get("rule") or {}).get("directory_reasons") or [])[:8],
+                                    "blocked_host": bool((r.get("rule") or {}).get("blocked_host")),
+                                    "prefecture_mismatch": bool((r.get("rule") or {}).get("prefecture_mismatch")),
+                                }
+                                for r in top3_records
+                            ],
+                        },
+                    )
+                    normalized_found_address = normalize_address(found_address) if found_address else ""
+                    company.update(
+                        {
+                            "homepage": "",
+                            "phone": phone or "",
+                            "found_address": normalized_found_address,
+                            "rep_name": rep_name_val or "",
+                            "description": description_val or "",
+                            "listing": listing_val or "",
+                            "revenue": revenue_val or "",
+                            "profit": profit_val or "",
+                            "capital": capital_val or "",
+                            "fiscal_month": fiscal_val or "",
+                            "founded_year": founded_val or "",
+                            "phone_source": phone_source or "",
+                            "address_source": address_source or "",
+                            "ai_used": int(ai_used or 0),
+                            "ai_model": ai_model or "",
+                            "extract_confidence": confidence,
+                            "source_url_phone": src_phone or "",
+                            "source_url_address": src_addr or "",
+                            "source_url_rep": src_rep or "",
+                            "homepage_official_flag": 0,
+                            "homepage_official_source": "",
+                            "homepage_official_score": 0.0,
+                            "address_confidence": address_ai_confidence,
+                            "address_evidence": address_ai_evidence,
+                            "deep_pages_visited": 0,
+                            "deep_fetch_count": 0,
+                            "deep_fetch_failures": 0,
+                            "deep_skip_reason": f"{skip_reason}:no_official".strip(":"),
+                            "deep_urls_visited": "[]",
+                            "deep_phone_candidates": 0,
+                            "deep_address_candidates": 0,
+                            "deep_rep_candidates": 0,
+                        }
+                    )
+                    manager.save_company_data(company, status="no_homepage")
+                    timeout_saved = True
+                except Exception:
+                    log.warning("[%s] no_homepage save failed", cid, exc_info=True)
+
             fatal_error = False
+            skip_company_reason = ""
             try:
                 try:
                     candidate_limit = SEARCH_CANDIDATE_LIMIT
@@ -1737,6 +1881,51 @@ async def process():
                         if ai_tasks:
                             await asyncio.gather(*ai_tasks, return_exceptions=True)
 
+                        # AI公式が複数出るケースに備え、AI判定が強い候補を先に評価する
+                        def _ai_select_score(rec: dict[str, Any]) -> float:
+                            aj = rec.get("ai_judge") or {}
+                            if not isinstance(aj, dict):
+                                aj = {}
+                            ai_is = aj.get("is_official_site")
+                            if ai_is is None:
+                                ai_is = aj.get("is_official")
+                            conf = aj.get("official_confidence")
+                            if conf is None:
+                                conf = aj.get("confidence")
+                            try:
+                                conf_f = float(conf) if conf is not None else 0.0
+                            except Exception:
+                                conf_f = 0.0
+                            rd = rec.get("rule") or {}
+                            evidence = float(rd.get("official_evidence_score") or 0.0)
+                            domain = float(rec.get("domain_score") or 0.0)
+                            directory_like = bool(rd.get("directory_like"))
+                            host_token_hit = bool(rec.get("host_token_hit"))
+                            strong_domain_host = bool(rec.get("strong_domain_host"))
+                            name_present = bool(rd.get("name_present"))
+                            # 公式と判定されたものを優先しつつ、低confは過信しない
+                            score = 0.0
+                            if ai_is is True and conf_f >= AI_VERIFY_MIN_CONFIDENCE:
+                                score += 1000.0 + conf_f * 100.0
+                            elif ai_is is True:
+                                score += conf_f * 10.0
+                            elif ai_is is False:
+                                score -= 200.0
+                            score += domain * 5.0 + evidence * 2.0
+                            score += 20.0 if host_token_hit else 0.0
+                            score += 12.0 if strong_domain_host else 0.0
+                            score += 10.0 if name_present else 0.0
+                            score -= 500.0 if directory_like else 0.0
+                            return score
+
+                        candidate_records.sort(
+                            key=lambda r: (
+                                -_ai_select_score(r),
+                                int(r.get("search_rank", 1_000_000_000) or 1_000_000_000),
+                                int(r.get("order_idx", 1_000_000_000) or 1_000_000_000),
+                            )
+                        )
+
                     for record in candidate_records:
                         normalized_url = record.get("normalized_url") or record.get("url")
                         extracted = record.get("extracted") or {}
@@ -2102,6 +2291,10 @@ async def process():
                     provisional_name_present = False
                     provisional_address_ok = False
                     best_record: dict[str, Any] | None = None
+                    # 候補が全滅（公式として採用できない）なら、以降の深掘り/補完は行わず次へ進む
+                    if not homepage:
+                        skip_company_reason = "no_official_in_top3"
+                        raise SkipCompany(skip_company_reason)
                     if not homepage and candidate_records:
                         best_score = float("-inf")
                         for record in candidate_records:
@@ -3199,6 +3392,8 @@ async def process():
                         company["description"] = company.get("description", "") or ""
                         confidence = 0.4
 
+                except SkipCompany:
+                    raise
                 except HardTimeout:
                     raise
                 except Exception:
@@ -3208,6 +3403,10 @@ async def process():
                     if fatal_error:
                         pass
                     else:
+                        if skip_company_reason:
+                            save_no_homepage(skip_company_reason)
+                            # SkipCompany を上位へ伝播させて次の会社へ（以降の補完/深掘りは行わない）
+                            raise SkipCompany(skip_company_reason)
                         # 公式サイトが無い場合のみ、検索結果の非公式ページから連絡先を補完
                         if not homepage and (not phone or not found_address or not rep_name_val):
                             for url, data in fallback_cands:
@@ -3501,6 +3700,16 @@ async def process():
 
                         processed += 1
 
+            except SkipCompany:
+                # save_no_homepage() が保存済み（エラー扱いにしない）
+                try:
+                    log.info("[%s] 候補が全滅のため次へ (worker=%s)", cid, WORKER_ID)
+                    if csv_writer:
+                        csv_writer.writerow({k: company.get(k, "") for k in CSV_FIELDNAMES})
+                        csv_file.flush()
+                    processed += 1
+                except Exception:
+                    pass
             except HardTimeout:
                 # 60秒超え等で打ち切り：ここまでに分かっている情報を保存して次へ
                 try:

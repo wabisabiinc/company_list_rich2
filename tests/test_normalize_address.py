@@ -29,3 +29,8 @@ def test_normalize_address_strips_employee_and_permit_tail():
 def test_normalize_address_strips_leading_label():
     raw = "住所：〒671-2232 兵庫県姫路市御国野町御着86-6"
     assert normalize_address(raw) == "〒671-2232 兵庫県姫路市御国野町御着86-6"
+
+
+def test_normalize_address_strips_broken_html_tag_fragments():
+    raw = "〒151-0053 東京都渋谷区代々木2丁目28番12号 <div class=\\\"x\\\""
+    assert normalize_address(raw) == "〒151-0053 東京都渋谷区代々木2丁目28番12号"
