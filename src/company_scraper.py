@@ -546,8 +546,20 @@ class CompanyScraper:
         self.search_cache: Dict[tuple[str, str], List[str]] = {}
         # 共有 HTTP セッションでコネクションを再利用し、検索/HTTP取得のレイテンシを抑える
         self.http_session: Optional[requests.Session] = requests.Session()
-        # 検索エンジンは DuckDuckGo に固定（Bing は使わない）
-        self.search_engines: list[str] = ["ddg"]
+        # 検索エンジン（環境変数 SEARCH_ENGINES=ddg,bing 等で指定。既定は ddg）
+        raw_engines = os.getenv("SEARCH_ENGINES", "ddg")
+        engines: list[str] = []
+        for part in (raw_engines or "").replace(" ", ",").split(","):
+            token = (part or "").strip().lower()
+            if not token:
+                continue
+            if token in {"duckduckgo", "ddg"}:
+                token = "ddg"
+            if token not in {"ddg", "bing"}:
+                continue
+            if token not in engines:
+                engines.append(token)
+        self.search_engines = engines or ["ddg"]
         # ブラウザ操作専用セマフォ（HTTPとは別枠で制御し渋滞を防ぐ）
         self.browser_concurrency = max(1, int(os.getenv("BROWSER_CONCURRENCY", "1")))
         self._browser_sem: asyncio.Semaphore | None = None
@@ -3379,11 +3391,27 @@ class CompanyScraper:
                 href or "",
             ]).lower()
             score = 0
+            # 会社概要導線は deep の最優先（URL文字列に頼らず、リンクテキスト/タイトルも重視）
+            profile_text_keywords = (
+                "会社概要", "会社情報", "企業情報", "企業概要", "会社案内", "法人概要", "概要",
+                "profile", "outline", "overview", "company profile", "corporate profile",
+            )
+            business_text_keywords = (
+                "事業内容", "事業紹介", "サービス", "Business", "Service", "Products", "Solutions",
+            )
+            token_low = token.lower()
+            profile_hit = any(kw.lower() in token_low for kw in profile_text_keywords)
+            business_hit = (not profile_hit) and any(kw.lower() in token_low for kw in business_text_keywords)
+
             # 欠損フィールドに応じて対象カテゴリを限定（Noneなら全部）
             include_contact = (not target_types) or ("contact" in target_types)
             include_about = (not target_types) or ("about" in target_types)
             include_finance = (not target_types) or ("finance" in target_types)
 
+            if profile_hit:
+                score += 20
+            elif business_hit:
+                score += 8
             if include_about:
                 for kw in PRIORITY_SECTION_KEYWORDS:
                     if kw in token:
@@ -3399,7 +3427,11 @@ class CompanyScraper:
                 continue
             for path_kw in PRIORITY_PATHS:
                 if path_kw.lower() in (parsed.path or "").lower():
-                    score += 2
+                    # /company /about 等の「会社概要系」パスは強めに加点
+                    if path_kw.lower() in ("/company", "/about", "/corporate", "/profile", "/overview", "/outline"):
+                        score += 8
+                    else:
+                        score += 2
                     break
             depth = parsed.path.count("/")
             text_len = len(anchor.get_text(strip=True) or "")
@@ -3709,15 +3741,20 @@ class CompanyScraper:
             if kw.lower() in text_low:
                 label_hits += 1
 
+        is_profile_heading = any(kw in head_low for kw in (k.lower() for k in profile_kw))
+        is_profile_path = any(seg in (url.lower()) for seg in ("/company", "/about", "/corporate", "/profile", "/overview", "/outline"))
+        has_hq_marker = ("本社所在地" in text_nfkc) or ("本店所在地" in text_nfkc) or ("本社" in text_nfkc) or ("本店" in text_nfkc)
+
         # BASES_LIST: 住所/拠点が多数並ぶページ
         zip_count = len(re.findall(r"\d{3}[-‐―－ー]?\d{4}", text_nfkc))
         branch_hits = sum(1 for kw in bases_kw if kw.lower() in text_low)
         pref_count = len(set(PREFECTURE_NAME_RE.findall(text_nfkc)))
-        if ("拠点一覧" in head_all) or ("店舗一覧" in head_all) or ("営業所一覧" in head_all) or zip_count >= 3 or pref_count >= 6 or branch_hits >= 6:
+        is_bases_like = ("拠点一覧" in head_all) or ("店舗一覧" in head_all) or ("営業所一覧" in head_all) or zip_count >= 3 or pref_count >= 6 or branch_hits >= 6
+        if is_bases_like:
+            # 拠点一覧に見えても「会社概要(本社所在地など)」が同ページに強く載っている場合はプロフィール扱いに寄せる
+            if (is_profile_heading or is_profile_path) and has_table_or_dl and label_hits >= 4 and has_hq_marker:
+                return {"page_type": "COMPANY_PROFILE", "score": label_hits, "reason": "bases_list_with_profile_signals"}
             return {"page_type": "BASES_LIST", "score": max(zip_count, pref_count, branch_hits), "reason": "bases_list_signals"}
-
-        is_profile_heading = any(kw in head_low for kw in (k.lower() for k in profile_kw))
-        is_profile_path = any(seg in (url.lower()) for seg in ("/company", "/about", "/corporate", "/profile", "/overview", "/outline"))
         if (is_profile_heading or is_profile_path) and has_table_or_dl and label_hits >= 4:
             return {"page_type": "COMPANY_PROFILE", "score": label_hits, "reason": "profile_heading+labels"}
         if is_profile_heading and label_hits >= 3:
@@ -4117,7 +4154,8 @@ class CompanyScraper:
                             # FAX専用行は代表電話候補として扱わない
                             continue
                         value_nfkc = unicodedata.normalize("NFKC", raw_value)
-                        fax_pos = re.search(r"(FAX|ファックス|ﾌｧｯｸｽ)", value_nfkc, re.I) if label_has_fax else None
+                        # 値側に "FAX" が混在するケースが多いので、ラベルにFAXが無くても分割して捨てられるようにする
+                        fax_pos = re.search(r"(FAX|ファックス|ﾌｧｯｸｽ)", value_nfkc, re.I)
                         tel_part = value_nfkc[: fax_pos.start()] if fax_pos else value_nfkc
                         fax_part = value_nfkc[fax_pos.start():] if fax_pos else ""
                         def _emit(part: str, is_fax: bool) -> None:
@@ -4141,7 +4179,8 @@ class CompanyScraper:
                         if norm_addr and self.looks_like_address(norm_addr):
                             prefix = "[TABLE]" if is_table_pair else "[LABEL]"
                             hq_labels = ("本社", "本店", "本社所在地", "本店所在地", "所在地(本社)")
-                            if any(h in norm_label for h in hq_labels):
+                            value_nfkc = unicodedata.normalize("NFKC", raw_value)
+                            if any(h in norm_label for h in hq_labels) or bool(re.search(r"(本社|本店)\s*[:：]?", value_nfkc)):
                                 prefix += "[HQ]"
                             addrs.append(f"{prefix}{norm_addr}")
                             matched = True

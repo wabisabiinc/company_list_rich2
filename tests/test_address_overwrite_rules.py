@@ -88,6 +88,38 @@ def test_address_overwritten_on_pref_mismatch_with_strong_hq_evidence(tmp_path):
     finally:
         manager.close()
 
+def test_address_overwritten_on_pref_mismatch_when_env_allows_and_official_strong(tmp_path, monkeypatch):
+    monkeypatch.setenv("ADDRESS_ALLOW_PREF_MISMATCH_OVERWRITE", "true")
+    db_path = str(tmp_path / "t.db")
+    manager = DatabaseManager(db_path=db_path, worker_id=None)
+    try:
+        manager.conn.execute(
+            "INSERT INTO companies (id, company_name, address, status) VALUES (?,?,?,?)",
+            (1, "テスト株式会社", "東京都", "pending"),
+        )
+        manager.conn.commit()
+
+        company = _fetch_one(db_path, "SELECT * FROM companies WHERE id=1")
+        assert company is not None
+        company.update(
+            {
+                "homepage_official_flag": 1,
+                "homepage_official_score": 5.0,
+                "address_source": "rule",
+                "found_address": "〒530-0001 大阪府大阪市北区梅田1-1-1",
+                "source_url_address": "https://example.co.jp/company/overview",
+            }
+        )
+
+        manager.save_company_data(company, status="done")
+
+        updated = _fetch_one(db_path, "SELECT address, status, address_conflict_level FROM companies WHERE id=1")
+        assert "大阪府" in (updated["address"] or "")
+        assert updated["status"] == "done"
+        assert updated["address_conflict_level"] == "pref_mismatch_overwritten"
+    finally:
+        manager.close()
+
 
 def test_address_not_overwritten_when_found_missing_prefecture(tmp_path):
     db_path = str(tmp_path / "t.db")

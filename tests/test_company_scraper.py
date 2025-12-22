@@ -33,6 +33,12 @@ def scraper():
     sc.http_session = None  # テストでは requests.get のモックを使う
     return sc
 
+
+def test_search_engines_env_parsing(monkeypatch):
+    monkeypatch.setenv("SEARCH_ENGINES", "duckduckgo,bing,unknown,DDG")
+    sc = CompanyScraper(headless=True)
+    assert sc.search_engines == ["ddg", "bing"]
+
 @pytest.mark.asyncio
 @patch("src.company_scraper.requests.get")
 async def test_search_company_filters_and_resolves(mock_get, scraper):

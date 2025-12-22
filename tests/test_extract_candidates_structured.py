@@ -36,3 +36,30 @@ def test_extract_candidates_footer_tel_and_tel_link():
     """
     cc = scraper.extract_candidates(text="", html=html)
     assert pick_best_phone(cc.get("phone_numbers") or []) == "03-6667-5800"
+
+
+def test_extract_candidates_table_tel_fax_mixed_value_without_fax_label_keeps_tel():
+    scraper = CompanyScraper(headless=True)
+    html = """
+    <html><body>
+      <table>
+        <tr><th>電話番号</th><td>TEL:03-1234-5678 / FAX:03-1111-2222</td></tr>
+      </table>
+    </body></html>
+    """
+    cc = scraper.extract_candidates(text="", html=html)
+    assert pick_best_phone(cc.get("phone_numbers") or []) == "03-1234-5678"
+
+
+def test_extract_candidates_address_hq_tag_detected_from_value_prefix():
+    scraper = CompanyScraper(headless=True)
+    html = """
+    <html><body>
+      <table>
+        <tr><th>所在地</th><td>本社: 〒100-0001 東京都千代田区千代田1-1</td></tr>
+        <tr><th>TEL</th><td>03-1234-5678</td></tr>
+      </table>
+    </body></html>
+    """
+    cc = scraper.extract_candidates(text="", html=html)
+    assert any("[HQ]" in a for a in (cc.get("addresses") or []))

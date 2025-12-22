@@ -317,6 +317,9 @@ class DatabaseManager:
         if "provisional_homepage" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN provisional_homepage TEXT;")
             cols.add("provisional_homepage")
+        if "provisional_reason" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN provisional_reason TEXT;")
+            cols.add("provisional_reason")
         if "final_homepage" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN final_homepage TEXT;")
             cols.add("final_homepage")
@@ -813,6 +816,18 @@ class DatabaseManager:
                     and phone_same_page
                     and _page_type_ok(src_url_addr)
                 )
+                # 追加オプション：CSV住所が誤っているケース救済（危険なのでデフォルト無効）
+                # - 公式採用（strong_official）で、HP側住所が郵便番号+市区町村を含むなど十分に具体的
+                # - 取得元URLが会社概要系（_page_type_ok）で、CSV側が情報不足（郵便番号/市区町村が欠ける等）
+                allow_pref_mismatch = os.getenv("ADDRESS_ALLOW_PREF_MISMATCH_OVERWRITE", "false").lower() == "true"
+                if not allow_overwrite and allow_pref_mismatch and strong_official and _page_type_ok(src_url_addr):
+                    found_has_zip = bool(re.search(r"\d{3}-\d{4}", found_addr))
+                    found_has_city = bool(re.search(r"(\u5e02|\u533a|\u753a|\u6751|\u90e1)", found_addr))
+                    base_has_zip = bool(re.search(r"\d{3}-\d{4}", baseline_address))
+                    base_has_city = bool(re.search(r"(\u5e02|\u533a|\u753a|\u6751|\u90e1)", baseline_address))
+                    if found_has_zip and found_has_city and (phone_same_page or addr_source in {"rule", "official"}):
+                        if (not base_has_zip or not base_has_city) or (len(found_addr) >= len(baseline_address) + 6):
+                            allow_overwrite = True
                 if not allow_overwrite:
                     review_reason = "pref_mismatch_no_strong_hq_evidence"
                     if status == "done":
@@ -868,6 +883,7 @@ class DatabaseManager:
         set_value("exclude_reasons", company.get("exclude_reasons", "") or "")
         set_value("skip_reason", company.get("skip_reason", "") or "")
         set_value("provisional_homepage", company.get("provisional_homepage", "") or "")
+        set_value("provisional_reason", company.get("provisional_reason", "") or "")
         set_value("final_homepage", company.get("final_homepage", "") or "")
         set_value("deep_enabled", company.get("deep_enabled"))
         set_value("deep_stop_reason", company.get("deep_stop_reason", "") or "")
