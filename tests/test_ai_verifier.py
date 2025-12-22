@@ -74,6 +74,7 @@ async def test_judge_official_homepage_parses_json():
         "is_official": True,
         "confidence": 0.85,
         "reason": "ドメイン一致",
+        "description": "法人向けの業務支援システムを開発・提供する企業です。",
     }
     verifier = AIVerifier(model=DummyModel(fake_json))
     result = await verifier.judge_official_homepage("text", b"", "Example", "Tokyo", "https://example.com")
@@ -82,3 +83,4 @@ async def test_judge_official_homepage_parses_json():
     assert abs(result["confidence"] - 0.85) < 1e-6
     assert result["is_official_site"] is True
     assert abs(result["official_confidence"] - 0.85) < 1e-6
+    assert isinstance(result.get("description"), str)

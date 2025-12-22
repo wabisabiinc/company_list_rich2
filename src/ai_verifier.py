@@ -586,11 +586,15 @@ class AIVerifier:
             "以下を根拠に、true/false と理由、信頼度(0-1)をJSONのみで出力してください。説明やマークダウンは禁止。\n"
             "出力フォーマット:\n"
             "{\\\"is_official\\\": true/false, \\\"confidence\\\": 0.0-1.0, \\\"reason\\\": \"簡潔な根拠\","
-            " \\\"is_official_site\\\": true/false, \\\"official_confidence\\\": 0.0-1.0, \\\"official_evidence\\\": [\"根拠\", ...]}\n"
+            " \\\"is_official_site\\\": true/false, \\\"official_confidence\\\": 0.0-1.0, \\\"official_evidence\\\": [\"根拠\", ...],"
+            " \\\"description\\\": \"事業内容の要約(60〜120文字・日本語1文)\" または null}\n"
             "判断基準:\n"
             "- 企業名・所在地・サービス内容の一致を確認。\n"
             "- 口コミ/求人/まとめサイト・予約サイトは false。\n"
             "- URLが企業ドメインや自治体/学校の公式ドメインなら true に寄せる。\n"
+            "description のルール:\n"
+            "- 事業内容だけを60〜120文字の日本語1文で要約（推測せず、根拠が弱ければ null）\n"
+            "- 禁止: URL/メール/電話番号/住所/採用/問い合わせ/アクセス/代表者情報\n"
             f"企業名: {company_name}\n住所: {address}\n候補URL: {url}\n本文抜粋:\n{snippet}\n"
         )
         def _build_content(use_image: bool) -> list[Any]:
@@ -649,6 +653,11 @@ class AIVerifier:
                 official_evidence_list = [str(x) for x in official_evidence if str(x).strip()][:8]
             else:
                 official_evidence_list = [reason] if reason else []
+            desc = result.get("description")
+            if isinstance(desc, str):
+                desc = self._validate_description(desc)
+            else:
+                desc = None
             return {
                 "is_official": bool(verdict),
                 "confidence": confidence,
@@ -656,6 +665,7 @@ class AIVerifier:
                 "is_official_site": bool(is_official_site),
                 "official_confidence": official_confidence,
                 "official_evidence": official_evidence_list,
+                "description": desc,
             }
         except Exception as exc:  # pylint: disable=broad-except
             log.warning(f"judge_official_homepage failed for {company_name} ({url}) with image: {exc}")
@@ -700,6 +710,11 @@ class AIVerifier:
                 official_evidence_list = [str(x) for x in official_evidence if str(x).strip()][:8]
             else:
                 official_evidence_list = [reason] if reason else []
+            desc = result.get("description")
+            if isinstance(desc, str):
+                desc = self._validate_description(desc)
+            else:
+                desc = None
             return {
                 "is_official": bool(verdict),
                 "confidence": confidence,
@@ -707,4 +722,5 @@ class AIVerifier:
                 "is_official_site": bool(is_official_site),
                 "official_confidence": official_confidence,
                 "official_evidence": official_evidence_list,
+                "description": desc,
             }

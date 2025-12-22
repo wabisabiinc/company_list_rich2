@@ -114,6 +114,26 @@ def test_is_likely_official_site_false(scraper):
         {"text": text},
     )
 
+@pytest.mark.asyncio
+@patch("src.company_scraper.requests.get")
+async def test_search_company_prefetch_excludes_directory_like_urls(mock_get, scraper):
+    html = """
+    <html><body>
+      <a class="result__a" href="https://some-directory.example.com/company/12345">Dir</a>
+      <a class="result__a" href="https://some-directory.example.com/detail?corporate_number=1234567890123">Dir2</a>
+      <a class="result__a" href="https://example.co.jp/company/overview">Official</a>
+    </body></html>
+    """
+    mock_response = MagicMock()
+    mock_response.text = html
+    mock_response.raise_for_status.return_value = None
+    mock_get.return_value = mock_response
+
+    urls = await scraper.search_company("社名", "住所", num_results=10)
+    assert "https://example.co.jp/company/overview" in urls
+    assert not any("some-directory.example.com/company/12345" in u for u in urls)
+    assert not any("some-directory.example.com/detail" in u for u in urls)
+
 
 def test_is_likely_official_site_romaji(scraper):
     text = "会社概要とお問い合わせ"
@@ -185,6 +205,11 @@ def test_extract_candidates_keeps_full_rep_name(scraper):
     text = "会社概要\n代表取締役会長　飯野　靖司\n所在地 東京都千代田区"
     cands = scraper.extract_candidates(text)
     assert any(name.replace(" ", "") == "飯野靖司" for name in cands["rep_names"])
+
+def test_extract_candidates_rep_name_then_role(scraper):
+    text = "役員紹介\n平野井 順一\n代表取締役社長\n所在地 東京都千代田区"
+    cands = scraper.extract_candidates(text)
+    assert any(name.replace(" ", "") == "平野井順一" for name in cands["rep_names"])
 
 
 def test_extract_candidates_finance_inline_variations(scraper):

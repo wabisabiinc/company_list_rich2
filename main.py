@@ -55,6 +55,7 @@ load_dotenv()
 # --------------------------------------------------
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 USE_AI = os.getenv("USE_AI", "true").lower() == "true"
+USE_AI_DESCRIPTION = os.getenv("USE_AI_DESCRIPTION", "false").lower() == "true"
 WORKER_ID = os.getenv("WORKER_ID", "w1")  # 並列識別子
 COMPANIES_DB_PATH = os.getenv("COMPANIES_DB_PATH", "data/companies.db")
 
@@ -126,6 +127,7 @@ CSV_FIELDNAMES = [
     "listing", "revenue", "profit", "capital", "fiscal_month", "founded_year"
 ]
 PHASE_METRICS_PATH = os.getenv("PHASE_METRICS_PATH", "logs/phase_metrics.csv")
+NO_OFFICIAL_LOG_PATH = os.getenv("NO_OFFICIAL_LOG_PATH", "logs/no_official.jsonl")
 
 REFERENCE_CHECKER: ReferenceChecker | None = None
 if REFERENCE_CSVS:
@@ -882,6 +884,16 @@ def build_ai_text_payload(*blocks: str) -> str:
     joined = "\n\n".join(payloads)
     return joined[:4000]
 
+def append_jsonl(path: str, payload: dict[str, Any]) -> None:
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        log.debug("append_jsonl failed: %s", path, exc_info=True)
+
 def build_official_ai_text(text: str, html: str) -> str:
     """
     AI公式判定向けに、1回fetch済みの text/html から根拠を落としにくい形で短文化する。
@@ -1282,6 +1294,7 @@ async def process():
                     homepage_official_flag = 0
                     homepage_official_source = ""
                     homepage_official_score = 0.0
+                    ai_official_description: str | None = None
                     force_review = False
                     ai_time_spent = 0.0
                     chosen_domain_score = 0
@@ -1751,6 +1764,7 @@ async def process():
                                 homepage_official_flag = 1
                                 homepage_official_source = "ai_fast" if fast_domain_ok else "ai_review"
                                 homepage_official_score = float(rule_details.get("score") or 0.0)
+                                ai_official_description = ai_judge.get("description") if isinstance(ai_judge, dict) else None
                                 chosen_domain_score = domain_score
                                 selected_candidate_record = record
                                 if not fast_domain_ok or (addr and not address_ok):
@@ -2436,6 +2450,13 @@ async def process():
                         need_description = False
                         return True
 
+                    # AI公式採用のときは、同じAI呼び出し(judge_official_homepage)で生成された description を優先採用する
+                    if homepage_official_source.startswith("ai") and isinstance(ai_official_description, str) and ai_official_description.strip():
+                        prev_desc = description_val
+                        description_val = ""
+                        if not update_description_candidate(ai_official_description):
+                            description_val = prev_desc
+
                     if homepage and info_dict:
                         absorb_doc_data(info_url, info_dict)
 
@@ -2746,7 +2767,7 @@ async def process():
                         if ai_attempted and AI_COOLDOWN_SEC > 0:
                             await asyncio.sleep(jittered_seconds(AI_COOLDOWN_SEC, JITTER_RATIO))
                     missing_contact, missing_extra = refresh_need_flags()
-                    if need_description and verifier is not None and info_dict and not timed_out and has_time_for_ai():
+                    if need_description and USE_AI_DESCRIPTION and verifier is not None and info_dict and not timed_out and has_time_for_ai():
                         desc_source = select_relevant_paragraphs(info_dict.get("text", "") or "")
                         try:
                             ai_desc = await asyncio.wait_for(
@@ -2846,7 +2867,7 @@ async def process():
                                         update_description_candidate(desc2)
 
                         missing_contact, missing_extra = refresh_need_flags()
-                        if need_description and verifier is not None and has_time_for_ai():
+                        if need_description and USE_AI_DESCRIPTION and verifier is not None and has_time_for_ai():
                             combined_sources = [select_relevant_paragraphs(v.get("text", "") or "") for v in priority_docs.values()]
                             combined_text = build_ai_text_payload(*combined_sources)
                             screenshot_payload = (info_dict or {}).get("screenshot") if info_dict else None
@@ -3289,6 +3310,43 @@ async def process():
                                 homepage_official_source = ""
                                 homepage_official_score = 0.0
                                 chosen_domain_score = 0
+
+                        if not homepage:
+                            top3_urls = list(urls or [])[:3]
+                            top3_records = sorted(candidate_records or [], key=lambda r: r.get("search_rank", 1e9))[:3]
+                            all_directory_like = bool(top3_records) and all(bool((r.get("rule") or {}).get("directory_like")) for r in top3_records)
+                            if not top3_urls:
+                                skip_reason = "no_search_results_or_prefiltered"
+                            elif all_directory_like:
+                                skip_reason = "top3_all_directory_like"
+                            else:
+                                skip_reason = "no_official_in_top3"
+                            if not (company.get("error_code") or "").strip():
+                                company["error_code"] = skip_reason
+                            append_jsonl(
+                                NO_OFFICIAL_LOG_PATH,
+                                {
+                                    "id": cid,
+                                    "company_name": name,
+                                    "csv_address": addr,
+                                    "skip_reason": skip_reason,
+                                    "top3_urls": top3_urls,
+                                    "top3_candidates": [
+                                        {
+                                            "url": (r.get("normalized_url") or r.get("url") or ""),
+                                            "search_rank": int(r.get("search_rank") or 0),
+                                            "domain_score": int(r.get("domain_score") or 0),
+                                            "rule_score": float(((r.get("rule") or {}).get("score")) or 0.0),
+                                            "directory_like": bool((r.get("rule") or {}).get("directory_like")),
+                                            "directory_score": int((r.get("rule") or {}).get("directory_score") or 0),
+                                            "directory_reasons": list((r.get("rule") or {}).get("directory_reasons") or [])[:8],
+                                            "blocked_host": bool((r.get("rule") or {}).get("blocked_host")),
+                                            "prefecture_mismatch": bool((r.get("rule") or {}).get("prefecture_mismatch")),
+                                        }
+                                        for r in top3_records
+                                    ],
+                                },
+                            )
 
                         status = "done" if homepage else "no_homepage"
                         if timed_out:

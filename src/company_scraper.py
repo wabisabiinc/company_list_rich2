@@ -457,13 +457,22 @@ class CompanyScraper:
         "sales promotion", "booking", "reservation", "hotel", "travel", "camp",
     )
     # 企業DB/ディレクトリ系の強いシグナル（URLパス＋本文）
+    CORPORATE_NUMBER_RE = re.compile(r"(?<!\d)\d{13}(?!\d)")
     DIRECTORY_URL_PATTERNS = (
-        re.compile(r"/companies/\\d+(?:/|$)", re.IGNORECASE),
-        re.compile(r"/company/\\d+(?:/|$)", re.IGNORECASE),
-        re.compile(r"/detail/\\d+(?:/|$)", re.IGNORECASE),
+        re.compile(r"/companies/\d+(?:/|$)", re.IGNORECASE),
+        re.compile(r"/company/\d+(?:/|$)", re.IGNORECASE),
+        re.compile(r"/detail/\d+(?:/|$)", re.IGNORECASE),
         re.compile(r"/(?:directory|listing|db)(?:/|$)", re.IGNORECASE),
         re.compile(r"/search(?:/|$)", re.IGNORECASE),
     )
+    # URLだけで高精度に企業DB/ディレクトリを疑えるパターン（prefetch用）
+    DIRECTORY_URL_PATTERNS_STRONG = (
+        re.compile(r"/(?:companies|company|corp|corporation|detail)/\d+(?:/|$)", re.IGNORECASE),
+        re.compile(r"/(?:companies|company|corp|corporation|detail)/\d{13}(?:/|$)", re.IGNORECASE),
+        re.compile(r"/\d{13}(?:/|$)", re.IGNORECASE),
+    )
+    DIRECTORY_QUERY_ID_KEYS = ("company_id", "companyid", "cid", "id", "detail_id", "detailid")
+    DIRECTORY_QUERY_CORP_KEYS = ("corporate_number", "corporatenumber", "hojin_no", "houjin_no", "hojinbango", "corporateno")
     DIRECTORY_TEXT_KEYWORDS_STRONG = (
         "掲載企業",
         "掲載情報",
@@ -1287,8 +1296,17 @@ class CompanyScraper:
         return score
 
     def _is_excluded(self, url: str) -> bool:
-        lowered = url.lower()
-        return any(ex in lowered for ex in self.EXCLUDE_DOMAINS)
+        lowered = (url or "").lower()
+        if any(ex in lowered for ex in self.EXCLUDE_DOMAINS):
+            return True
+        # fetch前に企業DB/ディレクトリ臭が強いURLを弾く（多少の未取得は許容、誤爆回避優先）
+        try:
+            directory = self._detect_directory_like(url or "", text="", html="")
+            if directory.get("is_directory_like"):
+                return True
+        except Exception:
+            pass
+        return False
 
     def _clean_candidate_url(self, raw: str) -> Optional[str]:
         if not raw:
@@ -1587,6 +1605,12 @@ class CompanyScraper:
             query = parsed.query or ""
         path_lower = (path or "").lower()
 
+        for pat in cls.DIRECTORY_URL_PATTERNS_STRONG:
+            if pat.search(path_lower):
+                score += 10
+                reasons.append(f"url_strong:{pat.pattern}")
+                break
+
         for pat in cls.DIRECTORY_URL_PATTERNS:
             if pat.search(path_lower):
                 score += 8
@@ -1595,15 +1619,29 @@ class CompanyScraper:
 
         if query:
             qs = parse_qs(query)
-            for key in ("company_id", "companyid", "cid", "id", "detail_id", "detailid"):
+            for key in cls.DIRECTORY_QUERY_CORP_KEYS:
                 vals = qs.get(key)
                 if not vals:
                     continue
                 v0 = (vals[0] or "").strip()
-                if re.fullmatch(r"\\d{2,}", v0):
+                if cls.CORPORATE_NUMBER_RE.fullmatch(v0):
+                    score += 10
+                    reasons.append(f"query:{key}={v0}")
+                    break
+            for key in cls.DIRECTORY_QUERY_ID_KEYS:
+                vals = qs.get(key)
+                if not vals:
+                    continue
+                v0 = (vals[0] or "").strip()
+                if re.fullmatch(r"\d{2,}", v0):
                     score += 4
                     reasons.append(f"query:{key}={v0}")
                     break
+
+        corp_in_path = cls.CORPORATE_NUMBER_RE.search(path_lower or "")
+        if corp_in_path:
+            score += 10
+            reasons.append(f"path:corp={corp_in_path.group(0)}")
 
         sample_text = (text or "")
         if not sample_text and html:
@@ -1626,7 +1664,7 @@ class CompanyScraper:
         # 多数の企業リンクがある（/companies/ 等）場合はディレクトリUIとみなす
         if html:
             try:
-                hits = len(re.findall(r"href=[\"'][^\"']*(?:/companies/|/company/|/detail/)\\d+", html, flags=re.I))
+                hits = len(re.findall(r"href=[\"'][^\"']*(?:/companies/|/company/|/detail/)\d+", html, flags=re.I))
             except Exception:
                 hits = 0
             if hits >= 4:
@@ -3537,6 +3575,19 @@ class CompanyScraper:
             )
             for m in rep_kw_pattern.finditer(text or ""):
                 name_cand = m.group(2)
+                cleaned = self.clean_rep_name(name_cand)
+                if cleaned:
+                    reps.append(cleaned)
+
+        # 追加の代表者抽出: 氏名 → 役職 の並び（カードUI等）に対応
+        if not reps:
+            rep_name_then_role_pattern = re.compile(
+                r"([一-龥]{2,5}(?:\s*[一-龥]{2,5})?)"
+                r"[\s\u3000\r\n]{0,8}"
+                r"(代表取締役社長|代表取締役会長|代表取締役|代表執行役社長|代表執行役|代表理事長|代表理事|代表社員|代表者|代表)"
+            )
+            for m in rep_name_then_role_pattern.finditer(text or ""):
+                name_cand = m.group(1)
                 cleaned = self.clean_rep_name(name_cand)
                 if cleaned:
                     reps.append(cleaned)
