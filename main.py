@@ -63,8 +63,16 @@ load_dotenv()
 # --------------------------------------------------
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 USE_AI = os.getenv("USE_AI", "true").lower() == "true"
-# AI公式判定（上位3件のみ）。従来どおり公式採用に使うためデフォルト有効。
+# AI公式判定。デフォルトは候補URLを広く判定し、公式採用の最終判断をAI優先にする。
 USE_AI_OFFICIAL = os.getenv("USE_AI_OFFICIAL", "true").lower() == "true"
+# AI公式判定の対象範囲（true: 候補を広く / false: 従来どおり上位3件のみ）
+AI_OFFICIAL_ALL_CANDIDATES = os.getenv("AI_OFFICIAL_ALL_CANDIDATES", "true").lower() == "true"
+# AI公式判定が使える場合、公式採用の最終判断をAI優先にする
+AI_OFFICIAL_PRIMARY = os.getenv("AI_OFFICIAL_PRIMARY", "true").lower() == "true"
+# AI公式判定の候補数上限（0以下で無制限）
+AI_OFFICIAL_CANDIDATE_LIMIT = int(os.getenv("AI_OFFICIAL_CANDIDATE_LIMIT", "0"))
+# AI公式判定の同時実行数（API/モデル負荷対策）
+AI_OFFICIAL_CONCURRENCY = max(1, int(os.getenv("AI_OFFICIAL_CONCURRENCY", "2")))
 # description はAIで常時生成（verify_infoで同時生成）。追加の説明専用AI呼び出しを有効にしたい場合のみ true。
 USE_AI_DESCRIPTION = os.getenv("USE_AI_DESCRIPTION", "false").lower() == "true"
 WORKER_ID = os.getenv("WORKER_ID", "w1")  # 並列識別子
@@ -1119,6 +1127,12 @@ def clean_founded_year(val: str) -> str:
 
 
 def record_needs_official_ai(record: dict[str, Any]) -> bool:
+    if AI_OFFICIAL_ALL_CANDIDATES:
+        rule_details = record.get("rule") or {}
+        # 企業DB/ディレクトリ臭が強いものはAIコストを掛けない
+        if rule_details.get("directory_like"):
+            return False
+        return True
     if record.get("force_ai_official"):
         return True
     rule_details = record.get("rule") or {}
@@ -1505,12 +1519,12 @@ async def process():
                         "deep_fetch_count": int(deep_fetch_count or 0),
                         "deep_fetch_failures": int(deep_fetch_failures or 0),
                         "deep_skip_reason": company.get("deep_skip_reason", "") or deep_skip_reason or "",
-	                        "deep_urls_visited": json.dumps(list(deep_urls_visited or [])[:5], ensure_ascii=False),
-	                        "deep_phone_candidates": int(deep_phone_candidates or 0),
-	                        "deep_address_candidates": int(deep_address_candidates or 0),
-	                        "deep_rep_candidates": int(deep_rep_candidates or 0),
-	                        "timeout_stage": timeout_stage or "",
-	                    })
+                            "deep_urls_visited": json.dumps(list(deep_urls_visited or [])[:5], ensure_ascii=False),
+                            "deep_phone_candidates": int(deep_phone_candidates or 0),
+                            "deep_address_candidates": int(deep_address_candidates or 0),
+                            "deep_rep_candidates": int(deep_rep_candidates or 0),
+                            "timeout_stage": timeout_stage or "",
+                        })
                     manager.save_company_data(company, status="review")
                     timeout_saved = True
                 except Exception:
@@ -1947,9 +1961,13 @@ async def process():
                     ai_official_rejected_record: dict[str, Any] | None = None
                     ai_official_rejected_conf: float = 0.0
                     ai_official_rejected_reason: str = ""
-                    if USE_AI_OFFICIAL and USE_AI and verifier is not None and hasattr(verifier, "judge_official_homepage"):
+                    ai_official_enabled = bool(
+                        USE_AI_OFFICIAL and USE_AI and verifier is not None and hasattr(verifier, "judge_official_homepage")
+                    )
+                    ai_official_primary = bool(AI_OFFICIAL_PRIMARY and ai_official_enabled)
+                    if ai_official_enabled:
                         ai_tasks: list[asyncio.Task] = []
-                        ai_sem = asyncio.Semaphore(2)
+                        ai_sem = asyncio.Semaphore(AI_OFFICIAL_CONCURRENCY)
 
                         async def run_official_ai(record: dict[str, Any]) -> dict[str, Any] | None:
                             nonlocal ai_official_attempted, ai_time_spent
@@ -2035,12 +2053,15 @@ async def process():
                             task.add_done_callback(_on_done)
                             task.add_done_callback(lambda t: t.exception() if t.done() else None)
 
-                        # 上位3件固定（search_rank基準）にのみ適用
-                        top3_for_ai_official = sorted(
+                        ranked_for_ai_official = sorted(
                             candidate_records,
                             key=lambda r: (int(r.get("search_rank", 1_000_000_000) or 1_000_000_000), int(r.get("order_idx", 1_000_000_000) or 1_000_000_000)),
-                        )[:3]
-                        for record in top3_for_ai_official:
+                        )
+                        if not AI_OFFICIAL_ALL_CANDIDATES:
+                            ranked_for_ai_official = ranked_for_ai_official[:3]
+                        elif AI_OFFICIAL_CANDIDATE_LIMIT > 0:
+                            ranked_for_ai_official = ranked_for_ai_official[:AI_OFFICIAL_CANDIDATE_LIMIT]
+                        for record in ranked_for_ai_official:
                             _attach_ai_task(record)
 
                         if ai_tasks:
@@ -2192,18 +2213,28 @@ async def process():
                                         ai_conf_f,
                                     )
                                     continue
-                                # AIが非公式でも、ルール根拠が強い場合は候補を捨てずにreviewで競合扱いにする
+                                # AI優先モードでは「AI非公式」は公式採用しない（review候補としてのみ保持）
                                 record["ai_conflict"] = True
                                 record["ai_conflict_confidence"] = ai_conf_f
                                 force_review = True
+                                manager.upsert_url_flag(
+                                    normalized_url,
+                                    is_official=False,
+                                    source="ai",
+                                    reason=ai_judge.get("reason", "") or "ai_not_official_rule_conflict",
+                                    confidence=ai_conf_f,
+                                )
+                                fallback_cands.append((record.get("url"), extracted))
                                 log.info(
-                                    "[%s] AI非公式だがルール根拠が強いので保持(review): %s (domain=%s evidence=%s conf=%.2f)",
+                                    "[%s] AI非公式のため公式採用せず(review候補): %s (domain=%s evidence=%s conf=%.2f)",
                                     cid,
                                     record.get("url"),
                                     domain_score,
                                     evidence_score,
                                     ai_conf_f,
                                 )
+                                if ai_official_primary:
+                                    continue
                             elif ai_conf_f < AI_VERIFY_MIN_CONFIDENCE:
                                 # 低confidenceは誤爆しやすいので除外には使わず、ルール判定で続行する
                                 record["ai_low_confidence"] = True
@@ -2303,7 +2334,8 @@ async def process():
                             homepage = normalized_url
                             info = record.get("info")
                             primary_cands = extracted
-                            homepage_official_flag = 1
+                            # AI公式判定が使える場合、この分岐だけで公式確定しない（review候補として保持）
+                            homepage_official_flag = 0 if ai_official_primary else 1
                             homepage_official_source = "name_addr"
                             homepage_official_score = float(rule_details.get("score") or 0.0)
                             chosen_domain_score = domain_score
@@ -2311,15 +2343,16 @@ async def process():
                             force_review = True
                             if record.get("ai_conflict"):
                                 homepage_official_source = "name_addr_ai_conflict"
-                            manager.upsert_url_flag(
-                                normalized_url,
-                                is_official=True,
-                                source="name_addr",
-                                reason="name_address_match_brand_host",
-                                confidence=rule_details.get("score"),
-                            )
+                            if not ai_official_primary:
+                                manager.upsert_url_flag(
+                                    normalized_url,
+                                    is_official=True,
+                                    source="name_addr",
+                                    reason="name_address_match_brand_host",
+                                    confidence=rule_details.get("score"),
+                                )
                             log.info(
-                                "[%s] 名前+住所一致（ブランドドメイン）でreview保存: %s host=%s",
+                                "[%s] 名前+住所一致（ブランドドメイン）でreview候補保存: %s host=%s",
                                 cid,
                                 normalized_url,
                                 host_name,
@@ -2418,12 +2451,15 @@ async def process():
                             info = record.get("info")
                             primary_cands = extracted
                             selected_candidate_record = record
-                            homepage_official_flag = 1
-                            homepage_official_source = "rule"
+                            # AI公式判定が使える場合 rule だけで公式確定しない（AI公式の方で採用される）
+                            homepage_official_flag = 0 if ai_official_primary else 1
+                            homepage_official_source = "rule" if not ai_official_primary else "rule_review"
                             homepage_official_score = float(rule_details.get("score") or 0.0)
                             chosen_domain_score = domain_score
+                            if ai_official_primary:
+                                force_review = True
                             if record.get("ai_conflict"):
-                                homepage_official_source = "rule_ai_conflict"
+                                homepage_official_source = "rule_ai_conflict" if not ai_official_primary else "rule_review_ai_conflict"
                                 force_review = True
                             free_host = _is_free_host(homepage)
                             if (free_host and evidence_score < 10) or not _official_signal_ok(
@@ -2446,12 +2482,13 @@ async def process():
                                     source="rule",
                                     reason="free_host_or_weak_signals",
                                 )
-                            manager.upsert_url_flag(
-                                normalized_url,
-                                is_official=True,
-                                source="rule",
-                                reason=f"score={rule_details.get('score', 0.0):.1f}",
-                            )
+                            if not ai_official_primary:
+                                manager.upsert_url_flag(
+                                    normalized_url,
+                                    is_official=True,
+                                    source="rule",
+                                    reason=f"score={rule_details.get('score', 0.0):.1f}",
+                                )
                             break
                         score_val = float(rule_details.get("score") or 0.0)
                         if score_val <= 1 and not rule_details.get("strong_domain"):
@@ -2749,6 +2786,11 @@ async def process():
                     page_type_per_url: dict[str, str] = {}
                     drop_reasons: dict[str, str] = {}
                     drop_details_by_url: dict[str, dict[str, str]] = {}
+                    ai_official_selected = bool(
+                        homepage
+                        and isinstance(homepage_official_source, str)
+                        and homepage_official_source.startswith("ai")
+                    )
 
                     def absorb_doc_data(url: str, pdata: dict[str, Any]) -> None:
                         nonlocal rule_phone, rule_address, rule_rep
@@ -2778,10 +2820,10 @@ async def process():
                                     src_phone = url
                                 else:
                                     drop_reasons["phone"] = drop_reasons.get("phone") or f"not_profile:{pt}"
-                        if cc.get("addresses"):
-                            cand_addr = pick_best_address(addr, cc["addresses"])
-                            if cand_addr and not rule_address:
-                                cand_norm = normalize_address(cand_addr) or cand_addr
+                            if cc.get("addresses"):
+                                cand_addr = pick_best_address(None if ai_official_selected else addr, cc["addresses"])
+                                if cand_addr and not rule_address:
+                                    cand_norm = normalize_address(cand_addr) or cand_addr
                                 # [HQ]タグがある同一正規化住所が存在する場合のみ採用
                                 def _strip_leading_tags(s: str) -> str:
                                     out = s or ""
@@ -2791,17 +2833,17 @@ async def process():
                                             break
                                         out = out[m.end():].lstrip()
                                     return out
-                                has_hq_tag = any(
-                                    isinstance(raw, str)
-                                    and "[HQ]" in raw
-                                    and (normalize_address(_strip_leading_tags(raw)) or "") == cand_norm
-                                    for raw in (cc.get("addresses") or [])
-                                )
-                                if pt in {"COMPANY_PROFILE", "ACCESS_CONTACT"} and has_hq_tag:
-                                    rule_address = cand_norm
-                                    src_addr = url
-                                else:
-                                    drop_reasons["address"] = drop_reasons.get("address") or f"no_hq_marker:{pt}"
+                                    has_hq_tag = any(
+                                        isinstance(raw, str)
+                                        and "[HQ]" in raw
+                                        and (normalize_address(_strip_leading_tags(raw)) or "") == cand_norm
+                                        for raw in (cc.get("addresses") or [])
+                                    )
+                                    if pt in {"COMPANY_PROFILE", "ACCESS_CONTACT"} and (has_hq_tag or ai_official_selected):
+                                        rule_address = cand_norm
+                                        src_addr = url
+                                    else:
+                                        drop_reasons["address"] = drop_reasons.get("address") or f"no_hq_marker:{pt}"
                         if cc.get("rep_names"):
                             cand_rep = pick_best_rep(cc["rep_names"], url)
                             cand_rep = scraper.clean_rep_name(cand_rep) if cand_rep else None
@@ -3003,7 +3045,7 @@ async def process():
                         if phones and not rule_phone and pt_info in {"COMPANY_PROFILE", "ACCESS_CONTACT"}:
                             rule_phone = pick_best_phone(phones)
                         if addrs and not rule_address:
-                            cand_addr = pick_best_address(addr, addrs)
+                            cand_addr = pick_best_address(None if ai_official_selected else addr, addrs)
                             if cand_addr:
                                 cand_norm = normalize_address(cand_addr) or cand_addr
                                 def _strip_leading_tags2(s: str) -> str:
@@ -3020,7 +3062,7 @@ async def process():
                                     and (normalize_address(_strip_leading_tags2(raw)) or "") == cand_norm
                                     for raw in addrs
                                 )
-                                if pt_info in {"COMPANY_PROFILE", "ACCESS_CONTACT"} and has_hq_tag:
+                                if pt_info in {"COMPANY_PROFILE", "ACCESS_CONTACT"} and (has_hq_tag or ai_official_selected):
                                     rule_address = cand_norm
                                 else:
                                     drop_reasons["address"] = drop_reasons.get("address") or f"no_hq_marker:{pt_info}"
@@ -3204,7 +3246,8 @@ async def process():
                             related_page_limit = RELATED_BASE_PAGES + (1 if missing_extra else 0)
                             if need_phone:
                                 related_page_limit += RELATED_EXTRA_PHONE
-                            related_page_limit = max(0, min(3, related_page_limit))
+                            related_cap = 6 if ai_official_selected else 3
+                            related_page_limit = max(0, min(related_cap, related_page_limit))
                             related = {}
                             related_meta: dict[str, Any] = {}
     
@@ -3234,7 +3277,8 @@ async def process():
                                         max_hops = 1
                                     else:
                                         max_hops = RELATED_MAX_HOPS_PHONE if need_phone else RELATED_MAX_HOPS_BASE
-                                        max_hops = max(0, min(3, int(max_hops or 0)))
+                                        max_hops_cap = 4 if ai_official_selected else 3
+                                        max_hops = max(0, min(max_hops_cap, int(max_hops or 0)))
                                     try:
                                         related, related_meta = await asyncio.wait_for(
                                             scraper.crawl_related(
@@ -3290,7 +3334,8 @@ async def process():
                                 )
                             except Exception:
                                 pass
-                                for url, data in related.items():
+
+                            for url, data in related.items():
                                     text = data.get("text", "") or ""
                                     html_content = data.get("html", "") or ""
                                     try:
@@ -3303,26 +3348,32 @@ async def process():
                                     deep_address_candidates += len(cc.get("addresses") or [])
                                     deep_rep_candidates += len(cc.get("rep_names") or [])
                                     if need_phone and cc.get("phone_numbers"):
-                                        cand = pick_best_phone(cc["phone_numbers"])
-                                        if cand:
-                                            if pt in {"COMPANY_PROFILE", "ACCESS_CONTACT"}:
-                                                phone = cand
-                                                phone_source = "rule"
-                                                src_phone = url
-                                                need_phone = False
-                                                log.info("[%s] deep_crawl picked phone=%s url=%s", cid, cand, url)
+                                            cand = pick_best_phone(cc["phone_numbers"])
+                                            if cand:
+                                                if pt in {"COMPANY_PROFILE", "ACCESS_CONTACT"}:
+                                                    phone = cand
+                                                    phone_source = "rule"
+                                                    src_phone = url
+                                                    need_phone = False
+                                                    log.info("[%s] deep_crawl picked phone=%s url=%s", cid, cand, url)
+                                                else:
+                                                    reason = f"not_profile:{pt}"
+                                                    drop_reasons["phone"] = drop_reasons.get("phone") or reason
+                                                    drop_details_by_url.setdefault(url, {})["phone"] = reason
+                                                    log.info("[%s] deep_crawl rejected phone reason=%s url=%s cand=%s", cid, reason, url, cand)
                                             else:
-                                                reason = f"not_profile:{pt}"
+                                                reason = "no_valid_phone"
                                                 drop_reasons["phone"] = drop_reasons.get("phone") or reason
                                                 drop_details_by_url.setdefault(url, {})["phone"] = reason
-                                                log.info("[%s] deep_crawl rejected phone reason=%s url=%s cand=%s", cid, reason, url, cand)
-                                        else:
-                                            reason = "no_valid_phone"
-                                            drop_reasons["phone"] = drop_reasons.get("phone") or reason
-                                            drop_details_by_url.setdefault(url, {})["phone"] = reason
-                                            log.info("[%s] deep_crawl rejected phones reason=%s url=%s candidates=%s", cid, reason, url, (cc.get("phone_numbers") or [])[:3])
+                                                log.info(
+                                                    "[%s] deep_crawl rejected phones reason=%s url=%s candidates=%s",
+                                                    cid,
+                                                    reason,
+                                                    url,
+                                                    (cc.get("phone_numbers") or [])[:3],
+                                                )
                                     if need_addr and cc.get("addresses"):
-                                        cand_addr = pick_best_address(addr, cc["addresses"])
+                                        cand_addr = pick_best_address(None if ai_official_selected else addr, cc["addresses"])
                                         if cand_addr:
                                             cand_norm = normalize_address(cand_addr) or cand_addr
                                             def _strip_leading_tags3(s: str) -> str:
@@ -3339,7 +3390,7 @@ async def process():
                                                 and (normalize_address(_strip_leading_tags3(raw)) or "") == cand_norm
                                                 for raw in (cc.get("addresses") or [])
                                             )
-                                            if pt in {"COMPANY_PROFILE", "ACCESS_CONTACT"} and has_hq_tag:
+                                            if pt in {"COMPANY_PROFILE", "ACCESS_CONTACT"} and (has_hq_tag or ai_official_selected):
                                                 found_address = cand_norm
                                                 address_source = "rule"
                                                 src_addr = url
@@ -3354,7 +3405,13 @@ async def process():
                                             reason = "no_valid_address"
                                             drop_reasons["address"] = drop_reasons.get("address") or reason
                                             drop_details_by_url.setdefault(url, {})["address"] = reason
-                                            log.info("[%s] deep_crawl rejected addresses reason=%s url=%s candidates=%s", cid, reason, url, (cc.get("addresses") or [])[:3])
+                                            log.info(
+                                                "[%s] deep_crawl rejected addresses reason=%s url=%s candidates=%s",
+                                                cid,
+                                                reason,
+                                                url,
+                                                (cc.get("addresses") or [])[:3],
+                                            )
                                     if need_rep and cc.get("rep_names"):
                                         cand_rep = pick_best_rep(cc["rep_names"], url)
                                         cand_rep = scraper.clean_rep_name(cand_rep) if cand_rep else None
@@ -3768,10 +3825,12 @@ async def process():
                             found_address = rule_address
                         if found_address and not looks_like_address(found_address):
                             found_address = ""
-                        normalized_found_address = normalize_address(found_address) if found_address else ""
-                        if not normalized_found_address and addr:
-                            normalized_found_address = normalize_address(addr) or ""
-                        csv_pref = CompanyScraper._extract_prefecture(addr) if addr else ""
+                            normalized_found_address = normalize_address(found_address) if found_address else ""
+                            if not normalized_found_address and addr:
+                                normalized_found_address = normalize_address(addr) or ""
+                            if ai_official_selected and normalized_found_address and (address_source or "") != "none":
+                                company["address"] = normalized_found_address
+                            csv_pref = CompanyScraper._extract_prefecture(addr) if addr else ""
                         hp_pref = CompanyScraper._extract_prefecture(normalized_found_address) if normalized_found_address else ""
                         pref_match = int(bool(csv_pref and hp_pref and csv_pref == hp_pref)) if (csv_pref and hp_pref) else None
                         csv_city_m = CITY_RE.search(addr or "")
@@ -3950,8 +4009,8 @@ async def process():
                             status = "review"
                         if not homepage and candidate_records:
                             status = "review"
-                        if status == "done" and found_address and not addr_compatible(addr, found_address):
-                            status = "review"
+                            if status == "done" and found_address and (not ai_official_selected) and not addr_compatible(addr, found_address):
+                                status = "review"
                         if (
                             status == "done"
                             and had_verify_target
@@ -3968,16 +4027,19 @@ async def process():
                             # 暫定URLで検証できない場合でも、深掘り/AI結果があれば保持し、ホームページは空に戻さない
                             pass
 
-                        if status == "done":
-                            strong_official = bool(
-                                homepage
-                                and homepage_official_flag == 1
-                                and (chosen_domain_score or 0) >= 4
-                                and (not addr or not found_address or addr_compatible(addr, found_address))
-                                and (
-                                    not had_verify_target
-                                    or verify_result.get("phone_ok")
-                                    or verify_result.get("address_ok")
+                            if status == "done":
+                                strong_official = bool(
+                                    homepage
+                                    and homepage_official_flag == 1
+                                    and (chosen_domain_score or 0) >= 4
+                                    and (
+                                        ai_official_selected
+                                        or (not addr or not found_address or addr_compatible(addr, found_address))
+                                    )
+                                    and (
+                                        not had_verify_target
+                                        or verify_result.get("phone_ok")
+                                        or verify_result.get("address_ok")
                                 )
                             )
                             if not strong_official:
