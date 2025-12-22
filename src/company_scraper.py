@@ -1193,6 +1193,11 @@ class CompanyScraper:
         # 住所は「都道府県+市区町村」程度に圧縮して検索精度を上げる（誤った住所が混ざる場合に備え、住所無しクエリも併用）
         loc = ""
         addr_norm = unicodedata.normalize("NFKC", address or "").strip()
+        # フォーム由来ノイズ/補助情報を軽く除去（入力CSVの品質が悪いケース対策）
+        if addr_norm:
+            addr_norm = re.sub(r"[（(]\s*(?:市区町村|自治体)コ[-ー]ド\s*[:：]\s*\d+\s*[)）]", "", addr_norm)
+            addr_norm = re.sub(r"(?:市区町村|自治体)コ[-ー]ド\s*[:：]\s*\d+", "", addr_norm)
+            addr_norm = re.sub(r"\s+", " ", addr_norm).strip()
         if addr_norm:
             pref = self._extract_prefecture(addr_norm)
             city_match = CITY_RE.search(addr_norm)

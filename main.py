@@ -9,6 +9,7 @@ import random
 import time
 import html as html_mod
 import threading
+import unicodedata
 from difflib import SequenceMatcher
 from typing import Any, Dict
 from urllib.parse import urlparse
@@ -139,7 +140,12 @@ ADDRESS_JS_NOISE_RE = re.compile(
 )
 ADDRESS_FORM_NOISE_RE = re.compile(
     # フォーム由来のラベル/説明文だけを狙う（単語の素朴な出現は弾かない）
-    r"(住所検索|郵便番号\s*[（(]?\s*半角|マンション・?ビル名|市区町村・番地|都道府県\b|都道府県\s*(?:選択|入力|[:：])|市区町村\s*(?:選択|入力|[:：]))",
+    r"("
+    r"住所検索|郵便番号\s*[（(]?\s*半角|マンション・?ビル名|市区町村・番地|"
+    r"都道府県\b|都道府県\s*(?:選択|入力|[:：])|市区町村\s*(?:選択|入力|[:：])|"
+    r"住所\s*(?:を)?\s*(?:入力|選択)\b|番地\s*(?:を)?\s*入力|建物(?:名)?\s*(?:を)?\s*入力|"
+    r"(?:必須|入力してください|例[:：]|記入例)"
+    r")",
     re.IGNORECASE,
 )
 KANJI_TOKEN_RE = re.compile(r"[一-龥]{2,}")
@@ -304,6 +310,42 @@ def normalize_address(s: str | None) -> str | None:
             return None
         return f"〒{m.group(1)} {body}"
     return s if s else None
+
+
+def is_prefecture_only_address(text: str | None) -> bool:
+    if not text:
+        return False
+    s = unicodedata.normalize("NFKC", str(text))
+    s = re.sub(r"\s+", "", s)
+    if not s:
+        return False
+    s = re.sub(r"^〒?\d{3}[-\s]?\d{4}", "", s)
+    s = s.strip(" 　\t,，;；。．|｜/／・-‐―－ー:：")
+    if not s:
+        return False
+    try:
+        return s in CompanyScraper.PREFECTURE_NAMES
+    except Exception:
+        return bool(re.fullmatch(r".+(都|道|府|県)", s)) and len(s) <= 4
+
+
+def is_address_verifiable(text: str | None) -> bool:
+    """
+    verify_on_site の検証対象にできる程度に、住所が具体的かどうか。
+    - 都道府県だけ等の低品質住所は False（マッチが容易すぎて誤判定を招く）
+    """
+    normalized = normalize_address(text)
+    if not normalized:
+        return False
+    if is_prefecture_only_address(normalized):
+        return False
+    if ZIP_CODE_RE.search(normalized):
+        return True
+    if CITY_RE.search(normalized):
+        return True
+    if re.search(r"\d", normalized) and re.search(r"(丁目|番地|番|号)", normalized):
+        return True
+    return False
 
 
 def sanitize_text_block(text: str | None) -> str:
@@ -1240,7 +1282,8 @@ async def process():
 
             cid = company.get("id")
             name = (company.get("company_name") or "").strip()
-            addr = (company.get("address") or "").strip()
+            addr_raw = (company.get("address") or "").strip()
+            addr = normalize_address(addr_raw) or ""
             input_addr_has_zip = bool(ZIP_CODE_RE.search(addr))
             input_addr_has_city = bool(CITY_RE.search(addr))
             input_addr_has_pref = any(pref in addr for pref in CompanyScraper.PREFECTURE_NAMES) if addr else False
@@ -3384,17 +3427,20 @@ async def process():
                                 absorb_doc_data(url, pdata)
 
                         deep_phase_end = elapsed()
-                        quick_verify_result = quick_verify_from_docs(
-                            phone or rule_phone,
-                            found_address or addr or rule_address,
-                        )
+                        expected_phone = phone or rule_phone or None
+                        expected_addr = found_address or addr or rule_address or ""
+                        expected_addr = normalize_address(expected_addr) or ""
+                        verifiable_addr = expected_addr if is_address_verifiable(expected_addr) else None
+                        quick_verify_result = quick_verify_from_docs(expected_phone, verifiable_addr)
                         verify_result = dict(quick_verify_result)
                         verify_result_source = "docs" if any(verify_result.values()) else "skip"
+                        require_phone = bool(expected_phone)
+                        require_addr = bool(verifiable_addr)
                         need_online_verify = (
                             not timed_out
                             and homepage
-                            and (phone or rule_phone or found_address or addr or rule_address)
-                            and (not verify_result.get("phone_ok") or not verify_result.get("address_ok"))
+                            and (require_phone or require_addr)
+                            and ((require_phone and not verify_result.get("phone_ok")) or (require_addr and not verify_result.get("address_ok")))
                             and not over_after_official()
                             and not over_deep_phase_deadline()
                         )
@@ -3403,9 +3449,9 @@ async def process():
                                 verify_result = await asyncio.wait_for(
                                     scraper.verify_on_site(
                                         homepage,
-                                        phone or rule_phone or None,
-                                        found_address or addr or rule_address or None,
-                                        fetch_limit=3,
+                                        expected_phone,
+                                        verifiable_addr,
+                                        fetch_limit=5,
                                     ),
                                     timeout=clamp_timeout(PAGE_FETCH_TIMEOUT_SEC),
                                 )
@@ -3415,17 +3461,28 @@ async def process():
                                 verify_result = quick_verify_result
                                 verify_result_source = "docs"
 
-                        matches = int(bool(verify_result.get("phone_ok"))) + int(bool(verify_result.get("address_ok")))
-                        if matches == 2:
-                            confidence = 1.0
-                        elif matches == 1:
-                            confidence = 0.8
+                        phone_ok = bool(verify_result.get("phone_ok"))
+                        addr_ok = bool(verify_result.get("address_ok"))
+                        required = int(require_phone) + int(require_addr)
+                        matches = int(phone_ok) + int(addr_ok)
+                        evidence_ok = (not require_phone or phone_ok) and (not require_addr or addr_ok)
+                        if required == 0:
+                            confidence = max(confidence or 0.0, 0.6)
+                        elif evidence_ok:
+                            confidence = 1.0 if required == 2 else 0.85
+                        elif matches >= 1:
+                            confidence = 0.75
                         else:
-                            confidence = 0.4
-                        if homepage and homepage_official_flag == 1 and matches < 2:
-                            log.info("[%s] verify_on_siteで根拠不足のため公式フラグを降格 (matches=%s): %s", cid, matches, homepage)
+                            confidence = 0.45
+
+                        # 公式フラグは「公式らしさ」の判定を優先し、verifyは追加根拠として扱う。
+                        # ただし、電話/住所ともに具体的な期待値があるのに両方拾えない場合は疑わしいので降格する。
+                        if homepage and homepage_official_flag == 1 and required == 2 and matches == 0:
+                            log.info("[%s] verify_on_siteで根拠不足のため公式フラグを降格 (required=%s matches=%s): %s", cid, required, matches, homepage)
                             homepage_official_flag = 0
                             homepage_official_source = "verify_fail"
+                            force_review = True
+                        elif homepage and homepage_official_flag == 1 and required > 0 and not evidence_ok:
                             force_review = True
                     else:
                         if urls:
@@ -3593,7 +3650,7 @@ async def process():
                         })
 
                         had_verify_target = bool(
-                            phone or rule_phone or found_address or rule_address or addr
+                            (phone or rule_phone) or is_address_verifiable(found_address or rule_address or addr)
                         )
 
                         if REFERENCE_CHECKER:
