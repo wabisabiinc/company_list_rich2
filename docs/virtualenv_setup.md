@@ -15,9 +15,11 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
+python -m playwright install chromium
 ```
 
 この状態で `python main.py` を実行すれば `ModuleNotFoundError: dotenv` のようなエラーは発生しません。
+`playwright install` を省略すると `Executable doesn't exist ... Please run: playwright install` のエラーになります。
 
 ## 3. VS Code と連携して毎回自動で有効化
 

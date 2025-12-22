@@ -532,6 +532,8 @@ class CompanyScraper:
         self._pw = None
         self.browser: Optional[Browser] = None
         self.context: Optional[BrowserContext] = None
+        self.browser_disabled = False
+        self.browser_disabled_reason = ""
         # ページ単位のタイムアウトを短めに（デフォルト6秒）
         self.page_timeout_ms = int(os.getenv("PAGE_TIMEOUT_MS", "6000"))
         self.slow_page_threshold_ms = int(os.getenv("SLOW_PAGE_THRESHOLD_MS", "6000"))
@@ -2972,13 +2974,23 @@ class CompanyScraper:
                 return self.page_cache[url]
 
         if not self.context:
+            if self.browser_disabled:
+                if http_fallback is not None:
+                    return http_fallback
+                if cached:
+                    return cached
+                return {"url": url, "text": "", "html": "", "screenshot": b""}
             try:
                 await self.start()
             except Exception:
+                self.browser_disabled = True
+                self.browser_disabled_reason = "start_failed"
                 # ブラウザ起動に失敗した場合は HTTP 取得結果（同一呼び出し内）にフォールバックする
                 if http_fallback is not None:
                     return http_fallback
-                raise
+                if cached:
+                    return cached
+                return {"url": url, "text": "", "html": "", "screenshot": b""}
 
         eff_timeout = timeout or self.page_timeout_ms
         if self.slow_page_threshold_ms > 0:
@@ -3693,14 +3705,17 @@ class CompanyScraper:
                 # table/dl のラベル抽出に乗らない住所を <footer>/<address> 等から拾う
                 try:
                     extra_blobs: list[str] = []
-                    for node in soup.find_all(["address", "footer"]):
+                    # header/footer は本文ノイズになりやすいので text には落とさないが、
+                    # 代表電話や所在地がここにしか出ないサイトが多いため、候補抽出では参照する
+                    for node in soup.find_all(["address", "footer", "header"]):
                         txt = node.get_text(separator=" ", strip=True)
                         if txt:
                             extra_blobs.append(txt)
-                    for node in soup.find_all(attrs={"role": "contentinfo"}):
-                        txt = node.get_text(separator=" ", strip=True)
-                        if txt:
-                            extra_blobs.append(txt)
+                    for role in ("contentinfo", "banner"):
+                        for node in soup.find_all(attrs={"role": role}):
+                            txt = node.get_text(separator=" ", strip=True)
+                            if txt:
+                                extra_blobs.append(txt)
                     # microdata (itemprop) のPostalAddress断片も拾う
                     parts: list[str] = []
                     for prop in ("postalCode", "addressRegion", "addressLocality", "streetAddress"):
@@ -3711,7 +3726,46 @@ class CompanyScraper:
                     if parts:
                         extra_blobs.append(" ".join(parts))
 
+                    # tel: リンクは本文から落ちやすいので、href からも拾う
+                    try:
+                        for a in soup.find_all("a", href=True):
+                            href = (a.get("href") or "").strip()
+                            if not href:
+                                continue
+                            if not href.lower().startswith("tel:"):
+                                continue
+                            cand = _normalize_phone_strict(href)
+                            if cand:
+                                phones.append(f"[TEL]{cand}")
+                    except Exception:
+                        pass
+
+                    # alt/title/aria-label 等に電話が載るケースを拾う（画像ボタン等）
+                    try:
+                        for node in soup.find_all(["a", "img", "button"]):
+                            for attr in ("alt", "title", "aria-label"):
+                                val = node.get(attr)
+                                if not isinstance(val, str) or not val:
+                                    continue
+                                for p in PHONE_RE.finditer(val):
+                                    cand = _normalize_phone_strict(p.group(0))
+                                    if cand:
+                                        phones.append(cand)
+                    except Exception:
+                        pass
+
                     for blob in extra_blobs:
+                        for p in PHONE_RE.finditer(blob or ""):
+                            cand = _normalize_phone_strict(p.group(0))
+                            if not cand:
+                                continue
+                            ctx = (blob or "")[max(0, p.start() - 12):p.start()]
+                            fax_hint = bool(re.search(r"(FAX|Fax|fax|ファックス|ﾌｧｯｸｽ|ＦＡＸ)", ctx))
+                            tel_hint = bool(re.search(r"(TEL|Tel|tel|電話)", ctx))
+                            if fax_hint and not tel_hint:
+                                phones.append(f"[FAX]{cand}")
+                            else:
+                                phones.append(cand)
                         for zm in ZIP_RE.finditer(blob or ""):
                             zip_code = f"〒{zm.group(1).replace('〒', '').strip()}-{zm.group(2)}"
                             cursor = zm.end()

@@ -18,3 +18,21 @@ def test_extract_candidates_table_tel_fax_prefers_tel_and_extracts_address():
     assert any("東京都" in a for a in (cc.get("addresses") or []))
     assert cc.get("rep_names")
 
+
+def test_extract_candidates_footer_tel_and_tel_link():
+    scraper = CompanyScraper(headless=True)
+    html = """
+    <html><body>
+      <main>
+        <p>本文は電話なし</p>
+      </main>
+      <footer>
+        <dl>
+          <dd class="f_tel pc">TEL:03-6667-5800</dd>
+          <dd class="f_tel sp"><a href="tel:03-6667-5800">TEL:03-6667-5800</a></dd>
+        </dl>
+      </footer>
+    </body></html>
+    """
+    cc = scraper.extract_candidates(text="", html=html)
+    assert pick_best_phone(cc.get("phone_numbers") or []) == "03-6667-5800"

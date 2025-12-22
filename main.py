@@ -3,6 +3,7 @@ import asyncio
 import os
 import csv
 import logging
+import json
 import re
 import random
 import time
@@ -99,24 +100,6 @@ LONG_TIME_LIMIT_WITH_OFFICIAL = float(os.getenv("LONG_TIME_LIMIT_WITH_OFFICIAL",
 LONG_TIME_LIMIT_DEEP = float(os.getenv("LONG_TIME_LIMIT_DEEP", os.getenv("TIME_LIMIT_DEEP", "60")))
 AI_MIN_REMAINING_SEC = float(os.getenv("AI_MIN_REMAINING_SEC", "2.5"))
 AI_VERIFY_MIN_CONFIDENCE = float(os.getenv("AI_VERIFY_MIN_CONFIDENCE", "0.65"))
-CONFLICT_RESOLUTION_BUDGET_SEC = float(os.getenv("CONFLICT_RESOLUTION_BUDGET_SEC", "60") or 0)
-_CONFLICT_BUDGET_LOCK = threading.Lock()
-_CONFLICT_BUDGET_REMAINING_SEC = CONFLICT_RESOLUTION_BUDGET_SEC
-
-
-def _conflict_budget_available(max_sec: float = 60.0) -> float:
-    if CONFLICT_RESOLUTION_BUDGET_SEC <= 0:
-        return 0.0
-    with _CONFLICT_BUDGET_LOCK:
-        return max(0.0, min(float(max_sec), float(_CONFLICT_BUDGET_REMAINING_SEC)))
-
-
-def _conflict_budget_consume(spent_sec: float) -> None:
-    if CONFLICT_RESOLUTION_BUDGET_SEC <= 0 or spent_sec <= 0:
-        return
-    global _CONFLICT_BUDGET_REMAINING_SEC
-    with _CONFLICT_BUDGET_LOCK:
-        _CONFLICT_BUDGET_REMAINING_SEC = max(0.0, float(_CONFLICT_BUDGET_REMAINING_SEC) - float(spent_sec))
 DEFAULT_TIME_LIMIT_FETCH_ONLY = TIME_LIMIT_FETCH_ONLY
 DEFAULT_TIME_LIMIT_WITH_OFFICIAL = TIME_LIMIT_WITH_OFFICIAL
 DEFAULT_TIME_LIMIT_DEEP = TIME_LIMIT_DEEP
@@ -1115,12 +1098,7 @@ async def process():
     normal_page_timeout_ms = getattr(scraper, "page_timeout_ms", base_page_timeout_ms)
     normal_slow_page_threshold_ms = getattr(scraper, "slow_page_threshold_ms", base_page_timeout_ms)
     PAGE_FETCH_TIMEOUT_SEC = max(5.0, (base_page_timeout_ms / 1000.0) + 5.0)
-    # CompanyScraper に start()/close() が無い実装でも動くように安全に呼ぶ
-    if hasattr(scraper, "start") and callable(getattr(scraper, "start")):
-        try:
-            await scraper.start()
-        except Exception:
-            log.warning("scraper.start() はスキップ（未実装または失敗）", exc_info=True)
+    # Playwright起動は get_page_info 内で必要時のみ行う（未導入環境での起動失敗や待ちを避ける）
 
     verifier = AIVerifier() if USE_AI else None
     manager = DatabaseManager(db_path=COMPANIES_DB_PATH, worker_id=WORKER_ID)
@@ -2303,100 +2281,6 @@ async def process():
                                 homepage_official_score = float(rule_details.get("score") or 0.0)
                                 chosen_domain_score = domain_score
                                 force_review = True
-
-                    # AI公式とルール強候補が競合するケースは、深掘り前に入力住所で簡易検証してから採用する
-                    if (
-                        homepage
-                        and addr
-                        and not input_addr_pref_only
-                        and isinstance(homepage_official_source, str)
-                        and homepage_official_source.startswith("ai")
-                        and candidate_records
-                        and remaining_time_budget() > 0
-                    ):
-                        conflict_budget = _conflict_budget_available(60.0)
-                        if conflict_budget >= 4.0 and not timed_out:
-                            conflict_started = time.monotonic()
-                            try:
-                                def _pick_best_alt_record(exclude_url: str) -> dict[str, Any] | None:
-                                    best_alt = None
-                                    best_alt_score = float("-inf")
-                                    for rec in candidate_records:
-                                        nurl = rec.get("normalized_url") or rec.get("url") or ""
-                                        if not nurl or nurl == exclude_url:
-                                            continue
-                                        rd = rec.get("rule") or {}
-                                        if rd.get("directory_like"):
-                                            continue
-                                        ds = int(rec.get("domain_score") or 0)
-                                        if nurl and ds == 0:
-                                            ds = scraper._domain_score(company_tokens, nurl)  # type: ignore
-                                            rec["domain_score"] = ds
-                                        sdh = bool(rec.get("strong_domain_host"))
-                                        name_present = bool(rd.get("name_present"))
-                                        addr_hit = bool(rd.get("address_match"))
-                                        pref_hit = bool(rd.get("prefecture_match"))
-                                        zip_hit = bool(rd.get("postal_code_match"))
-                                        addr_ok = addr_hit or pref_hit or zip_hit
-                                        ev = int(rd.get("official_evidence_score") or 0)
-                                        allow = sdh or name_present or ds >= 4 or (addr_ok and ds >= 3) or ev >= 10
-                                        if not rec.get("host_token_hit") and not allow:
-                                            continue
-                                        aj = rec.get("ai_judge") or {}
-                                        ai_bonus = 0.0
-                                        if aj:
-                                            ai_is = aj.get("is_official_site")
-                                            if ai_is is None:
-                                                ai_is = aj.get("is_official")
-                                            conf = aj.get("official_confidence")
-                                            if conf is None:
-                                                conf = aj.get("confidence")
-                                            try:
-                                                conf_f = float(conf) if conf is not None else 0.0
-                                            except Exception:
-                                                conf_f = 0.0
-                                            if ai_is is True and conf_f >= AI_VERIFY_MIN_CONFIDENCE:
-                                                ai_bonus = 6.0
-                                        score = ds * 2 + (3 if addr_ok else 0) + float(rd.get("score") or 0.0) + min(6.0, ev / 2.0) + (4 if sdh else 0) + ai_bonus
-                                        if score > best_alt_score:
-                                            best_alt_score = score
-                                            best_alt = rec
-                                    return best_alt
-
-                                alt_record = _pick_best_alt_record(homepage)
-                                alt_url = (alt_record or {}).get("normalized_url") or (alt_record or {}).get("url") or ""
-                                if alt_record and alt_url and alt_url != homepage:
-                                    per_timeout = min(PAGE_FETCH_TIMEOUT_SEC, max(2.0, conflict_budget / 2.0))
-                                    v1 = await asyncio.wait_for(
-                                        scraper.verify_on_site(homepage, None, addr, fetch_limit=3),
-                                        timeout=clamp_timeout(per_timeout),
-                                    )
-                                    v2 = await asyncio.wait_for(
-                                        scraper.verify_on_site(alt_url, None, addr, fetch_limit=3),
-                                        timeout=clamp_timeout(per_timeout),
-                                    )
-                                    if (not v1.get("address_ok")) and bool(v2.get("address_ok")):
-                                        rd2 = alt_record.get("rule") or {}
-                                        ds2 = int(alt_record.get("domain_score") or 0)
-                                        homepage = alt_url
-                                        info = alt_record.get("info")
-                                        primary_cands = alt_record.get("extracted") or {}
-                                        selected_candidate_record = alt_record
-                                        homepage_official_flag = 0
-                                        homepage_official_source = "conflict_addr_switch"
-                                        homepage_official_score = float(rd2.get("score") or 0.0)
-                                        chosen_domain_score = ds2
-                                        force_review = True
-                                        log.info(
-                                            "[%s] AI公式候補より住所根拠が強い候補へ切替: %s -> %s",
-                                            cid,
-                                            v1.get("address_url") or "",
-                                            alt_url,
-                                        )
-                            except Exception:
-                                pass
-                            finally:
-                                _conflict_budget_consume(time.monotonic() - conflict_started)
 
                     official_phase_end = elapsed()
                     deep_phase_deadline = time.monotonic() + DEEP_PHASE_TIMEOUT_SEC if DEEP_PHASE_TIMEOUT_SEC > 0 else None
