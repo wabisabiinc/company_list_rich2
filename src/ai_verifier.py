@@ -27,6 +27,7 @@ API_KEY: str = (os.getenv("GEMINI_API_KEY") or "").strip()
 DEFAULT_MODEL: str = (os.getenv("GEMINI_MODEL") or "gemini-2.5-flash-lite").strip()
 AI_CONTEXT_PATH: str = os.getenv("AI_CONTEXT_PATH", "docs/ai_context.md")
 AI_DESCRIPTION_MAX_LEN = int(os.getenv("AI_DESCRIPTION_MAX_LEN", "140"))
+AI_DESCRIPTION_MIN_LEN = int(os.getenv("AI_DESCRIPTION_MIN_LEN", "80"))
 
 # ---- deps -------------------------------------------------------
 try:
@@ -386,6 +387,174 @@ class AIVerifier:
         if re.search(r"[\x00-\x1f\x7f]", desc):
             return None
         return desc
+
+    @staticmethod
+    def _validate_rich_description(desc: Optional[str]) -> Optional[str]:
+        if not desc:
+            return None
+        if "http://" in desc or "https://" in desc or "＠" in desc or "@" in desc:
+            return None
+        desc = re.sub(r"\s+", " ", desc.strip())
+        if len(desc) < AI_DESCRIPTION_MIN_LEN or len(desc) > 160:
+            return None
+        if not re.search(r"[ぁ-んァ-ン一-龥]", desc):
+            return None
+        if re.search(r"[\x00-\x1f\x7f]", desc):
+            return None
+        # 事業内容以外の誘導語を軽く弾く（強すぎると落ちすぎるため最小限）
+        if any(k in desc for k in ("お問い合わせ", "採用", "アクセス", "所在地", "電話", "TEL", "FAX")):
+            return None
+        return desc
+
+    def _build_rich_prompt(self, payload_json: str, company_name: str = "", csv_address: str = "") -> str:
+        """
+        会社情報の最終選択（1回/社）用プロンプト。
+        docs/ai_context.md は system prompt として別途渡される想定。
+        """
+        snippet = _shorten_text(payload_json or "", max_len=4200)
+        return (
+            "以下の JSON は、同一ドメイン内の最大2〜3ページからルール抽出した候補群です。\n"
+            "推測は禁止。候補に無い値は返さないでください。迷ったら null。\n"
+            "出力は JSON のみ。\n"
+            f"対象企業: {company_name or '不明'} / csv_address: {csv_address or '不明'}\n"
+            "OUTPUT SCHEMA:\n"
+            "{\n"
+            '  "phone_number": string|null,\n'
+            '  "address": string|null,\n'
+            '  "representative": string|null,\n'
+            '  "company_facts": {"founded": string|null, "capital": string|null, "employees": string|null, "license": string|null},\n'
+            '  "industry": string|null,\n'
+            '  "business_tags": string[],\n'
+            '  "description": string|null,\n'
+            '  "confidence": number,\n'
+            '  "evidence": string|null,\n'
+            '  "description_evidence": [{"url": string, "snippet": string}]\n'
+            "}\n"
+            "制約:\n"
+            "- business_tags は最大5件。\n"
+            "- description は80〜160字、日本語1〜2文、事業内容のみ。根拠が薄い/材料が無い場合は null。\n"
+            "- description!=null の場合、description_evidence は必ず2件（URLと短い抜粋）。\n"
+            "- evidence は住所/電話/代表者の根拠の短い抜粋（無ければ null）。\n"
+            f"# CANDIDATES_JSON\n{snippet}\n"
+        )
+
+    async def select_company_fields(
+        self,
+        payload: Dict[str, Any],
+        screenshot: bytes | None,
+        company_name: str,
+        csv_address: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not self.model:
+            return None
+        try:
+            payload_json = json.dumps(payload, ensure_ascii=False)
+        except Exception:
+            payload_json = str(payload)
+        prompt = self._build_rich_prompt(payload_json, company_name=company_name, csv_address=csv_address)
+
+        def _build_content(use_image: bool) -> list[Any]:
+            out: list[Any] = []
+            if self.system_prompt:
+                out.append(self.system_prompt)
+            out.append(prompt)
+            if use_image and screenshot:
+                try:
+                    b64 = base64.b64encode(screenshot).decode("utf-8")
+                    out.append({"inline_data": {"mime_type": "image/png", "data": b64}})
+                except Exception:
+                    pass
+            return out
+
+        resp = await self._generate_with_timeout(_build_content(bool(screenshot)))
+        if resp is None and screenshot:
+            resp = await self._generate_with_timeout(_build_content(False))
+        if resp is None:
+            return None
+
+        raw = _resp_text(resp)
+        data = _extract_first_json(raw)
+        if not isinstance(data, dict):
+            return None
+
+        phone = _normalize_phone(data.get("phone_number"))
+        addr = _normalize_address(data.get("address"))
+        rep = data.get("representative")
+        rep = re.sub(r"\s+", " ", str(rep)).strip() if isinstance(rep, str) and rep.strip() else None
+
+        facts_in = data.get("company_facts") if isinstance(data.get("company_facts"), dict) else {}
+        def _as_str(v: Any, max_len: int = 80) -> Optional[str]:
+            if v is None:
+                return None
+            if not isinstance(v, str):
+                v = str(v)
+            v = re.sub(r"\s+", " ", v.strip())
+            return v[:max_len] if v else None
+        company_facts = {
+            "founded": _as_str(facts_in.get("founded")),
+            "capital": _as_str(facts_in.get("capital")),
+            "employees": _as_str(facts_in.get("employees")),
+            "license": _as_str(facts_in.get("license")),
+        }
+
+        industry = _as_str(data.get("industry"), max_len=60)
+        tags_raw = data.get("business_tags")
+        tags: list[str] = []
+        if isinstance(tags_raw, list):
+            for t in tags_raw:
+                if isinstance(t, str):
+                    tt = re.sub(r"\s+", " ", t.strip())
+                    if tt:
+                        tags.append(tt[:24])
+        tags = tags[:5]
+
+        desc = data.get("description")
+        desc = self._validate_rich_description(desc if isinstance(desc, str) else None)
+
+        conf_val = data.get("confidence")
+        try:
+            conf = float(conf_val) if conf_val is not None else 0.0
+        except Exception:
+            conf = 0.0
+        conf = max(0.0, min(1.0, conf))
+
+        evidence = data.get("evidence")
+        if isinstance(evidence, str):
+            ev = re.sub(r"\s+", " ", evidence.strip())
+            evidence = ev[:200] if len(ev) >= 12 else None
+        else:
+            evidence = None
+
+        de_raw = data.get("description_evidence")
+        description_evidence: list[dict[str, str]] = []
+        if isinstance(de_raw, list):
+            for item in de_raw:
+                if not isinstance(item, dict):
+                    continue
+                u = item.get("url")
+                sn = item.get("snippet")
+                if not (isinstance(u, str) and u.strip() and isinstance(sn, str) and sn.strip()):
+                    continue
+                description_evidence.append(
+                    {"url": u.strip()[:500], "snippet": re.sub(r"\s+", " ", sn.strip())[:180]}
+                )
+        if desc and len(description_evidence) < 2:
+            # 仕様違反（根拠不足）なら description を捨てる
+            desc = None
+            description_evidence = []
+
+        return {
+            "phone_number": phone,
+            "address": addr,
+            "representative": rep,
+            "company_facts": company_facts,
+            "industry": industry,
+            "business_tags": tags,
+            "description": desc,
+            "confidence": conf,
+            "evidence": evidence,
+            "description_evidence": description_evidence,
+        }
 
     async def verify_info(self, text: str, screenshot: bytes, company_name: str, address: str) -> Optional[Dict[str, Any]]:
         if not self.model:

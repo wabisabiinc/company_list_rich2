@@ -62,6 +62,8 @@ load_dotenv()
 # --------------------------------------------------
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 USE_AI = os.getenv("USE_AI", "true").lower() == "true"
+# 公式判定にAIを使うと1社あたり複数回呼び出しになりやすいので、デフォルト無効（1回/社の制約を優先）
+USE_AI_OFFICIAL = os.getenv("USE_AI_OFFICIAL", "false").lower() == "true"
 # description はAIで常時生成（verify_infoで同時生成）。追加の説明専用AI呼び出しを有効にしたい場合のみ true。
 USE_AI_DESCRIPTION = os.getenv("USE_AI_DESCRIPTION", "false").lower() == "true"
 WORKER_ID = os.getenv("WORKER_ID", "w1")  # 並列識別子
@@ -482,14 +484,23 @@ def _official_signal_ok(
     return bool(strong_domain and name_or_addr)
 
 def pick_best_address(expected_addr: str | None, candidates: list[str]) -> str | None:
-    def _parse_source(raw: str) -> tuple[str, str]:
+    def _parse_source(raw: str) -> tuple[str, bool, str]:
         if not raw:
-            return "OTHER", ""
+            return "OTHER", False, ""
         s = str(raw).strip()
-        m = re.match(r"^\[(JSONLD|TABLE|LABEL|FOOTER|TEXT)\]", s)
-        if m:
-            return m.group(1), s[m.end():].strip()
-        return "OTHER", s
+        tags: list[str] = []
+        rest = s
+        while True:
+            m = re.match(r"^\[([A-Z_]+)\]", rest)
+            if not m:
+                break
+            tags.append(m.group(1))
+            rest = rest[m.end():].lstrip()
+        source = next((t for t in tags if t in {"JSONLD", "TABLE", "LABEL", "FOOTER", "TEXT"}), "OTHER")
+        is_hq = "HQ" in tags or "HEADQUARTERS" in tags
+        # remove any remaining bracket tags that might slip through
+        rest = re.sub(r"^\[[A-Z_]+\]\s*", "", rest)
+        return source, is_hq, rest.strip()
 
     source_bonus = {
         "JSONLD": 6.0,
@@ -500,23 +511,26 @@ def pick_best_address(expected_addr: str | None, candidates: list[str]) -> str |
         "OTHER": 0.0,
     }
 
-    normalized_candidates: list[tuple[str, str]] = []  # (normalized, source)
+    normalized_candidates: list[tuple[str, str, bool]] = []  # (normalized, source, is_hq)
     for cand in candidates:
-        source, raw_val = _parse_source(cand)
+        source, is_hq, raw_val = _parse_source(cand)
         norm = normalize_address(raw_val)
         if norm:
-            normalized_candidates.append((norm, source))
+            normalized_candidates.append((norm, source, is_hq))
     if not normalized_candidates:
         return None
     # dedupe while keeping the best source bonus for the same normalized address
-    best_by_norm: dict[str, str] = {}
-    for norm, src in normalized_candidates:
+    best_by_norm: dict[str, tuple[str, bool]] = {}
+    for norm, src, is_hq in normalized_candidates:
         if norm not in best_by_norm:
-            best_by_norm[norm] = src
+            best_by_norm[norm] = (src, is_hq)
             continue
-        if source_bonus.get(src, 0.0) > source_bonus.get(best_by_norm[norm], 0.0):
-            best_by_norm[norm] = src
-    normalized_candidates = [(n, s) for n, s in best_by_norm.items()]
+        prev_src, prev_hq = best_by_norm[norm]
+        prev_score = source_bonus.get(prev_src, 0.0) + (4.0 if prev_hq else 0.0)
+        cur_score = source_bonus.get(src, 0.0) + (4.0 if is_hq else 0.0)
+        if cur_score > prev_score:
+            best_by_norm[norm] = (src, is_hq)
+    normalized_candidates = [(n, s, hq) for n, (s, hq) in best_by_norm.items()]
     if not expected_addr:
         # 郵便番号/市区町村/丁目を多く含むものを優先
         def _score(addr: str) -> int:
@@ -531,14 +545,14 @@ def pick_best_address(expected_addr: str | None, candidates: list[str]) -> str |
                 score += 1
             return score
         normalized_candidates.sort(
-            key=lambda pair: (_score(pair[0]) + source_bonus.get(pair[1], 0.0), len(pair[0])),
+            key=lambda pair: (_score(pair[0]) + source_bonus.get(pair[1], 0.0) + (4.0 if pair[2] else 0.0), len(pair[0])),
             reverse=True,
         )
         return normalized_candidates[0][0]
 
     expected_norm = normalize_address(expected_addr)
     if not expected_norm:
-        normalized_candidates.sort(key=lambda pair: source_bonus.get(pair[1], 0.0), reverse=True)
+        normalized_candidates.sort(key=lambda pair: (source_bonus.get(pair[1], 0.0) + (4.0 if pair[2] else 0.0)), reverse=True)
         return normalized_candidates[0][0]
 
     expected_pref = CompanyScraper._extract_prefecture(expected_norm)
@@ -549,13 +563,17 @@ def pick_best_address(expected_addr: str | None, candidates: list[str]) -> str |
 
     best = normalized_candidates[0][0]
     best_score = float("-inf")
-    scored_any = False
-    for cand, src in normalized_candidates:
-        if expected_pref and expected_pref not in cand:
-            continue
-        scored_any = True
+    for cand, src, is_hq in normalized_candidates:
         key = CompanyScraper._addr_key(cand)
         score = 0.0
+        if is_hq:
+            score += 6.0
+        if expected_pref:
+            if expected_pref in cand:
+                score += 3.0
+            else:
+                # 都道府県不一致は採用リスクが高いので強めに減点（ただし候補としては保持する）
+                score -= 10.0
         cand_zip_match = ZIP_CODE_RE.search(cand)
         if expected_zip and cand_zip_match and cand_zip_match.group(1) == expected_zip:
             score += 8
@@ -575,8 +593,6 @@ def pick_best_address(expected_addr: str | None, candidates: list[str]) -> str |
         if score > best_score:
             best_score = score
             best = cand
-    if expected_pref and not scored_any:
-        return None
     return best
 
 def pick_best_phone(candidates: list[str]) -> str | None:
@@ -1283,6 +1299,7 @@ async def process():
             cid = company.get("id")
             name = (company.get("company_name") or "").strip()
             addr_raw = (company.get("address") or "").strip()
+            company["csv_address"] = addr_raw
             addr = normalize_address(addr_raw) or ""
             input_addr_has_zip = bool(ZIP_CODE_RE.search(addr))
             input_addr_has_city = bool(CITY_RE.search(addr))
@@ -1464,11 +1481,12 @@ async def process():
                         "deep_fetch_count": int(deep_fetch_count or 0),
                         "deep_fetch_failures": int(deep_fetch_failures or 0),
                         "deep_skip_reason": company.get("deep_skip_reason", "") or deep_skip_reason or "",
-                        "deep_urls_visited": json.dumps(list(deep_urls_visited or [])[:5], ensure_ascii=False),
-                        "deep_phone_candidates": int(deep_phone_candidates or 0),
-                        "deep_address_candidates": int(deep_address_candidates or 0),
-                        "deep_rep_candidates": int(deep_rep_candidates or 0),
-                    })
+	                        "deep_urls_visited": json.dumps(list(deep_urls_visited or [])[:5], ensure_ascii=False),
+	                        "deep_phone_candidates": int(deep_phone_candidates or 0),
+	                        "deep_address_candidates": int(deep_address_candidates or 0),
+	                        "deep_rep_candidates": int(deep_rep_candidates or 0),
+	                        "timeout_stage": timeout_stage or "",
+	                    })
                     manager.save_company_data(company, status="review")
                     timeout_saved = True
                 except Exception:
@@ -1517,6 +1535,14 @@ async def process():
                         },
                     )
                     normalized_found_address = normalize_address(found_address) if found_address else ""
+                    try:
+                        _exclude = exclude_reasons  # type: ignore[name-defined]
+                    except Exception:
+                        _exclude = {}
+                    try:
+                        exclude_reasons_json = json.dumps(_exclude or {}, ensure_ascii=False)
+                    except Exception:
+                        exclude_reasons_json = "{}"
                     company.update(
                         {
                             "homepage": "",
@@ -1551,6 +1577,14 @@ async def process():
                             "deep_phone_candidates": 0,
                             "deep_address_candidates": 0,
                             "deep_rep_candidates": 0,
+                            "top3_urls": json.dumps(top3_urls, ensure_ascii=False),
+                            "exclude_reasons": exclude_reasons_json,
+                            "skip_reason": skip_reason,
+                            "provisional_homepage": "",
+                            "final_homepage": "",
+                            "deep_enabled": 0,
+                            "deep_stop_reason": "no_official",
+                            "timeout_stage": timeout_stage or "",
                         }
                     )
                     manager.save_company_data(company, status="no_homepage")
@@ -1614,6 +1648,7 @@ async def process():
                         log.info("[%s] limiting candidates to top %s (had %s)", cid, max_candidates, len(urls))
                         urls = urls[:max_candidates]
                     url_flags_map, host_flags_map = manager.get_url_flags_batch(urls)
+                    exclude_reasons: dict[str, str] = {}
                     homepage = ""
                     info = None
                     primary_cands: dict[str, list[str]] = {}
@@ -1632,6 +1667,7 @@ async def process():
                     deep_fetch_count = 0
                     deep_fetch_failures = 0
                     deep_skip_reason = ""
+                    deep_stop_reason = ""
                     deep_urls_visited: list[str] = []
                     deep_phone_candidates = 0
                     deep_address_candidates = 0
@@ -1656,7 +1692,22 @@ async def process():
                         if not flag_info and host_for_flag:
                             flag_info = host_flags_map.get(host_for_flag)
                         domain_score_for_flag = scraper._domain_score(company_tokens, url_for_flag)  # type: ignore
+                        # fetch前のURL文字列だけで弾けるものは弾く（コスト最小化）
+                        try:
+                            dir_hint = scraper._detect_directory_like(url_for_flag, text="", html="")  # type: ignore[attr-defined]
+                            if bool(dir_hint.get("is_directory_like")) and int(dir_hint.get("directory_score") or 0) >= 8 and domain_score_for_flag < 4:
+                                exclude_reasons[candidate] = "prefilter_directory_like_url"
+                                log.info("[%s] URLパターンで企業DB/ディレクトリ臭が強いのでfetch前に除外: %s", cid, candidate)
+                                return None
+                        except Exception:
+                            pass
                         if should_skip_by_url_flag(flag_info):
+                            try:
+                                exclude_reasons[candidate] = (
+                                    f"url_flag:{(flag_info.get('judge_source') or '').strip()}:{(flag_info.get('reason') or '').strip()}"
+                                ).strip(":")[:240]
+                            except Exception:
+                                exclude_reasons[candidate] = "url_flag"
                             log.info(
                                 "[%s] 既知の非公式URLを除外: %s (domain_score=%s source=%s conf=%s reason=%s)",
                                 cid,
@@ -1869,7 +1920,7 @@ async def process():
                     ai_official_rejected_record: dict[str, Any] | None = None
                     ai_official_rejected_conf: float = 0.0
                     ai_official_rejected_reason: str = ""
-                    if USE_AI and verifier is not None and hasattr(verifier, "judge_official_homepage"):
+                    if USE_AI_OFFICIAL and USE_AI and verifier is not None and hasattr(verifier, "judge_official_homepage"):
                         ai_tasks: list[asyncio.Task] = []
                         ai_sem = asyncio.Semaphore(2)
 
@@ -2129,34 +2180,17 @@ async def process():
                         ai_content_ok = fast_address_ok or fast_phone_hit or name_hit or host_token_hit
                         if ai_is_official_effective is True:
                             if input_addr_pref_only and not ai_content_ok:
-                                manager.upsert_url_flag(
-                                    normalized_url,
-                                    is_official=False,
-                                    source="rule",
-                                    reason="pref_only_input_no_name_host",
-                                )
-                                fallback_cands.append((record.get("url"), extracted))
-                                log.info("[%s] AI公式だが都道府県のみ＆根拠不足のため除外: %s", cid, record.get("url"))
-                                if ai_conf_f >= ai_official_rejected_conf:
-                                    ai_official_rejected_record = record
-                                    ai_official_rejected_conf = ai_conf_f
-                                    ai_official_rejected_reason = "ai_official_pref_only_no_signal"
-                                continue
+                                # AI公式は探索起点として正義：除外せず provisional として保持する（確定公式にはしない）
+                                record["ai_official_provisional"] = True
+                                record["ai_official_provisional_reason"] = "pref_only_input_no_name_host"
+                                force_review = True
+                                log.info("[%s] AI公式だが都道府県のみ＆根拠不足 -> provisional保持: %s", cid, record.get("url"))
                             if not ai_content_ok:
-                                manager.upsert_url_flag(
-                                    normalized_url,
-                                    is_official=False,
-                                    source="ai",
-                                    reason="ai_no_content_signal",
-                                    confidence=ai_judge.get("confidence"),
-                                )
-                                fallback_cands.append((record.get("url"), extracted))
-                                log.info("[%s] AI公式でもコンテンツ根拠が乏しいため除外: %s", cid, record.get("url"))
-                                if ai_conf_f >= ai_official_rejected_conf:
-                                    ai_official_rejected_record = record
-                                    ai_official_rejected_conf = ai_conf_f
-                                    ai_official_rejected_reason = "ai_official_no_content_signal"
-                                continue
+                                # AI公式は除外しない（確定公式にもせず、deep起点として扱う）
+                                record["ai_official_provisional"] = True
+                                record["ai_official_provisional_reason"] = "ai_no_content_signal"
+                                force_review = True
+                                log.info("[%s] AI公式だがコンテンツ根拠が乏しい -> provisional保持: %s", cid, record.get("url"))
                             info = record.get("info")
                             primary_cands = extracted
                             homepage = normalized_url
@@ -2180,12 +2214,22 @@ async def process():
                                 homepage_official_flag = 0
                                 homepage_official_source = "provisional_freehost"
                                 force_review = True
-                                manager.upsert_url_flag(
-                                    normalized_url,
-                                    is_official=False,
-                                    source="rule",
-                                    reason="free_host_or_weak_signals",
-                                )
+                                # AI公式は「除外禁止」: キャッシュも非公式にせず provisional として保持する
+                                if ai_is_official_effective is True:
+                                    manager.upsert_url_flag(
+                                        normalized_url,
+                                        is_official=True,
+                                        source="ai_provisional",
+                                        reason="ai_official_but_weak_signals",
+                                        confidence=ai_judge.get("confidence"),
+                                    )
+                                else:
+                                    manager.upsert_url_flag(
+                                        normalized_url,
+                                        is_official=False,
+                                        source="rule",
+                                        reason="free_host_or_weak_signals",
+                                    )
                             else:
                                 manager.upsert_url_flag(
                                     normalized_url,
@@ -2383,10 +2427,6 @@ async def process():
                     provisional_name_present = False
                     provisional_address_ok = False
                     best_record: dict[str, Any] | None = None
-                    # 候補が全滅（公式として採用できない）なら、以降の深掘り/補完は行わず次へ進む
-                    if not homepage:
-                        skip_company_reason = "no_official_in_top3"
-                        raise SkipCompany(skip_company_reason)
                     if not homepage and candidate_records:
                         best_score = float("-inf")
                         for record in candidate_records:
@@ -2638,6 +2678,8 @@ async def process():
 
                     info_dict = info or {}
                     info_url = homepage
+                    page_type_per_url: dict[str, str] = {}
+                    drop_reasons: dict[str, str] = {}
 
                     def absorb_doc_data(url: str, pdata: dict[str, Any]) -> None:
                         nonlocal rule_phone, rule_address, rule_rep
@@ -2650,24 +2692,57 @@ async def process():
                         nonlocal founded_val, need_founded
                         nonlocal description_val, need_description
 
-                        cc = scraper.extract_candidates(pdata.get("text", ""), pdata.get("html", ""))
+                        text_val = pdata.get("text", "") or ""
+                        html_val = pdata.get("html", "") or ""
+                        try:
+                            pt = scraper.classify_page_type(url, text=text_val, html=html_val).get("page_type") or "OTHER"
+                        except Exception:
+                            pt = "OTHER"
+                        page_type_per_url[url] = str(pt)
+
+                        cc = scraper.extract_candidates(text_val, html_val)
                         if cc.get("phone_numbers"):
                             cand = pick_best_phone(cc["phone_numbers"])
                             if cand and not rule_phone:
-                                rule_phone = cand
-                                src_phone = url
+                                if pt in {"COMPANY_PROFILE", "ACCESS_CONTACT"}:
+                                    rule_phone = cand
+                                    src_phone = url
+                                else:
+                                    drop_reasons["phone"] = drop_reasons.get("phone") or f"not_profile:{pt}"
                         if cc.get("addresses"):
                             cand_addr = pick_best_address(addr, cc["addresses"])
                             if cand_addr and not rule_address:
-                                rule_address = cand_addr
-                                src_addr = url
+                                cand_norm = normalize_address(cand_addr) or cand_addr
+                                # [HQ]タグがある同一正規化住所が存在する場合のみ採用
+                                def _strip_leading_tags(s: str) -> str:
+                                    out = s or ""
+                                    while True:
+                                        m = re.match(r"^\\[[A-Z_]+\\]", out)
+                                        if not m:
+                                            break
+                                        out = out[m.end():].lstrip()
+                                    return out
+                                has_hq_tag = any(
+                                    isinstance(raw, str)
+                                    and "[HQ]" in raw
+                                    and (normalize_address(_strip_leading_tags(raw)) or "") == cand_norm
+                                    for raw in (cc.get("addresses") or [])
+                                )
+                                if pt in {"COMPANY_PROFILE", "ACCESS_CONTACT"} and has_hq_tag:
+                                    rule_address = cand_norm
+                                    src_addr = url
+                                else:
+                                    drop_reasons["address"] = drop_reasons.get("address") or f"no_hq_marker:{pt}"
                         if cc.get("rep_names"):
                             cand_rep = pick_best_rep(cc["rep_names"], url)
                             cand_rep = scraper.clean_rep_name(cand_rep) if cand_rep else None
                             if cand_rep:
-                                if not rule_rep or len(cand_rep) > len(rule_rep):
-                                    rule_rep = cand_rep
-                                    src_rep = url
+                                if pt == "COMPANY_PROFILE":
+                                    if not rule_rep or len(cand_rep) > len(rule_rep):
+                                        rule_rep = cand_rep
+                                        src_rep = url
+                                else:
+                                    drop_reasons["rep"] = drop_reasons.get("rep") or f"not_profile:{pt}"
                         if cc.get("listings"):
                             candidate = pick_best_listing(cc["listings"])
                             if candidate and not listing_val:
@@ -2854,10 +2929,35 @@ async def process():
                         fiscals = cands.get("fiscal_months") or []
                         founded_years = cands.get("founded_years") or []
 
-                        rule_phone = pick_best_phone(phones) if phones else None
-                        rule_address = pick_best_address(addr, addrs) if addrs else None
-                        rule_rep = pick_best_rep(reps, info_url) if reps else None
-                        rule_rep = scraper.clean_rep_name(rule_rep) if rule_rep else None
+                        # primary_cands は page_type が不明なことがあるため、基本は absorb_doc_data の結果を優先する
+                        pt_info = page_type_per_url.get(info_url) or "OTHER"
+                        if phones and not rule_phone and pt_info in {"COMPANY_PROFILE", "ACCESS_CONTACT"}:
+                            rule_phone = pick_best_phone(phones)
+                        if addrs and not rule_address:
+                            cand_addr = pick_best_address(addr, addrs)
+                            if cand_addr:
+                                cand_norm = normalize_address(cand_addr) or cand_addr
+                                def _strip_leading_tags2(s: str) -> str:
+                                    out = s or ""
+                                    while True:
+                                        m = re.match(r"^\\[[A-Z_]+\\]", out)
+                                        if not m:
+                                            break
+                                        out = out[m.end():].lstrip()
+                                    return out
+                                has_hq_tag = any(
+                                    isinstance(raw, str)
+                                    and "[HQ]" in raw
+                                    and (normalize_address(_strip_leading_tags2(raw)) or "") == cand_norm
+                                    for raw in addrs
+                                )
+                                if pt_info in {"COMPANY_PROFILE", "ACCESS_CONTACT"} and has_hq_tag:
+                                    rule_address = cand_norm
+                                else:
+                                    drop_reasons["address"] = drop_reasons.get("address") or f"no_hq_marker:{pt_info}"
+                        if reps and not rule_rep and pt_info == "COMPANY_PROFILE":
+                            rule_rep = pick_best_rep(reps, info_url)
+                            rule_rep = scraper.clean_rep_name(rule_rep) if rule_rep else None
                         if rule_phone and not src_phone:
                             src_phone = info_url
                         if rule_address and not src_addr:
@@ -2918,6 +3018,11 @@ async def process():
                                 if missing_contact > 0:
                                     priority_limit = 3
                                     target_types.append("contact")
+                                    # provisional/非プロフィール起点だと contact だけでは会社概要に到達しにくいので about も許可する
+                                    base_pt = page_type_per_url.get(info_url) or page_type_per_url.get(homepage) or "OTHER"
+                                    if base_pt != "COMPANY_PROFILE" and "about" not in target_types:
+                                        priority_limit = max(priority_limit, 2)
+                                        target_types.append("about")
                                 if need_description or need_founded or need_listing:
                                     priority_limit = max(priority_limit, 2)
                                     target_types.append("about")
@@ -2947,295 +3052,50 @@ async def process():
                         if site_docs:
                             missing_contact, missing_extra = refresh_need_flags()
 
+                    # AIは最終手段（1社あたり最大1回）なので、この段階では呼び出さない。
+                    # deep後に候補群（住所/電話/代表/会社情報/事業テキスト）をまとめて1回だけAIへ渡す。
                     ai_result = None
                     ai_attempted = False
-                    ai_task: asyncio.Task | None = None
-
-                    missing_contact, missing_extra = refresh_need_flags()
-                    ai_needed = bool(
-                        homepage
-                        and USE_AI
-                        and verifier is not None
-                        and (
-                            missing_contact > 0
-                            or need_description
-                            or need_listing
-                            or need_capital
-                            or need_revenue
-                            or need_profit
-                            or need_fiscal
-                            or need_founded
-                        )
-                    )
-                    if ai_needed and not timed_out and has_time_for_ai():
-                        ai_attempted = True
-                        info_dict = await ensure_info_has_screenshot(scraper, info_url, info_dict, need_screenshot=OFFICIAL_AI_USE_SCREENSHOT)
-                        info = info_dict
-                        desc_source_text = select_relevant_paragraphs(info_dict.get("text", ""))
-                        ai_text_payload = build_ai_text_payload(desc_source_text)
-
-                        async def run_ai_verify():
-                            nonlocal ai_time_spent
-                            if not has_time_for_ai():
-                                return None
-                            ai_started = time.monotonic()
-                            try:
-                                res = await asyncio.wait_for(
-                                    verifier.verify_info(
-                                        ai_text_payload,
-                                        info_dict.get("screenshot"),
-                                        name,
-                                        addr,
-                                    ),
-                                    timeout=clamp_timeout(max(ai_call_timeout, 5.0)),
-                                )
-                            except Exception:
-                                log.warning("[%s] AI検証失敗 -> ルールベースにフォールバック", cid, exc_info=True)
-                                return None
-                            finally:
-                                ai_time_spent += time.monotonic() - ai_started
-                            return res
-
-                        ai_task = asyncio.create_task(run_ai_verify())
-                    elif ai_needed and not timed_out:
-                        ai_needed = False
-
                     ai_phone: str | None = None
                     ai_addr: str | None = None
                     ai_rep: str | None = None
-                    def consume_ai_result(res: dict[str, Any] | None) -> None:
-                        nonlocal ai_used, ai_model, ai_phone, ai_addr, ai_rep
-                        nonlocal address_ai_confidence, address_ai_evidence
-                        if not res:
-                            return
-                        ai_used = 1
-                        ai_model = AI_MODEL_NAME
-                        conf_val = res.get("confidence")
-                        try:
-                            ai_conf = float(conf_val) if conf_val is not None else None
-                        except Exception:
-                            ai_conf = None
-                        # description は低confidenceでも採用してよい（住所/電話と違い誤採用リスクが低い）
-                        desc_candidate = res.get("description")
-                        if isinstance(desc_candidate, str) and desc_candidate.strip():
-                            update_description_candidate(desc_candidate)
-                        if ai_conf is not None and ai_conf < AI_VERIFY_MIN_CONFIDENCE:
-                            log.info(
-                                "[%s] AI low confidence=%.2f (<%.2f) -> ignore fields and continue deep crawl (evidence=%s)",
-                                cid,
-                                ai_conf,
-                                AI_VERIFY_MIN_CONFIDENCE,
-                                res.get("evidence"),
-                            )
-                            return
-                        phone_candidate = normalize_phone(res.get("phone_number"))
-                        if phone_candidate:
-                            ai_phone = phone_candidate
-                        if AI_ADDRESS_ENABLED:
-                            addr_candidate = normalize_address(res.get("address"))
-                            if addr_candidate:
-                                ai_addr = addr_candidate
-                                address_ai_confidence = ai_conf
-                                ev = res.get("evidence")
-                                if isinstance(ev, str) and ev.strip():
-                                    address_ai_evidence = ev.strip()[:200]
-                        rep_candidate = res.get("rep_name") or res.get("representative")
-                        rep_candidate = scraper.clean_rep_name(rep_candidate) if rep_candidate else None
-                        if rep_candidate:
-                            ai_rep = rep_candidate
-                    if ai_task:
-                        ai_result = await ai_task
-                        consume_ai_result(ai_result)
-                    elif ai_needed and info_url and verifier is not None and USE_AI and not timed_out and has_time_for_ai():
-                        # 公式候補はあるがテキストが乏しい場合のフォールバック: 再取得してでもAIを1回回す
-                        try:
-                            info_dict = await ensure_info_has_screenshot(scraper, info_url, info_dict, need_screenshot=OFFICIAL_AI_USE_SCREENSHOT)
-                            ai_started = time.monotonic()
-                            if not has_time_for_ai():
-                                raise asyncio.TimeoutError()
-                            ai_result = await asyncio.wait_for(
-                                verifier.verify_info(
-                                    build_ai_text_payload(info_dict.get("text", "")),
-                                    info_dict.get("screenshot"),
-                                    name,
-                                    addr,
-                                ),
-                                timeout=clamp_timeout(max(ai_call_timeout, 5.0)),
-                            )
-                            ai_time_spent += time.monotonic() - ai_started
-                            ai_attempted = True
-                        except Exception:
-                            ai_result = None
-                        consume_ai_result(ai_result)
-                    else:
-                        if ai_attempted and AI_COOLDOWN_SEC > 0:
-                            await asyncio.sleep(jittered_seconds(AI_COOLDOWN_SEC, JITTER_RATIO))
+
                     missing_contact, missing_extra = refresh_need_flags()
-                    if need_description and USE_AI_DESCRIPTION and verifier is not None and info_dict and not timed_out and has_time_for_ai():
-                        desc_source = select_relevant_paragraphs(info_dict.get("text", "") or "")
-                        try:
-                            ai_desc = await asyncio.wait_for(
-                                verifier.generate_description(
-                                    build_ai_text_payload(desc_source),
-                                    info_dict.get("screenshot"),
-                                    name,
-                                    addr,
-                                ),
-                                timeout=clamp_timeout(max(ai_call_timeout, 5.0)),
-                            )
-                        except asyncio.TimeoutError:
-                            ai_desc = None
-                        except Exception:
-                            ai_desc = None
-                        if ai_desc:
-                            description_val = ai_desc
-                            need_description = False
-                            ai_used = 1
-                            ai_model = AI_MODEL_NAME
-
-                    # AI 2回目: まだ欠損がある場合に、優先リンクから集めたテキストで再度問い合わせ
-                    if USE_AI and verifier is not None and priority_docs and not timed_out and has_time_for_ai():
-                        provisional_contact_missing = int(not (phone or ai_phone or rule_phone)) + int(not (found_address or ai_addr or rule_address or addr)) + int(not (rep_name_val or ai_rep or rule_rep))
-                        missing_extra = sum([
-                            int(need_description),
-                            int(need_listing),
-                            int(need_capital),
-                            int(need_revenue),
-                            int(need_profit),
-                            int(need_fiscal),
-                            int(need_founded),
-                        ])
-                        missing_fields = (provisional_contact_missing > 0) or (missing_extra >= 2)
-                        if missing_fields:
-                            combined_sources = [select_relevant_paragraphs(v.get("text", "") or "") for v in priority_docs.values()]
-                            combined_text = build_ai_text_payload(*combined_sources)
-                            if combined_text.strip():
-                                screenshot_payload = None
-                                if info_url:
-                                    info_dict = await ensure_info_has_screenshot(scraper, info_url, info_dict, need_screenshot=OFFICIAL_AI_USE_SCREENSHOT)
-                                screenshot_payload = (info_dict or {}).get("screenshot")
-                                async def run_ai_verify2():
-                                    nonlocal ai_time_spent
-                                    if not has_time_for_ai():
-                                        return None
-                                    ai_started = time.monotonic()
-                                    try:
-                                        if not has_time_for_ai():
-                                            return None
-                                        return await asyncio.wait_for(
-                                            verifier.verify_info(combined_text, screenshot_payload, name, addr),
-                                            timeout=clamp_timeout(max(ai_call_timeout, 5.0)),
-                                        )
-                                    except Exception:
-                                        return None
-                                    finally:
-                                        ai_time_spent += time.monotonic() - ai_started
-                                ai_attempted = True
-                                ai_result2 = await run_ai_verify2()
-                                if ai_result2:
-                                    conf_val2 = ai_result2.get("confidence")
-                                    try:
-                                        ai_conf2 = float(conf_val2) if conf_val2 is not None else None
-                                    except Exception:
-                                        ai_conf2 = None
-                                    if ai_conf2 is not None and ai_conf2 < AI_VERIFY_MIN_CONFIDENCE:
-                                        log.info(
-                                            "[%s] AI(low) second pass confidence=%.2f (<%.2f) -> ignore fields (evidence=%s)",
-                                            cid,
-                                            ai_conf2,
-                                            AI_VERIFY_MIN_CONFIDENCE,
-                                            ai_result2.get("evidence"),
-                                        )
-                                        ai_result2 = None
-                                        ai_conf2 = None
-                                if ai_result2:
-                                    ai_used = 1
-                                    ai_model = AI_MODEL_NAME
-                                    ai_phone2 = normalize_phone(ai_result2.get("phone_number"))
-                                    ai_addr2 = normalize_address(ai_result2.get("address")) if AI_ADDRESS_ENABLED else None
-                                    ai_rep2 = ai_result2.get("rep_name") or ai_result2.get("representative")
-                                    ai_rep2 = scraper.clean_rep_name(ai_rep2) if ai_rep2 else None
-                                    desc2 = ai_result2.get("description")
-                                    if ai_phone2 and not phone:
-                                        phone = ai_phone2
-                                        phone_source = "ai"
-                                        src_phone = info_url
-                                    if ai_addr2 and not found_address:
-                                        found_address = ai_addr2
-                                        address_source = "ai"
-                                        src_addr = info_url
-                                    if ai_rep2 and (not rep_name_val or len(ai_rep2) > len(rep_name_val)):
-                                        rep_name_val = ai_rep2
-                                        src_rep = info_url
-                                    if isinstance(desc2, str) and desc2.strip():
-                                        update_description_candidate(desc2)
-
-                        missing_contact, missing_extra = refresh_need_flags()
-                        if need_description and USE_AI_DESCRIPTION and verifier is not None and has_time_for_ai():
-                            combined_sources = [select_relevant_paragraphs(v.get("text", "") or "") for v in priority_docs.values()]
-                            combined_text = build_ai_text_payload(*combined_sources)
-                            screenshot_payload = (info_dict or {}).get("screenshot") if info_dict else None
-                            try:
-                                ai_desc2 = await asyncio.wait_for(
-                                    verifier.generate_description(combined_text, screenshot_payload, name, addr),
-                                    timeout=clamp_timeout(max(ai_call_timeout, 5.0)),
-                                )
-                            except asyncio.TimeoutError:
-                                ai_desc2 = None
-                            except Exception:
-                                ai_desc2 = None
-                            if ai_desc2:
-                                description_val = ai_desc2
+                    if need_description:
+                        payloads: list[dict[str, Any]] = []
+                        if info_dict:
+                            payloads.append(info_dict)
+                        payloads.extend(priority_docs.values())
+                        for pdata in payloads:
+                            desc = extract_description_from_payload(pdata)
+                            if desc:
+                                description_val = desc
                                 need_description = False
-                                ai_used = 1
-                                ai_model = AI_MODEL_NAME
-                        if need_description:
-                            payloads: list[dict[str, Any]] = []
-                            if info_dict:
-                                payloads.append(info_dict)
-                            payloads.extend(priority_docs.values())
-                            for pdata in payloads:
-                                desc = extract_description_from_payload(pdata)
-                                if desc:
-                                    description_val = desc
-                                    need_description = False
-                                    break
+                                break
 
-                        if ai_phone:
-                            phone = ai_phone
-                            phone_source = "ai"
+                    if rule_phone:
+                        phone = rule_phone
+                        phone_source = "rule"
+                        if not src_phone:
                             src_phone = info_url
-                        elif rule_phone:
-                            phone = rule_phone
-                            phone_source = "rule"
-                            if not src_phone:
-                                src_phone = info_url
-                        else:
-                            phone = ""
-                            phone_source = "none"
+                    else:
+                        phone = ""
+                        phone_source = "none"
 
-                        if rule_address:
-                            found_address = rule_address
-                            address_source = "rule"
-                            if not src_addr:
-                                src_addr = info_url
-                        elif ai_addr:
-                            found_address = ai_addr
-                            address_source = "ai"
+                    if rule_address:
+                        found_address = rule_address
+                        address_source = "rule"
+                        if not src_addr:
                             src_addr = info_url
-                        else:
-                            found_address = rule_address or ""
-                            address_source = "none"
+                    else:
+                        found_address = rule_address or ""
+                        address_source = "none"
 
-                        if ai_rep:
-                            if not rep_name_val or len(ai_rep) > len(rep_name_val):
-                                rep_name_val = ai_rep
+                    if rule_rep:
+                        if not rep_name_val or len(rule_rep) > len(rep_name_val):
+                            rep_name_val = rule_rep
+                            if not src_rep:
                                 src_rep = info_url
-                        elif rule_rep:
-                            if not rep_name_val or len(rule_rep) > len(rep_name_val):
-                                rep_name_val = rule_rep
-                                if not src_rep:
-                                    src_rep = info_url
 
                         # ???????????????????????????????
                         deep_pages_visited = 0
@@ -3315,6 +3175,7 @@ async def process():
                             deep_fetch_count = int((related_meta or {}).get("fetch_count") or 0)
                             deep_fetch_failures = int((related_meta or {}).get("fetch_failures") or 0)
                             deep_urls_visited = list((related_meta or {}).get("urls_visited") or list(related.keys()))
+                            deep_stop_reason = str((related_meta or {}).get("stop_reason") or "")
                             if related:
                                 try:
                                     log.info("[%s] deep_crawl visited=%s", cid, list(related.keys()))
@@ -3334,6 +3195,11 @@ async def process():
                             for url, data in related.items():
                                 text = data.get("text", "") or ""
                                 html_content = data.get("html", "") or ""
+                                try:
+                                    pt = scraper.classify_page_type(url, text=text, html=html_content).get("page_type") or "OTHER"
+                                except Exception:
+                                    pt = "OTHER"
+                                page_type_per_url[url] = str(pt)
                                 cc = scraper.extract_candidates(text, html_content)
                                 deep_phone_candidates += len(cc.get("phone_numbers") or [])
                                 deep_address_candidates += len(cc.get("addresses") or [])
@@ -3341,31 +3207,55 @@ async def process():
                                 if need_phone and cc.get("phone_numbers"):
                                     cand = pick_best_phone(cc["phone_numbers"])
                                     if cand:
-                                        phone = cand
-                                        phone_source = "rule"
-                                        src_phone = url
-                                        need_phone = False
-                                        log.info("[%s] deep_crawl picked phone=%s url=%s", cid, cand, url)
+                                        if pt in {"COMPANY_PROFILE", "ACCESS_CONTACT"}:
+                                            phone = cand
+                                            phone_source = "rule"
+                                            src_phone = url
+                                            need_phone = False
+                                            log.info("[%s] deep_crawl picked phone=%s url=%s", cid, cand, url)
+                                        else:
+                                            drop_reasons["phone"] = drop_reasons.get("phone") or f"not_profile:{pt}"
                                     else:
                                         log.info("[%s] deep_crawl rejected phones url=%s candidates=%s", cid, url, (cc.get("phone_numbers") or [])[:3])
                                 if need_addr and cc.get("addresses"):
                                     cand_addr = pick_best_address(addr, cc["addresses"])
                                     if cand_addr:
-                                        found_address = cand_addr
-                                        address_source = "rule"
-                                        src_addr = url
-                                        need_addr = False
-                                        log.info("[%s] deep_crawl picked address=%s url=%s", cid, cand_addr, url)
+                                        cand_norm = normalize_address(cand_addr) or cand_addr
+                                        def _strip_leading_tags3(s: str) -> str:
+                                            out = s or ""
+                                            while True:
+                                                m = re.match(r"^\\[[A-Z_]+\\]", out)
+                                                if not m:
+                                                    break
+                                                out = out[m.end():].lstrip()
+                                            return out
+                                        has_hq_tag = any(
+                                            isinstance(raw, str)
+                                            and "[HQ]" in raw
+                                            and (normalize_address(_strip_leading_tags3(raw)) or "") == cand_norm
+                                            for raw in (cc.get("addresses") or [])
+                                        )
+                                        if pt in {"COMPANY_PROFILE", "ACCESS_CONTACT"} and has_hq_tag:
+                                            found_address = cand_norm
+                                            address_source = "rule"
+                                            src_addr = url
+                                            need_addr = False
+                                            log.info("[%s] deep_crawl picked address=%s url=%s", cid, cand_norm, url)
+                                        else:
+                                            drop_reasons["address"] = drop_reasons.get("address") or f"no_hq_marker:{pt}"
                                     else:
                                         log.info("[%s] deep_crawl rejected addresses url=%s candidates=%s", cid, url, (cc.get("addresses") or [])[:3])
                                 if need_rep and cc.get("rep_names"):
                                     cand_rep = pick_best_rep(cc["rep_names"], url)
                                     cand_rep = scraper.clean_rep_name(cand_rep) if cand_rep else None
                                     if cand_rep:
-                                        rep_name_val = cand_rep
-                                        src_rep = url
-                                        need_rep = False
-                                        log.info("[%s] deep_crawl picked rep=%s url=%s", cid, cand_rep, url)
+                                        if pt == "COMPANY_PROFILE":
+                                            rep_name_val = cand_rep
+                                            src_rep = url
+                                            need_rep = False
+                                            log.info("[%s] deep_crawl picked rep=%s url=%s", cid, cand_rep, url)
+                                        else:
+                                            drop_reasons["rep"] = drop_reasons.get("rep") or f"not_profile:{pt}"
                                 if need_description and cc.get("description"):
                                     desc = clean_description_value(cc["description"])
                                     if desc:
@@ -3427,6 +3317,186 @@ async def process():
                                 absorb_doc_data(url, pdata)
 
                         deep_phase_end = elapsed()
+                        # ---- AI (final, max 1 call/company) ----
+                        missing_contact, missing_extra = refresh_need_flags()
+                        ai_need_final = bool(
+                            homepage
+                            and USE_AI
+                            and not USE_AI_OFFICIAL
+                            and verifier is not None
+                            and not timed_out
+                            and has_time_for_ai()
+                            and (
+                                missing_contact > 0
+                                or missing_extra > 0
+                                or (not description_val)
+                            )
+                        )
+                        if ai_need_final:
+                            try:
+                                # 取得済みdocsから、page_type優先で最大3ページ分だけAIへ渡す（探索増なし）
+                                docs_by_url: dict[str, dict[str, Any]] = {}
+                                if info_url and info_dict:
+                                    docs_by_url[info_url] = {
+                                        "text": info_dict.get("text", "") or "",
+                                        "html": info_dict.get("html", "") or "",
+                                    }
+                                for u, d in (priority_docs or {}).items():
+                                    if u not in docs_by_url:
+                                        docs_by_url[u] = d
+                                for u, d in (related or {}).items():
+                                    if u not in docs_by_url:
+                                        docs_by_url[u] = {
+                                            "text": d.get("text", "") or "",
+                                            "html": d.get("html", "") or "",
+                                        }
+
+                                def _pt_priority(pt: str) -> int:
+                                    return {"COMPANY_PROFILE": 0, "ACCESS_CONTACT": 1, "OTHER": 2, "BASES_LIST": 3, "DIRECTORY_DB": 4}.get(pt, 9)
+
+                                scored_urls: list[tuple[int, str]] = []
+                                for u, d in docs_by_url.items():
+                                    try:
+                                        pt = page_type_per_url.get(u) or scraper.classify_page_type(
+                                            u, text=d.get("text", ""), html=d.get("html", "")
+                                        ).get("page_type") or "OTHER"
+                                    except Exception:
+                                        pt = page_type_per_url.get(u) or "OTHER"
+                                    page_type_per_url[u] = str(pt)
+                                    scored_urls.append((_pt_priority(str(pt)), u))
+                                scored_urls.sort(key=lambda x: (x[0], x[1]))
+                                top_urls_for_ai = [u for _, u in scored_urls if u][:3]
+
+                                def _pack_candidates(urls_for_ai: list[str]) -> dict[str, Any]:
+                                    out: dict[str, Any] = {
+                                        "company_name": name,
+                                        "csv_address": addr_raw,
+                                        "urls": [],
+                                        "candidates": {
+                                            "phone_numbers": [],
+                                            "addresses": [],
+                                            "representatives": [],
+                                            "company_facts": {"capitals": [], "founded": [], "listing": []},
+                                        },
+                                        "business_snippets": [],
+                                    }
+                                    for u in urls_for_ai:
+                                        d = docs_by_url.get(u) or {}
+                                        t = d.get("text", "") or ""
+                                        h = d.get("html", "") or ""
+                                        pt = page_type_per_url.get(u) or "OTHER"
+                                        out["urls"].append({"url": u, "page_type": pt})
+                                        cc = scraper.extract_candidates(t, h)
+                                        for p in (cc.get("phone_numbers") or [])[:10]:
+                                            out["candidates"]["phone_numbers"].append({"value": p, "url": u, "page_type": pt})
+                                        for a in (cc.get("addresses") or [])[:10]:
+                                            out["candidates"]["addresses"].append({"value": a, "url": u, "page_type": pt})
+                                        for r in (cc.get("rep_names") or [])[:10]:
+                                            out["candidates"]["representatives"].append({"value": r, "url": u, "page_type": pt})
+                                        for c in (cc.get("capitals") or [])[:8]:
+                                            out["candidates"]["company_facts"]["capitals"].append({"value": c, "url": u, "page_type": pt})
+                                        for fy in (cc.get("founded_years") or [])[:6]:
+                                            out["candidates"]["company_facts"]["founded"].append({"value": fy, "url": u, "page_type": pt})
+                                        for li in (cc.get("listings") or [])[:6]:
+                                            out["candidates"]["company_facts"]["listing"].append({"value": li, "url": u, "page_type": pt})
+                                        biz = select_relevant_paragraphs(t, limit=3)
+                                        if biz:
+                                            out["business_snippets"].append({"url": u, "snippet": biz[:800], "page_type": pt})
+                                    return out
+
+                                ai_payload = _pack_candidates(top_urls_for_ai)
+                                screenshot_payload = None
+                                if info_url:
+                                    info_dict = await ensure_info_has_screenshot(
+                                        scraper, info_url, info_dict, need_screenshot=OFFICIAL_AI_USE_SCREENSHOT
+                                    )
+                                    screenshot_payload = (info_dict or {}).get("screenshot")
+
+                                ai_started = time.monotonic()
+                                ai_attempted = True
+                                ai_result = await asyncio.wait_for(
+                                    verifier.select_company_fields(ai_payload, screenshot_payload, name, addr_raw),
+                                    timeout=clamp_timeout(max(ai_call_timeout, 5.0)),
+                                )
+                                ai_time_spent += time.monotonic() - ai_started
+                            except Exception:
+                                ai_result = None
+
+                            if isinstance(ai_result, dict):
+                                ai_used = 1
+                                ai_model = AI_MODEL_NAME
+                                company["ai_confidence"] = ai_result.get("confidence")
+                                company["ai_reason"] = "final_selection"
+                                def _strip_tags_for_ai(raw: str) -> str:
+                                    out = raw or ""
+                                    while True:
+                                        m = re.match(r"^\\[[A-Z_]+\\]", out)
+                                        if not m:
+                                            break
+                                        out = out[m.end():].lstrip()
+                                    return out
+                                def _find_src(cands: list[dict[str, Any]], kind: str, chosen: str) -> str:
+                                    if not chosen:
+                                        return ""
+                                    for it in cands or []:
+                                        if not isinstance(it, dict):
+                                            continue
+                                        raw = it.get("value")
+                                        url0 = it.get("url")
+                                        if not (isinstance(raw, str) and isinstance(url0, str) and url0):
+                                            continue
+                                        raw_val = _strip_tags_for_ai(raw)
+                                        if kind == "phone" and (normalize_phone(raw_val) or "") == chosen:
+                                            return url0
+                                        if kind == "address" and (normalize_address(raw_val) or "") == chosen:
+                                            return url0
+                                        if kind == "rep":
+                                            cleaned = scraper.clean_rep_name(raw_val) or ""
+                                            if cleaned and cleaned == chosen:
+                                                return url0
+                                    return ""
+                                if not description_val and isinstance(ai_result.get("description"), str) and ai_result.get("description"):
+                                    description_val = ai_result["description"]
+                                    try:
+                                        company["description_evidence"] = json.dumps(ai_result.get("description_evidence") or [], ensure_ascii=False)
+                                    except Exception:
+                                        company["description_evidence"] = ""
+                                if not phone and isinstance(ai_result.get("phone_number"), str) and ai_result.get("phone_number"):
+                                    phone = normalize_phone(ai_result.get("phone_number")) or ""
+                                    if phone:
+                                        phone_source = "ai"
+                                        src_phone = _find_src(ai_payload.get("candidates", {}).get("phone_numbers") or [], "phone", phone)
+                                if not found_address and isinstance(ai_result.get("address"), str) and ai_result.get("address"):
+                                    addr_ai = normalize_address(ai_result.get("address"))
+                                    if addr_ai:
+                                        found_address = addr_ai
+                                        address_source = "ai"
+                                        src_addr = _find_src(ai_payload.get("candidates", {}).get("addresses") or [], "address", found_address)
+                                        ev = ai_result.get("evidence")
+                                        if isinstance(ev, str) and ev.strip():
+                                            address_ai_evidence = ev.strip()[:200]
+                                if not rep_name_val and isinstance(ai_result.get("representative"), str) and ai_result.get("representative"):
+                                    rep_candidate = scraper.clean_rep_name(ai_result.get("representative"))
+                                    if rep_candidate:
+                                        rep_name_val = rep_candidate
+                                        src_rep = _find_src(ai_payload.get("candidates", {}).get("representatives") or [], "rep", rep_name_val)
+                                facts = ai_result.get("company_facts") if isinstance(ai_result.get("company_facts"), dict) else {}
+                                if not founded_val and isinstance(facts.get("founded"), str) and facts.get("founded"):
+                                    founded_val = clean_founded_year(facts.get("founded"))
+                                if not capital_val and isinstance(facts.get("capital"), str) and facts.get("capital"):
+                                    capital_val = clean_amount_value(facts.get("capital"))
+                                if isinstance(facts.get("employees"), str) and facts.get("employees"):
+                                    company["employees"] = str(facts.get("employees"))[:60]
+                                if isinstance(facts.get("license"), str) and facts.get("license"):
+                                    company["license"] = str(facts.get("license"))[:80]
+                                if isinstance(ai_result.get("industry"), str) and ai_result.get("industry"):
+                                    company["industry"] = str(ai_result.get("industry"))[:60]
+                                if isinstance(ai_result.get("business_tags"), list):
+                                    try:
+                                        company["business_tags"] = json.dumps(ai_result.get("business_tags")[:5], ensure_ascii=False)
+                                    except Exception:
+                                        company["business_tags"] = ""
+
                         expected_phone = phone or rule_phone or None
                         expected_addr = found_address or addr or rule_address or ""
                         expected_addr = normalize_address(expected_addr) or ""
@@ -3588,6 +3658,12 @@ async def process():
                         normalized_found_address = normalize_address(found_address) if found_address else ""
                         if not normalized_found_address and addr:
                             normalized_found_address = normalize_address(addr) or ""
+                        csv_pref = CompanyScraper._extract_prefecture(addr) if addr else ""
+                        hp_pref = CompanyScraper._extract_prefecture(normalized_found_address) if normalized_found_address else ""
+                        pref_match = int(bool(csv_pref and hp_pref and csv_pref == hp_pref)) if (csv_pref and hp_pref) else None
+                        csv_city_m = CITY_RE.search(addr or "")
+                        hp_city_m = CITY_RE.search(normalized_found_address or "")
+                        city_match = int(bool(csv_city_m and hp_city_m and csv_city_m.group(1) == hp_city_m.group(1))) if (csv_city_m and hp_city_m) else None
                         rep_name_val = scraper.clean_rep_name(rep_name_val) or ""
                         description_val = clean_description_value(sanitize_text_block(description_val))
                         listing_val = clean_listing_value(listing_val)
@@ -3647,6 +3723,26 @@ async def process():
                             "deep_phone_candidates": int(deep_phone_candidates or 0),
                             "deep_address_candidates": int(deep_address_candidates or 0),
                             "deep_rep_candidates": int(deep_rep_candidates or 0),
+                            "top3_urls": json.dumps(list(urls or [])[:3], ensure_ascii=False),
+                            "exclude_reasons": json.dumps(exclude_reasons or {}, ensure_ascii=False),
+                            "skip_reason": (company.get("skip_reason") or "").strip(),
+                            "provisional_homepage": (provisional_homepage or ""),
+                            "final_homepage": (homepage or ""),
+                            "deep_enabled": int(bool(deep_pages_visited or deep_fetch_count)),
+                            "deep_stop_reason": (deep_stop_reason or deep_skip_reason or ""),
+                            "timeout_stage": timeout_stage or "",
+                            "page_type_per_url": json.dumps(page_type_per_url or {}, ensure_ascii=False),
+                            "extracted_candidates_count": json.dumps(
+                                {
+                                    "phone": int(deep_phone_candidates or 0) + len((primary_cands or {}).get("phone_numbers") or []),
+                                    "address": int(deep_address_candidates or 0) + len((primary_cands or {}).get("addresses") or []),
+                                    "rep": int(deep_rep_candidates or 0) + len((primary_cands or {}).get("rep_names") or []),
+                                },
+                                ensure_ascii=False,
+                            ),
+                            "drop_reasons": json.dumps(drop_reasons or {}, ensure_ascii=False),
+                            "pref_match": pref_match,
+                            "city_match": city_match,
                         })
 
                         had_verify_target = bool(

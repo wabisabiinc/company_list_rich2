@@ -302,6 +302,69 @@ class DatabaseManager:
         if "deep_rep_candidates" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN deep_rep_candidates INTEGER;")
             cols.add("deep_rep_candidates")
+        if "csv_address" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN csv_address TEXT;")
+            cols.add("csv_address")
+        if "top3_urls" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN top3_urls TEXT;")
+            cols.add("top3_urls")
+        if "exclude_reasons" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN exclude_reasons TEXT;")
+            cols.add("exclude_reasons")
+        if "skip_reason" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN skip_reason TEXT;")
+            cols.add("skip_reason")
+        if "provisional_homepage" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN provisional_homepage TEXT;")
+            cols.add("provisional_homepage")
+        if "final_homepage" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN final_homepage TEXT;")
+            cols.add("final_homepage")
+        if "deep_enabled" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN deep_enabled INTEGER;")
+            cols.add("deep_enabled")
+        if "deep_stop_reason" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN deep_stop_reason TEXT;")
+            cols.add("deep_stop_reason")
+        if "timeout_stage" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN timeout_stage TEXT;")
+            cols.add("timeout_stage")
+        if "page_type_per_url" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN page_type_per_url TEXT;")
+            cols.add("page_type_per_url")
+        if "extracted_candidates_count" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN extracted_candidates_count TEXT;")
+            cols.add("extracted_candidates_count")
+        if "drop_reasons" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN drop_reasons TEXT;")
+            cols.add("drop_reasons")
+        if "pref_match" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN pref_match INTEGER;")
+            cols.add("pref_match")
+        if "city_match" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN city_match INTEGER;")
+            cols.add("city_match")
+        if "industry" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN industry TEXT;")
+            cols.add("industry")
+        if "business_tags" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN business_tags TEXT;")
+            cols.add("business_tags")
+        if "license" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN license TEXT;")
+            cols.add("license")
+        if "employees" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN employees TEXT;")
+            cols.add("employees")
+        if "description_evidence" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN description_evidence TEXT;")
+            cols.add("description_evidence")
+        if "ai_confidence" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN ai_confidence REAL;")
+            cols.add("ai_confidence")
+        if "ai_reason" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN ai_reason TEXT;")
+            cols.add("ai_reason")
 
         self.conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_companies_name_addr ON companies(company_name, address);"
@@ -673,6 +736,8 @@ class DatabaseManager:
             return ""
 
         raw_address = (company.get("address") or "").strip()
+        csv_address = (company.get("csv_address") or "").strip() or raw_address
+        set_value("csv_address", csv_address)
         set_value("homepage", company.get("homepage", "") or "")
         cleaned_phone = _clean_phone(company.get("phone"))
         set_value("phone", cleaned_phone)
@@ -680,6 +745,7 @@ class DatabaseManager:
         set_value("found_address", found_addr_clean)
         # 住所上書き（CSV住所 -> HP住所）は誤爆しやすいので、都道府県不一致時は厳格に制限する
         found_addr = found_addr_clean or ""
+        baseline_address = csv_address or raw_address
         final_address = raw_address
         conflict_level = ""
         review_reason = ""
@@ -689,7 +755,7 @@ class DatabaseManager:
             (company.get("homepage_official_flag") == 1)
             and float(company.get("homepage_official_score") or 0.0) >= 4.0
         )
-        csv_pref = _extract_prefecture(raw_address)
+        csv_pref = _extract_prefecture(baseline_address)
         hp_pref = _extract_prefecture(found_addr)
         pref_diff = bool(csv_pref and hp_pref and csv_pref != hp_pref)
 
@@ -725,16 +791,16 @@ class DatabaseManager:
                 if strong_official or addr_source in {"official", "rule"}:
                     has_zip = bool(re.search(r"\d{3}-\d{4}", found_addr))
                     has_city = bool(re.search(r"(\u5e02|\u533a|\u753a|\u6751|\u90e1)", found_addr))
-                    raw_has_zip = bool(re.search(r"\d{3}-\d{4}", raw_address))
-                    raw_has_city = bool(re.search(r"(\u5e02|\u533a|\u753a|\u6751|\u90e1)", raw_address))
+                    raw_has_zip = bool(re.search(r"\d{3}-\d{4}", baseline_address))
+                    raw_has_city = bool(re.search(r"(\u5e02|\u533a|\u753a|\u6751|\u90e1)", baseline_address))
                     allow_overwrite = bool(
-                        (not raw_address)
-                        or len(found_addr) > len(raw_address)
+                        (not baseline_address)
+                        or len(found_addr) > len(baseline_address)
                         or (has_zip and not raw_has_zip)
                         or (has_city and not raw_has_city)
                     )
                     # CSVに都道府県があるのに、取得住所に都道府県が無い場合は品質劣化のため上書きしない
-                    if allow_overwrite and csv_pref and not hp_pref and raw_address:
+                    if allow_overwrite and csv_pref and not hp_pref and baseline_address:
                         allow_overwrite = False
             else:
                 conflict_level = "pref_mismatch"
@@ -766,6 +832,8 @@ class DatabaseManager:
         set_value("description", company.get("description", "") or "")
         set_value("ai_used", int(company.get("ai_used", 0) or 0))
         set_value("ai_model", company.get("ai_model", "") or "")
+        set_value("ai_confidence", company.get("ai_confidence"))
+        set_value("ai_reason", company.get("ai_reason", "") or "")
         set_value("phone_source", company.get("phone_source", "") or "")
         set_value("address_source", company.get("address_source", "") or "")
         set_value("extract_confidence", company.get("extract_confidence"))
@@ -796,6 +864,24 @@ class DatabaseManager:
         set_value("deep_phone_candidates", company.get("deep_phone_candidates"))
         set_value("deep_address_candidates", company.get("deep_address_candidates"))
         set_value("deep_rep_candidates", company.get("deep_rep_candidates"))
+        set_value("top3_urls", company.get("top3_urls", "") or "")
+        set_value("exclude_reasons", company.get("exclude_reasons", "") or "")
+        set_value("skip_reason", company.get("skip_reason", "") or "")
+        set_value("provisional_homepage", company.get("provisional_homepage", "") or "")
+        set_value("final_homepage", company.get("final_homepage", "") or "")
+        set_value("deep_enabled", company.get("deep_enabled"))
+        set_value("deep_stop_reason", company.get("deep_stop_reason", "") or "")
+        set_value("timeout_stage", company.get("timeout_stage", "") or "")
+        set_value("page_type_per_url", company.get("page_type_per_url", "") or "")
+        set_value("extracted_candidates_count", company.get("extracted_candidates_count", "") or "")
+        set_value("drop_reasons", company.get("drop_reasons", "") or "")
+        set_value("pref_match", company.get("pref_match"))
+        set_value("city_match", company.get("city_match"))
+        set_value("industry", company.get("industry", "") or "")
+        set_value("business_tags", company.get("business_tags", "") or "")
+        set_value("license", company.get("license", "") or "")
+        set_value("employees", company.get("employees", "") or "")
+        set_value("description_evidence", company.get("description_evidence", "") or "")
 
         if "last_checked_at" in cols:
             updates.append("last_checked_at = datetime('now')")

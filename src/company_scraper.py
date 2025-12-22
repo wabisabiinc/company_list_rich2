@@ -3572,13 +3572,6 @@ class CompanyScraper:
             if hop >= max_hops:
                 continue
 
-            # 入力住所の都道府県があるのに、ページ側の都道府県が明確に不一致なら深掘りを打ち切る
-            if expected_pref:
-                found_prefs = set(PREFECTURE_NAME_RE.findall(results[url]["text"] or ""))
-                if 0 < len(found_prefs) <= 3 and expected_pref not in found_prefs:
-                    meta["skipped_pref_mismatch"] += 1
-                    continue
-
             missing: List[str] = []
             if need_phone:
                 missing.append("phone")
@@ -3612,6 +3605,13 @@ class CompanyScraper:
             elif (need_listing or need_capital or need_revenue or need_profit or need_fiscal or need_founded):
                 focus_targets.add("overview")
             ranked_links = self._rank_links(url, html, focus=focus_targets)
+            # 入力住所の都道府県があるのに、ページ側の都道府県が明確に不一致なら深掘りを縮小する。
+            # ただし「会社概要/企業情報」導線が欲しい場合が多いので profile/overview を狙う場合は継続する。
+            if expected_pref and ("profile" not in focus_targets) and ("overview" not in focus_targets):
+                found_prefs = set(PREFECTURE_NAME_RE.findall(results[url]["text"] or ""))
+                if 0 < len(found_prefs) <= 3 and expected_pref not in found_prefs:
+                    meta["skipped_pref_mismatch"] += 1
+                    continue
             for child in ranked_links:
                 if child in visited:
                     continue
@@ -3642,6 +3642,92 @@ class CompanyScraper:
             else:
                 meta["stop_reason"] = "unknown"
         return (results, meta) if return_meta else results
+
+    def classify_page_type(self, url: str, text: str = "", html: str = "") -> Dict[str, Any]:
+        """
+        AI禁止の軽量ページ分類。
+        COMPANY_PROFILE / ACCESS_CONTACT / BASES_LIST / DIRECTORY_DB / OTHER
+        """
+        url = url or ""
+        text_nfkc = unicodedata.normalize("NFKC", text or "")
+        text_low = text_nfkc.lower()
+
+        directory = self._detect_directory_like(url, text=text_nfkc, html=html or "")
+        if bool(directory.get("is_directory_like")):
+            return {
+                "page_type": "DIRECTORY_DB",
+                "score": int(directory.get("directory_score") or 0),
+                "reason": "directory_like",
+                "directory_reasons": list(directory.get("directory_reasons") or [])[:8],
+            }
+
+        title = ""
+        headings = ""
+        has_table_or_dl = False
+        try:
+            soup = BeautifulSoup(html or "", "html.parser")
+            if soup.title and soup.title.string:
+                title = soup.title.string.strip()
+            hs: list[str] = []
+            for tag in ("h1", "h2", "h3"):
+                for node in soup.find_all(tag)[:12]:
+                    t = node.get_text(" ", strip=True)
+                    if t:
+                        hs.append(t)
+            headings = " ".join(hs)
+            has_table_or_dl = bool(soup.find("table") or soup.find("dl"))
+            if not text_nfkc and html:
+                try:
+                    text_nfkc = unicodedata.normalize("NFKC", soup.get_text(" ", strip=True) or "")
+                    text_low = text_nfkc.lower()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        head_all = f"{title}\n{headings}".strip()
+        head_low = unicodedata.normalize("NFKC", head_all).lower()
+
+        profile_kw = (
+            "会社概要", "会社情報", "企業情報", "会社案内", "法人概要", "企業概要",
+            "outline", "profile", "overview", "company profile", "corporate profile",
+        )
+        contact_kw = (
+            "お問い合わせ", "お問合せ", "問合せ", "contact", "inquiry",
+            "アクセス", "access", "所在地", "location",
+        )
+        bases_kw = (
+            "拠点一覧", "営業所一覧", "店舗一覧", "事業所一覧", "支店一覧", "工場一覧",
+            "センター一覧", "拠点", "営業所", "事業所", "支店", "店舗", "工場", "センター",
+        )
+
+        label_hits = 0
+        for kw in (
+            "本社所在地", "本店所在地", "所在地", "住所", "電話", "TEL", "代表", "代表取締役",
+            "設立", "創業", "資本金", "従業員", "事業内容", "許認可",
+        ):
+            if kw.lower() in text_low:
+                label_hits += 1
+
+        # BASES_LIST: 住所/拠点が多数並ぶページ
+        zip_count = len(re.findall(r"\d{3}[-‐―－ー]?\d{4}", text_nfkc))
+        branch_hits = sum(1 for kw in bases_kw if kw.lower() in text_low)
+        pref_count = len(set(PREFECTURE_NAME_RE.findall(text_nfkc)))
+        if ("拠点一覧" in head_all) or ("店舗一覧" in head_all) or ("営業所一覧" in head_all) or zip_count >= 3 or pref_count >= 6 or branch_hits >= 6:
+            return {"page_type": "BASES_LIST", "score": max(zip_count, pref_count, branch_hits), "reason": "bases_list_signals"}
+
+        is_profile_heading = any(kw in head_low for kw in (k.lower() for k in profile_kw))
+        is_profile_path = any(seg in (url.lower()) for seg in ("/company", "/about", "/corporate", "/profile", "/overview", "/outline"))
+        if (is_profile_heading or is_profile_path) and has_table_or_dl and label_hits >= 4:
+            return {"page_type": "COMPANY_PROFILE", "score": label_hits, "reason": "profile_heading+labels"}
+        if is_profile_heading and label_hits >= 3:
+            return {"page_type": "COMPANY_PROFILE", "score": label_hits, "reason": "profile_heading"}
+
+        is_contact_heading = any(kw in head_low for kw in (k.lower() for k in contact_kw))
+        if is_contact_heading or any(seg in url.lower() for seg in ("/contact", "/inquiry", "/access", "/toiawase")):
+            return {"page_type": "ACCESS_CONTACT", "score": label_hits, "reason": "contact_heading_or_path"}
+
+        return {"page_type": "OTHER", "score": label_hits, "reason": "default"}
 
     # ===== 抽出 =====
     def extract_candidates(self, text: str, html: Optional[str] = None) -> Dict[str, List[str]]:
@@ -4053,7 +4139,11 @@ class CompanyScraper:
                     elif field == "addresses":
                         norm_addr = self._normalize_address_candidate(raw_value)
                         if norm_addr and self.looks_like_address(norm_addr):
-                            addrs.append(f"[TABLE]{norm_addr}" if is_table_pair else f"[LABEL]{norm_addr}")
+                            prefix = "[TABLE]" if is_table_pair else "[LABEL]"
+                            hq_labels = ("本社", "本店", "本社所在地", "本店所在地", "所在地(本社)")
+                            if any(h in norm_label for h in hq_labels):
+                                prefix += "[HQ]"
+                            addrs.append(f"{prefix}{norm_addr}")
                             matched = True
                     elif field == "listing":
                         listings.append(raw_value if not is_table_pair else f"[TABLE]{raw_value}")
