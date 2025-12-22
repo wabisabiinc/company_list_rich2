@@ -61,6 +61,7 @@ load_dotenv()
 # --------------------------------------------------
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 USE_AI = os.getenv("USE_AI", "true").lower() == "true"
+# description はAIで常時生成（verify_infoで同時生成）。追加の説明専用AI呼び出しを有効にしたい場合のみ true。
 USE_AI_DESCRIPTION = os.getenv("USE_AI_DESCRIPTION", "false").lower() == "true"
 WORKER_ID = os.getenv("WORKER_ID", "w1")  # 並列識別子
 COMPANIES_DB_PATH = os.getenv("COMPANIES_DB_PATH", "data/companies.db")
@@ -95,7 +96,8 @@ GLOBAL_HARD_TIMEOUT_SEC = float(os.getenv("GLOBAL_HARD_TIMEOUT_SEC", "60"))
 COMPANY_HARD_TIMEOUT_SEC = float(os.getenv("COMPANY_HARD_TIMEOUT_SEC", "60"))
 DEEP_PHASE_TIMEOUT_SEC = float(os.getenv("DEEP_PHASE_TIMEOUT_SEC", "120"))
 OFFICIAL_AI_USE_SCREENSHOT = os.getenv("OFFICIAL_AI_USE_SCREENSHOT", "true").lower() == "true"
-AI_ADDRESS_ENABLED = os.getenv("AI_ADDRESS_ENABLED", "false").lower() == "true"
+# 住所はAIの出力も取り込みつつ、DB側で都道府県不一致の上書きを厳格に制限する
+AI_ADDRESS_ENABLED = os.getenv("AI_ADDRESS_ENABLED", "true").lower() == "true"
 SECOND_PASS_ENABLED = os.getenv("SECOND_PASS_ENABLED", "false").lower() == "true"
 SECOND_PASS_RETRY_STATUSES = [s.strip() for s in os.getenv("SECOND_PASS_RETRY_STATUSES", "review,no_homepage,error").split(",") if s.strip()]
 LONG_PAGE_TIMEOUT_MS = int(os.getenv("LONG_PAGE_TIMEOUT_MS", os.getenv("PAGE_TIMEOUT_MS", "9000")))
@@ -105,6 +107,9 @@ LONG_TIME_LIMIT_WITH_OFFICIAL = float(os.getenv("LONG_TIME_LIMIT_WITH_OFFICIAL",
 LONG_TIME_LIMIT_DEEP = float(os.getenv("LONG_TIME_LIMIT_DEEP", os.getenv("TIME_LIMIT_DEEP", "60")))
 AI_MIN_REMAINING_SEC = float(os.getenv("AI_MIN_REMAINING_SEC", "2.5"))
 AI_VERIFY_MIN_CONFIDENCE = float(os.getenv("AI_VERIFY_MIN_CONFIDENCE", "0.65"))
+# url_flags に保存された「AI非公式」判定を、候補URL取得前に強制スキップするための閾値。
+# 低confidenceのAI判定は誤爆しやすいので、一定以上のみハードに扱う（それ未満は再評価対象）。
+AI_SKIP_NEGATIVE_FLAG_MIN_CONFIDENCE = float(os.getenv("AI_SKIP_NEGATIVE_FLAG_MIN_CONFIDENCE", "0.85"))
 DEFAULT_TIME_LIMIT_FETCH_ONLY = TIME_LIMIT_FETCH_ONLY
 DEFAULT_TIME_LIMIT_WITH_OFFICIAL = TIME_LIMIT_WITH_OFFICIAL
 DEFAULT_TIME_LIMIT_DEEP = TIME_LIMIT_DEEP
@@ -133,7 +138,8 @@ ADDRESS_JS_NOISE_RE = re.compile(
     re.IGNORECASE,
 )
 ADDRESS_FORM_NOISE_RE = re.compile(
-    r"(住所検索|都道府県|市区町村|マンション・?ビル名|郵便番号\s*[（(]?\s*半角)",
+    # フォーム由来のラベル/説明文だけを狙う（単語の素朴な出現は弾かない）
+    r"(住所検索|郵便番号\s*[（(]?\s*半角|マンション・?ビル名|市区町村・番地|都道府県\b|都道府県\s*(?:選択|入力|[:：])|市区町村\s*(?:選択|入力|[:：]))",
     re.IGNORECASE,
 )
 KANJI_TOKEN_RE = re.compile(r"[一-龥]{2,}")
@@ -273,6 +279,10 @@ def normalize_address(s: str | None) -> str | None:
     s = re.sub(r"[‐―－ー]+", "-", s)
     s = re.sub(r"\s+", " ", s)
     s = re.sub(r"^〒\s*", "〒", s)
+    # （市区町村コード:12208）等の「住所ではない補助情報」を除去（フォームノイズ判定に引っかかるのを防ぐ）
+    # ※ 正規化で「コード」の長音が '-' になるケースがあるので両対応
+    s = re.sub(r"[（(]\s*(?:市区町村|自治体)コ[-ー]ド\s*[:：]\s*\d+\s*[)）]", "", s)
+    s = re.sub(r"(?:市区町村|自治体)コ[-ー]ド\s*[:：]\s*\d+", "", s)
     s = _strip_address_label(s)
     s = _cut_trailing_non_address(s)
     # 住所入力フォームのラベル/候補一覧が混入したケースを除外
@@ -394,6 +404,26 @@ def _is_free_host(url: str) -> bool:
     if host.startswith("www."):
         host = host[4:]
     return any(host.endswith(suf) for suf in FREE_HOST_SUFFIXES)
+
+def should_skip_by_url_flag(flag_info: dict | None) -> bool:
+    """
+    url_flags の「非公式」判定を候補URLの事前スキップに使うかどうか。
+    - ルール由来（directory_like 等）や高confidenceのAIはハードに扱う
+    - 低confidenceのAI非公式は誤爆しやすいので再評価対象としてスキップしない
+    """
+    if not flag_info:
+        return False
+    if flag_info.get("is_official") is not False:
+        return False
+    source = (flag_info.get("judge_source") or "").strip().lower()
+    conf = flag_info.get("confidence")
+    try:
+        conf_f = float(conf) if conf is not None else None
+    except Exception:
+        conf_f = None
+    if source == "ai" and (conf_f is None or conf_f < AI_SKIP_NEGATIVE_FLAG_MIN_CONFIDENCE):
+        return False
+    return True
 
 
 def _official_signal_ok(
@@ -1583,8 +1613,16 @@ async def process():
                         if not flag_info and host_for_flag:
                             flag_info = host_flags_map.get(host_for_flag)
                         domain_score_for_flag = scraper._domain_score(company_tokens, url_for_flag)  # type: ignore
-                        if flag_info and flag_info.get("is_official") is False:
-                            log.info("[%s] 既知の非公式URLを除外: %s (domain_score=%s)", cid, candidate, domain_score_for_flag)
+                        if should_skip_by_url_flag(flag_info):
+                            log.info(
+                                "[%s] 既知の非公式URLを除外: %s (domain_score=%s source=%s conf=%s reason=%s)",
+                                cid,
+                                candidate,
+                                domain_score_for_flag,
+                                flag_info.get("judge_source"),
+                                flag_info.get("confidence"),
+                                flag_info.get("reason"),
+                            )
                             return None
                         candidate_info: Dict[str, Any] | None = None
 
@@ -1976,6 +2014,10 @@ async def process():
                             log.info("[%s] 企業DB/ディレクトリ判定のため除外: %s", cid, record.get("url"))
                             continue
 
+                        ai_is_official = None
+                        ai_is_official_effective = None
+                        ai_conf_f = 0.0
+
                         if ai_judge:
                             ai_is_official = ai_judge.get("is_official_site")
                             if ai_is_official is None:
@@ -1987,23 +2029,27 @@ async def process():
                                 ai_conf_f = float(ai_conf) if ai_conf is not None else 0.0
                             except Exception:
                                 ai_conf_f = 0.0
-                            # AIが非公式 or 低confidence の場合は候補URLを落として次へ（企業DBが勝たないようにする）
-                            if (ai_is_official is False) or (ai_conf_f < AI_VERIFY_MIN_CONFIDENCE):
-                                manager.upsert_url_flag(
-                                    normalized_url,
-                                    is_official=False,
-                                    source="ai",
-                                    reason=ai_judge.get("reason", "") or "ai_low_confidence_or_not_official",
-                                    confidence=ai_conf_f,
-                                )
+                            ai_is_official_effective = (
+                                ai_is_official if ai_conf_f >= AI_VERIFY_MIN_CONFIDENCE else None
+                            )
+                            # AIが「非公式」かつconfidenceが十分高い場合のみ、強い除外として扱う
+                            if ai_is_official_effective is False:
                                 rule_strong_for_conflict = bool(
-                                    host_token_hit
+                                    content_strong
+                                    or host_token_hit
                                     or strong_domain_host
                                     or rule_details.get("strong_domain")
                                     or domain_score >= 5
                                     or evidence_score >= 10
                                 )
                                 if not rule_strong_for_conflict:
+                                    manager.upsert_url_flag(
+                                        normalized_url,
+                                        is_official=False,
+                                        source="ai",
+                                        reason=ai_judge.get("reason", "") or "ai_not_official",
+                                        confidence=ai_conf_f,
+                                    )
                                     fallback_cands.append((record.get("url"), extracted))
                                     log.info(
                                         "[%s] AI判定で除外: %s (is_official=%s confidence=%.2f)",
@@ -2018,102 +2064,105 @@ async def process():
                                 record["ai_conflict_confidence"] = ai_conf_f
                                 force_review = True
                                 log.info(
-                                    "[%s] AI非公式/低confだがルール根拠が強いので保持(review): %s (domain=%s evidence=%s conf=%.2f)",
+                                    "[%s] AI非公式だがルール根拠が強いので保持(review): %s (domain=%s evidence=%s conf=%.2f)",
                                     cid,
                                     record.get("url"),
                                     domain_score,
                                     evidence_score,
                                     ai_conf_f,
                                 )
+                            elif ai_conf_f < AI_VERIFY_MIN_CONFIDENCE:
+                                # 低confidenceは誤爆しやすいので除外には使わず、ルール判定で続行する
+                                record["ai_low_confidence"] = True
 
-                            fast_phone_hit = bool(extracted.get("phone_numbers"))
-                            fast_address_ok = address_ok or bool(rule_details.get("address_match"))
-                            fast_domain_ok = (
-                                domain_score >= 4
-                                or host_token_hit
-                                or strong_domain_host
-                                or rule_details.get("strong_domain")
-                            )
-                            ai_content_ok = fast_address_ok or fast_phone_hit or name_hit or host_token_hit
-                            if ai_is_official is True:
-                                if input_addr_pref_only and not ai_content_ok:
-                                    manager.upsert_url_flag(
-                                        normalized_url,
-                                        is_official=False,
-                                        source="rule",
-                                        reason="pref_only_input_no_name_host",
-                                    )
-                                    fallback_cands.append((record.get("url"), extracted))
-                                    log.info("[%s] AI公式だが都道府県のみ＆根拠不足のため除外: %s", cid, record.get("url"))
-                                    if ai_conf_f >= ai_official_rejected_conf:
-                                        ai_official_rejected_record = record
-                                        ai_official_rejected_conf = ai_conf_f
-                                        ai_official_rejected_reason = "ai_official_pref_only_no_signal"
-                                    continue
-                                if not ai_content_ok:
-                                    manager.upsert_url_flag(
-                                        normalized_url,
-                                        is_official=False,
-                                        source="ai",
-                                        reason="ai_no_content_signal",
-                                        confidence=ai_judge.get("confidence"),
-                                    )
-                                    fallback_cands.append((record.get("url"), extracted))
-                                    log.info("[%s] AI公式でもコンテンツ根拠が乏しいため除外: %s", cid, record.get("url"))
-                                    if ai_conf_f >= ai_official_rejected_conf:
-                                        ai_official_rejected_record = record
-                                        ai_official_rejected_conf = ai_conf_f
-                                        ai_official_rejected_reason = "ai_official_no_content_signal"
-                                    continue
-                                info = record.get("info")
-                                primary_cands = extracted
-                                homepage = normalized_url
-                                homepage_official_flag = 1
-                                homepage_official_source = "ai_fast" if fast_domain_ok else "ai_review"
-                                homepage_official_score = float(rule_details.get("score") or 0.0)
-                                ai_official_description = ai_judge.get("description") if isinstance(ai_judge, dict) else None
-                                chosen_domain_score = domain_score
-                                selected_candidate_record = record
-                                if not fast_domain_ok or (addr and not address_ok):
-                                    force_review = True
-                                free_host = _is_free_host(homepage)
-                                if (free_host and evidence_score < 10) or not _official_signal_ok(
-                                    host_token_hit=host_token_hit,
-                                    strong_domain_host=strong_domain_host,
-                                    domain_score=domain_score,
-                                    name_hit=name_hit,
-                                    address_ok=address_ok,
-                                    official_evidence_score=evidence_score,
-                                ):
-                                    homepage_official_flag = 0
-                                    homepage_official_source = "provisional_freehost"
-                                    force_review = True
-                                    manager.upsert_url_flag(
-                                        normalized_url,
-                                        is_official=False,
-                                        source="rule",
-                                        reason="free_host_or_weak_signals",
-                                    )
-                                else:
-                                    manager.upsert_url_flag(
-                                        normalized_url,
-                                        is_official=True,
-                                        source=homepage_official_source,
-                                        reason=ai_judge.get("reason", ""),
-                                        confidence=ai_judge.get("confidence"),
-                                    )
-                                log.info(
-                                    "[%s] AI公式採用: %s (source=%s domain=%s host=%s addr=%s phone=%s review=%s)",
-                                    cid,
+                        fast_phone_hit = bool(extracted.get("phone_numbers"))
+                        fast_address_ok = address_ok or bool(rule_details.get("address_match"))
+                        fast_domain_ok = (
+                            domain_score >= 4
+                            or host_token_hit
+                            or strong_domain_host
+                            or rule_details.get("strong_domain")
+                        )
+                        ai_content_ok = fast_address_ok or fast_phone_hit or name_hit or host_token_hit
+                        if ai_is_official_effective is True:
+                            if input_addr_pref_only and not ai_content_ok:
+                                manager.upsert_url_flag(
                                     normalized_url,
-                                    homepage_official_source,
-                                    domain_score,
-                                    host_token_hit,
-                                    fast_address_ok,
-                                    fast_phone_hit,
-                                    force_review,
+                                    is_official=False,
+                                    source="rule",
+                                    reason="pref_only_input_no_name_host",
                                 )
-                                break
+                                fallback_cands.append((record.get("url"), extracted))
+                                log.info("[%s] AI公式だが都道府県のみ＆根拠不足のため除外: %s", cid, record.get("url"))
+                                if ai_conf_f >= ai_official_rejected_conf:
+                                    ai_official_rejected_record = record
+                                    ai_official_rejected_conf = ai_conf_f
+                                    ai_official_rejected_reason = "ai_official_pref_only_no_signal"
+                                continue
+                            if not ai_content_ok:
+                                manager.upsert_url_flag(
+                                    normalized_url,
+                                    is_official=False,
+                                    source="ai",
+                                    reason="ai_no_content_signal",
+                                    confidence=ai_judge.get("confidence"),
+                                )
+                                fallback_cands.append((record.get("url"), extracted))
+                                log.info("[%s] AI公式でもコンテンツ根拠が乏しいため除外: %s", cid, record.get("url"))
+                                if ai_conf_f >= ai_official_rejected_conf:
+                                    ai_official_rejected_record = record
+                                    ai_official_rejected_conf = ai_conf_f
+                                    ai_official_rejected_reason = "ai_official_no_content_signal"
+                                continue
+                            info = record.get("info")
+                            primary_cands = extracted
+                            homepage = normalized_url
+                            homepage_official_flag = 1
+                            homepage_official_source = "ai_fast" if fast_domain_ok else "ai_review"
+                            homepage_official_score = float(rule_details.get("score") or 0.0)
+                            ai_official_description = ai_judge.get("description") if isinstance(ai_judge, dict) else None
+                            chosen_domain_score = domain_score
+                            selected_candidate_record = record
+                            if not fast_domain_ok or (addr and not address_ok):
+                                force_review = True
+                            free_host = _is_free_host(homepage)
+                            if (free_host and evidence_score < 10) or not _official_signal_ok(
+                                host_token_hit=host_token_hit,
+                                strong_domain_host=strong_domain_host,
+                                domain_score=domain_score,
+                                name_hit=name_hit,
+                                address_ok=address_ok,
+                                official_evidence_score=evidence_score,
+                            ):
+                                homepage_official_flag = 0
+                                homepage_official_source = "provisional_freehost"
+                                force_review = True
+                                manager.upsert_url_flag(
+                                    normalized_url,
+                                    is_official=False,
+                                    source="rule",
+                                    reason="free_host_or_weak_signals",
+                                )
+                            else:
+                                manager.upsert_url_flag(
+                                    normalized_url,
+                                    is_official=True,
+                                    source=homepage_official_source,
+                                    reason=ai_judge.get("reason", ""),
+                                    confidence=ai_judge.get("confidence"),
+                                )
+                            log.info(
+                                "[%s] AI公式採用: %s (source=%s domain=%s host=%s addr=%s phone=%s review=%s)",
+                                cid,
+                                normalized_url,
+                                homepage_official_source,
+                                domain_score,
+                                host_token_hit,
+                                fast_address_ok,
+                                fast_phone_hit,
+                                force_review,
+                            )
+                            break
 
                         brand_allowed = (allowed_tld or whitelist_host) and not host_token_hit
                         if (
@@ -2911,7 +2960,6 @@ async def process():
                     ai_phone: str | None = None
                     ai_addr: str | None = None
                     ai_rep: str | None = None
-                    ai_desc: str | None = None
                     def consume_ai_result(res: dict[str, Any] | None) -> None:
                         nonlocal ai_used, ai_model, ai_phone, ai_addr, ai_rep
                         nonlocal address_ai_confidence, address_ai_evidence
@@ -2924,6 +2972,10 @@ async def process():
                             ai_conf = float(conf_val) if conf_val is not None else None
                         except Exception:
                             ai_conf = None
+                        # description は低confidenceでも採用してよい（住所/電話と違い誤採用リスクが低い）
+                        desc_candidate = res.get("description")
+                        if isinstance(desc_candidate, str) and desc_candidate.strip():
+                            update_description_candidate(desc_candidate)
                         if ai_conf is not None and ai_conf < AI_VERIFY_MIN_CONFIDENCE:
                             log.info(
                                 "[%s] AI low confidence=%.2f (<%.2f) -> ignore fields and continue deep crawl (evidence=%s)",
@@ -2948,17 +3000,9 @@ async def process():
                         rep_candidate = scraper.clean_rep_name(rep_candidate) if rep_candidate else None
                         if rep_candidate:
                             ai_rep = rep_candidate
-                        desc_candidate = res.get("description")
-                        if isinstance(desc_candidate, str) and desc_candidate.strip():
-                            update_description_candidate(desc_candidate)
                     if ai_task:
                         ai_result = await ai_task
                         consume_ai_result(ai_result)
-                        if ai_desc and not description_val:
-                            cleaned_ai_desc = clean_description_value(ai_desc)
-                            if cleaned_ai_desc:
-                                description_val = cleaned_ai_desc
-                                need_description = False
                     elif ai_needed and info_url and verifier is not None and USE_AI and not timed_out and has_time_for_ai():
                         # 公式候補はあるがテキストが乏しい場合のフォールバック: 再取得してでもAIを1回回す
                         try:

@@ -116,6 +116,23 @@ def _normalize_address(addr: Optional[str]) -> Optional[str]:
     if not addr:
         return None
     a = re.sub(r"\s+", " ", addr.strip())
+    # 住所の後ろに混入しがちな付帯情報をカット（AI出力の誤混入対策）
+    cut_re = re.compile(
+        r"\s*(?:"
+        r"TEL|電話|☎|℡|FAX|ファックス|メール|E[-\s]?mail|"
+        r"地図|マップ|Google\s*マップ|アクセス|行き方|ルート|経路|"
+        r"営業時間|受付時間|定休日|"
+        r"従業員(?:数)?|社員(?:数)?|職員(?:数)?|スタッフ(?:数)?|人数|"
+        r"資本金|設立|創業|沿革|代表者|代表取締役|"
+        r"(?:市区町村|自治体)コ[-ー]ド"
+        r")\b",
+        re.IGNORECASE,
+    )
+    m = cut_re.search(a)
+    if m:
+        a = a[: m.start()].strip()
+    # （市区町村コード:12208）等の括弧付帯情報を削除
+    a = re.sub(r"[（(]\s*(?:市区町村|自治体)コ[-ー]ド\s*[:：]\s*\d+\s*[)）]", "", a)
     # 郵便番号があれば 〒を付けて統一
     m = re.search(r"(\d{3}-\d{4})\s*(.+)", a)
     if m:
@@ -320,18 +337,22 @@ class AIVerifier:
         snippet = _shorten_text(text or "", max_len=3500)
         return (
             "あなたは日本企業の公式Webサイトから「代表電話番号」と「本社/本店所在地住所」を抽出する専門家です。\n"
+            "加えて、事業内容だけを1文で要約（description）してください。\n"
             "推測は禁止。確証がない場合は null を返してください。\n"
             "出力はJSONのみ（説明文やマークダウンは禁止）。\n"
             "重要:\n"
             "- 支店・営業所・事業所・工場・店舗・センター・倉庫・拠点一覧の住所は、本社/本店である確証がない限り採用しない。\n"
             "- FAX/直通/採用窓口/問い合わせ窓口など、代表以外の番号は採用しない。\n"
             "- Cookie/利用規約/ナビ/フッター/メニュー等の定型文やHTML/CSS/JS断片を住所に混ぜない。\n"
+            "- address は「住所のみ」を返す（アクセス案内/営業時間/従業員数/許認可/コード類/地図/連絡先を混ぜない）。\n"
+            "- description は事業内容のみ（問い合わせ/採用/アクセス/所在地/電話/URL/メール等は除外）。日本語1文で60〜120文字。迷ったら null。\n"
             "厳守:\n"
             "- csv_address（入力住所）と抽出候補住所の都道府県が不一致なら、住所近傍に「本社所在地/本店所在地」等の明示があり、代表電話も同ページ等で確認できる場合に限り address を返す。迷ったら null。\n"
             f"対象企業: {company_name or '不明'} / csv_address: {address or '不明'}\n"
             "{\n"
             '  "phone_number": "03-1234-5678" または null,\n'
             '  "address": "東京都新宿区西新宿1-1-1 ○○ビル3F" または null,\n'
+            '  "description": "事業内容の要約(60〜120文字・日本語1文)" または null,\n'
             '  "confidence": 0.0-1.0,\n'
             '  "evidence": "根拠となる原文抜粋（20〜80文字程度）" または null\n'
             "}\n"
@@ -405,6 +426,11 @@ class AIVerifier:
 
             phone = _normalize_phone(result.get("phone_number"))
             addr = _normalize_address(result.get("address"))
+            desc = result.get("description")
+            if isinstance(desc, str) and desc.strip():
+                desc = self._validate_description(desc)
+            else:
+                desc = None
             confidence_val = result.get("confidence")
             try:
                 confidence = float(confidence_val) if confidence_val is not None else None
@@ -488,12 +514,13 @@ class AIVerifier:
                         if has_branch and not has_hq:
                             addr = None
 
-            if evidence and not (phone or addr):
+            if evidence and not (phone or addr or desc):
                 evidence = None
 
             return {
                 "phone_number": phone,
                 "address": addr,
+                "description": desc,
                 "confidence": confidence,
                 "evidence": evidence,
             }

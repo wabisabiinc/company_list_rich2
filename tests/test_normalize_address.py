@@ -34,3 +34,8 @@ def test_normalize_address_strips_leading_label():
 def test_normalize_address_strips_broken_html_tag_fragments():
     raw = "〒151-0053 東京都渋谷区代々木2丁目28番12号 <div class=\\\"x\\\""
     assert normalize_address(raw) == "〒151-0053 東京都渋谷区代々木2丁目28番12号"
+
+
+def test_normalize_address_does_not_reject_city_code_suffix():
+    raw = "〒278-0055 千葉県野田市岩名2023番地6（市区町村コード:12208）"
+    assert normalize_address(raw) == "〒278-0055 千葉県野田市岩名2023番地6"

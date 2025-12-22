@@ -28,6 +28,7 @@ async def test_verify_info_success():
     fake_json = {
         "phone_number": "03-0000-0000",
         "address": "東京都中央区1-1-1",
+        "description": "法人向けの業務支援システムを開発・提供する企業です。",
         "confidence": 0.93,
         "evidence": "代表電話：03-0000-0000　所在地：東京都中央区1-1-1",
     }
@@ -46,6 +47,7 @@ async def test_verify_info_success():
     assert isinstance(result, dict)
     assert result["phone_number"] == "03-0000-0000"
     assert result["address"] == "東京都中央区1-1-1"
+    assert isinstance(result.get("description"), str)
     assert abs(result["confidence"] - 0.93) < 1e-6
     assert isinstance(result.get("evidence"), str)
 
