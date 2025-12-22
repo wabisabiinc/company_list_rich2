@@ -2299,6 +2299,8 @@ async def process():
                     verify_result = {"phone_ok": False, "address_ok": False}
                     verify_result_source = "none"
                     confidence = 0.0
+                    address_ai_confidence: float | None = None
+                    address_ai_evidence: str | None = None
                     rule_phone = None
                     rule_address = None
                     rule_rep = None
@@ -2674,6 +2676,7 @@ async def process():
                     ai_desc: str | None = None
                     def consume_ai_result(res: dict[str, Any] | None) -> None:
                         nonlocal ai_used, ai_model, ai_phone, ai_addr, ai_rep
+                        nonlocal address_ai_confidence, address_ai_evidence
                         if not res:
                             return
                         ai_used = 1
@@ -2699,6 +2702,10 @@ async def process():
                             addr_candidate = normalize_address(res.get("address"))
                             if addr_candidate:
                                 ai_addr = addr_candidate
+                                address_ai_confidence = ai_conf
+                                ev = res.get("evidence")
+                                if isinstance(ev, str) and ev.strip():
+                                    address_ai_evidence = ev.strip()[:200]
                         rep_candidate = res.get("rep_name") or res.get("representative")
                         rep_candidate = scraper.clean_rep_name(rep_candidate) if rep_candidate else None
                         if rep_candidate:
@@ -3243,6 +3250,8 @@ async def process():
                             "homepage_official_flag": homepage_official_flag,
                             "homepage_official_source": homepage_official_source,
                             "homepage_official_score": homepage_official_score,
+                            "address_confidence": address_ai_confidence,
+                            "address_evidence": address_ai_evidence,
                         })
 
                         had_verify_target = bool(

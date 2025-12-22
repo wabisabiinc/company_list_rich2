@@ -235,6 +235,18 @@ class DatabaseManager:
         if "accuracy_address" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN accuracy_address TEXT;")
             cols.add("accuracy_address")
+        if "address_confidence" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN address_confidence REAL;")
+            cols.add("address_confidence")
+        if "address_evidence" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN address_evidence TEXT;")
+            cols.add("address_evidence")
+        if "address_conflict_level" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN address_conflict_level TEXT;")
+            cols.add("address_conflict_level")
+        if "address_review_reason" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN address_review_reason TEXT;")
+            cols.add("address_review_reason")
 
     def _ensure_indexes(self) -> None:
         cols = self._get_table_columns()
@@ -616,34 +628,113 @@ class DatabaseManager:
                 updates.append(f"{column} = ?")
                 params.append(value)
 
+        def _extract_prefecture(addr: str) -> str:
+            if not addr:
+                return ""
+            # 重い依存を避けるためここに静的リストを保持する
+            prefectures = (
+                "北海道", "青森県", "岩手県", "宮城県", "秋田県", "山形県", "福島県",
+                "茨城県", "栃木県", "群馬県", "埼玉県", "千葉県", "東京都", "神奈川県",
+                "新潟県", "富山県", "石川県", "福井県", "山梨県", "長野県",
+                "岐阜県", "静岡県", "愛知県", "三重県",
+                "滋賀県", "京都府", "大阪府", "兵庫県", "奈良県", "和歌山県",
+                "鳥取県", "島根県", "岡山県", "広島県", "山口県",
+                "徳島県", "香川県", "愛媛県", "高知県",
+                "福岡県", "佐賀県", "長崎県", "熊本県", "大分県", "宮崎県", "鹿児島県",
+                "沖縄県",
+            )
+            for p in prefectures:
+                if p in addr:
+                    return p
+            return ""
+
         raw_address = (company.get("address") or "").strip()
         set_value("homepage", company.get("homepage", "") or "")
         cleaned_phone = _clean_phone(company.get("phone"))
         set_value("phone", cleaned_phone)
         found_addr_clean = _clean_address(company.get("found_address"))
         set_value("found_address", found_addr_clean)
-        final_address = raw_address
+        # 住所上書き（CSV住所 -> HP住所）は誤爆しやすいので、都道府県不一致時は厳格に制限する
         found_addr = found_addr_clean or ""
+        final_address = raw_address
+        conflict_level = ""
+        review_reason = ""
+
+        addr_source = (company.get("address_source") or "").lower()
+        strong_official = bool(
+            (company.get("homepage_official_flag") == 1)
+            and float(company.get("homepage_official_score") or 0.0) >= 4.0
+        )
+        csv_pref = _extract_prefecture(raw_address)
+        hp_pref = _extract_prefecture(found_addr)
+        pref_diff = bool(csv_pref and hp_pref and csv_pref != hp_pref)
+
+        # 追加のAI呼び出しは行わず、既に得られている根拠だけで判断する
+        address_confidence = company.get("address_confidence")
+        if address_confidence is None and addr_source == "ai":
+            address_confidence = company.get("extract_confidence")
+        try:
+            address_conf_f = float(address_confidence) if address_confidence is not None else None
+        except Exception:
+            address_conf_f = None
+        evidence = (company.get("address_evidence") or "").strip()
+        hq_markers = ("本社所在地", "本店所在地", "本社", "本店")
+        has_hq_evidence = any(m in evidence for m in hq_markers)
+
+        src_url_addr = (company.get("source_url_address") or "").strip()
+        src_url_phone = (company.get("source_url_phone") or "").strip()
+        phone_same_page = bool(cleaned_phone and src_url_addr and src_url_phone and src_url_phone == src_url_addr)
+
+        def _page_type_ok(url: str) -> bool:
+            low = url.lower()
+            if not low:
+                return True
+            allow = ("/company", "/about", "/profile", "/overview", "/corporate")
+            deny = ("/contact", "/inquiry", "/toiawase", "お問い合わせ", "お問合せ", "問合せ")
+            if any(d in low for d in deny) and not any(a in low for a in allow):
+                return False
+            return True
+
+        allow_overwrite = False
         if found_addr:
-            strong_official = bool(
-                (company.get("homepage_official_flag") == 1)
-                and float(company.get("homepage_official_score") or 0.0) >= 4.0
-            )
-            addr_source = (company.get("address_source") or "").lower()
-            if strong_official or addr_source in {"official", "rule"}:
-                has_zip = bool(re.search(r"\d{3}-\d{4}", found_addr))
-                has_city = bool(re.search(r"(\u5e02|\u533a|\u753a|\u6751|\u90e1)", found_addr))
-                raw_has_zip = bool(re.search(r"\d{3}-\d{4}", raw_address))
-                raw_has_city = bool(re.search(r"(\u5e02|\u533a|\u753a|\u6751|\u90e1)", raw_address))
-                if (
-                    not raw_address
-                    or len(found_addr) > len(raw_address)
-                    or (has_zip and not raw_has_zip)
-                    or (has_city and not raw_has_city)
-                ):
-                    final_address = found_addr
-                    company["address"] = final_address
+            if not pref_diff:
+                if strong_official or addr_source in {"official", "rule"}:
+                    has_zip = bool(re.search(r"\d{3}-\d{4}", found_addr))
+                    has_city = bool(re.search(r"(\u5e02|\u533a|\u753a|\u6751|\u90e1)", found_addr))
+                    raw_has_zip = bool(re.search(r"\d{3}-\d{4}", raw_address))
+                    raw_has_city = bool(re.search(r"(\u5e02|\u533a|\u753a|\u6751|\u90e1)", raw_address))
+                    allow_overwrite = bool(
+                        (not raw_address)
+                        or len(found_addr) > len(raw_address)
+                        or (has_zip and not raw_has_zip)
+                        or (has_city and not raw_has_city)
+                    )
+            else:
+                conflict_level = "pref_mismatch"
+                # 都道府県不一致は原則上書き禁止。例外は「本社/本店の明示 + 代表電話同ページ + 高confidence + ページ種別OK」
+                allow_overwrite = bool(
+                    strong_official
+                    and addr_source == "ai"
+                    and (address_conf_f is not None and address_conf_f >= 0.90)
+                    and has_hq_evidence
+                    and phone_same_page
+                    and _page_type_ok(src_url_addr)
+                )
+                if not allow_overwrite:
+                    review_reason = "pref_mismatch_no_strong_hq_evidence"
+                    if status == "done":
+                        status = "review"
+                else:
+                    conflict_level = "pref_mismatch_overwritten"
+        if allow_overwrite:
+            final_address = found_addr
+            company["address"] = final_address
+
         set_value("address", final_address)
+        set_value("address_confidence", address_conf_f)
+        set_value("address_evidence", evidence[:200] if evidence else "")
+        set_value("address_conflict_level", conflict_level)
+        set_value("address_review_reason", review_reason)
         set_value("rep_name", company.get("rep_name", "") or "")
         set_value("description", company.get("description", "") or "")
         set_value("ai_used", int(company.get("ai_used", 0) or 0))
