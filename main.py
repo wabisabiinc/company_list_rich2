@@ -81,6 +81,8 @@ TIME_LIMIT_SEC = float(os.getenv("TIME_LIMIT_SEC", "60"))
 TIME_LIMIT_FETCH_ONLY = float(os.getenv("TIME_LIMIT_FETCH_ONLY", "10"))  # 公式未確定で候補取得フェーズ（0で無効）
 TIME_LIMIT_WITH_OFFICIAL = float(os.getenv("TIME_LIMIT_WITH_OFFICIAL", "40"))  # 公式確定後、主要項目未充足（0で無効）
 TIME_LIMIT_DEEP = float(os.getenv("TIME_LIMIT_DEEP", "45"))  # 深掘り専用の上限（公式確定後）（0で無効）
+# 会社ごとの絶対上限（この時間を超えたら部分保存して次へ）
+ABSOLUTE_COMPANY_DEADLINE_SEC = float(os.getenv("ABSOLUTE_COMPANY_DEADLINE_SEC", "60"))
 # 全体のハード上限（デフォルト60秒で次ジョブへスキップ）
 GLOBAL_HARD_TIMEOUT_SEC = float(os.getenv("GLOBAL_HARD_TIMEOUT_SEC", "60"))
 # 単社処理のハード上限（candidate取得で固まるのを避けるための保険、0で無効）
@@ -183,6 +185,10 @@ def normalize_phone(s: str | None) -> str | None:
     s = re.sub(r"(内線|ext|extension)\s*[:：]?\s*\d+$", "", s, flags=re.I)
     # ハイフン類を統一
     s = re.sub(r"[‐―－ー–—]+", "-", s)
+    # 文字列上の区切りがある場合は、それを優先して分割（03-1234-5678 等の誤分割を防ぐ）
+    m_sep = re.search(r"(0\d{1,4})\D+?(\d{1,4})\D+?(\d{3,4})", s)
+    if m_sep:
+        return f"{m_sep.group(1)}-{m_sep.group(2)}-{m_sep.group(3)}"
     digits = re.sub(r"\D", "", s)
     if digits.startswith("81") and len(digits) >= 10:
         digits = "0" + digits[2:]
@@ -509,32 +515,52 @@ def pick_best_address(expected_addr: str | None, candidates: list[str]) -> str |
     return best
 
 def pick_best_phone(candidates: list[str]) -> str | None:
-    best = None
+    best: str | None = None
+    best_is_table = False
     for cand in candidates:
-        norm = normalize_phone(cand)
+        if not cand:
+            continue
+        raw = str(cand)
+        is_table = "[TABLE]" in raw
+        is_fax = "[FAX]" in raw
+        is_tel = "[TEL]" in raw
+        if is_fax and not is_tel:
+            continue
+        raw_for_norm = re.sub(r"\[(?:TABLE|FAX|TEL|TEXT)\]", "", raw)
+        norm = normalize_phone(raw_for_norm)
         if not norm:
             continue
-        is_table = isinstance(cand, str) and cand.startswith("[TABLE]")
         norm_val = norm
         # prefer non-navi numbers over 0120/0570
         if best is None:
             best = norm_val
+            best_is_table = is_table
             continue
         if re.match(r"^(0120|0570)", norm_val) and not re.match(r"^(0120|0570)", best):
             continue
         if re.match(r"^(0120|0570)", best) and not re.match(r"^(0120|0570)", norm_val):
             best = norm_val
+            best_is_table = is_table
             continue
         # prefer table-derived
-        if is_table and not (isinstance(best, str) and best.startswith("[TABLE]")):
+        if is_table and not best_is_table:
             best = norm_val
+            best_is_table = True
             continue
         # prefer standard 12-13 chars (including hyphens)
         if len(norm_val) == len(best):
             continue
         if abs(len(norm_val) - 12) < abs(len(best) - 12):
             best = norm_val
+            best_is_table = is_table
     return best
+
+def is_over_deep_limit(total_elapsed: float, homepage: str | None, official_phase_end: float, time_limit_deep: float) -> bool:
+    if time_limit_deep <= 0 or not homepage:
+        return False
+    if official_phase_end > 0:
+        return (total_elapsed - official_phase_end) > time_limit_deep
+    return total_elapsed > time_limit_deep
 
 def pick_best_rep(names: list[str], source_url: str | None = None) -> str | None:
     role_keywords = ("代表", "取締役", "社長", "理事長", "会長", "院長", "学長", "園長", "代表社員", "CEO", "COO")
@@ -1169,7 +1195,11 @@ async def process():
             company_has_corp = any(suffix in name for suffix in CompanyScraper.CORP_SUFFIXES)
             hard_timeout_candidates = [t for t in (GLOBAL_HARD_TIMEOUT_SEC, COMPANY_HARD_TIMEOUT_SEC, TIME_LIMIT_SEC) if t > 0]
             hard_timeout_sec = min(hard_timeout_candidates) if hard_timeout_candidates else 60.0
+            if ABSOLUTE_COMPANY_DEADLINE_SEC > 0:
+                hard_timeout_sec = min(hard_timeout_sec, ABSOLUTE_COMPANY_DEADLINE_SEC)
             hard_deadline = started_at + hard_timeout_sec
+            timeout_stage = ""
+            timeout_saved = False
 
             def elapsed() -> float:
                 return time.monotonic() - started_at
@@ -1196,7 +1226,7 @@ async def process():
 
             def over_deep_limit() -> bool:
                 # 深掘りフェーズの専用上限（公式確定後）
-                return TIME_LIMIT_DEEP > 0 and homepage and elapsed() > TIME_LIMIT_DEEP
+                return is_over_deep_limit(elapsed(), homepage, official_phase_end, TIME_LIMIT_DEEP)
 
             def over_deep_phase_deadline() -> bool:
                 return deep_phase_deadline is not None and time.monotonic() > deep_phase_deadline
@@ -1205,8 +1235,9 @@ async def process():
             ai_call_timeout = AI_CALL_TIMEOUT_SEC or 20.0
 
             def raise_hard_timeout(stage: str) -> None:
-                nonlocal timed_out, hard_timeout_logged
+                nonlocal timed_out, hard_timeout_logged, timeout_stage
                 timed_out = True
+                timeout_stage = stage or timeout_stage
                 if not company.get("error_code"):
                     company["error_code"] = "timeout"
                 if not hard_timeout_logged:
@@ -1231,6 +1262,107 @@ async def process():
 
             def has_time_for_ai() -> bool:
                 return remaining_time_budget() > AI_MIN_REMAINING_SEC
+
+            # タイムアウト時に「分かっている範囲」を確実に保存するためのデフォルト初期化
+            urls: list[str] = []
+            candidate_records: list[dict[str, Any]] = []
+            homepage = (company.get("homepage") or "").strip()
+            info: dict[str, Any] | None = None
+            primary_cands: dict[str, list[str]] = {}
+            fallback_cands: list[tuple[str, dict[str, list[str]]]] = []
+            homepage_official_flag = int(company.get("homepage_official_flag") or 0)
+            homepage_official_source = company.get("homepage_official_source", "") or ""
+            homepage_official_score = float(company.get("homepage_official_score") or 0.0)
+            ai_time_spent = 0.0
+            chosen_domain_score = 0
+            search_phase_end = 0.0
+            official_phase_end = 0.0
+            deep_phase_end = 0.0
+            deep_pages_visited = int(company.get("deep_pages_visited") or 0)
+            deep_fetch_count = int(company.get("deep_fetch_count") or 0)
+            deep_fetch_failures = int(company.get("deep_fetch_failures") or 0)
+            deep_skip_reason = company.get("deep_skip_reason", "") or ""
+            deep_urls_visited: list[str] = []
+            deep_phone_candidates = int(company.get("deep_phone_candidates") or 0)
+            deep_address_candidates = int(company.get("deep_address_candidates") or 0)
+            deep_rep_candidates = int(company.get("deep_rep_candidates") or 0)
+
+            phone = (company.get("phone") or "").strip()
+            found_address = (company.get("found_address") or "").strip()
+            rep_name_val = (scraper.clean_rep_name(company.get("rep_name")) or "").strip()
+            description_val = (company.get("description") or "").strip()
+            listing_val = clean_listing_value(company.get("listing") or "")
+            revenue_val = clean_amount_value(company.get("revenue") or "")
+            profit_val = clean_amount_value(company.get("profit") or "")
+            capital_val = clean_amount_value(company.get("capital") or "")
+            fiscal_val = clean_fiscal_month(company.get("fiscal_month") or "")
+            founded_val = clean_founded_year(company.get("founded_year") or "")
+            phone_source = company.get("phone_source", "") or "none"
+            address_source = company.get("address_source", "") or "none"
+            ai_used = int(company.get("ai_used") or 0)
+            ai_model = company.get("ai_model", "") or ""
+            src_phone = company.get("source_url_phone", "") or ""
+            src_addr = company.get("source_url_address", "") or ""
+            src_rep = company.get("source_url_rep", "") or ""
+            verify_result: dict[str, Any] = {"phone_ok": False, "address_ok": False}
+            verify_result_source = "none"
+            force_review = False
+            confidence = float(company.get("extract_confidence") or 0.0)
+            address_ai_confidence: float | None = company.get("address_confidence")
+            address_ai_evidence: str | None = company.get("address_evidence")
+            rule_phone: str | None = None
+            rule_address: str | None = None
+            rule_rep: str | None = None
+
+            def save_partial(reason: str) -> None:
+                nonlocal timeout_saved
+                if timeout_saved:
+                    return
+                try:
+                    if not (company.get("error_code") or "").strip():
+                        company["error_code"] = reason or "timeout"
+                    if not deep_skip_reason and (reason or timeout_stage):
+                        company["deep_skip_reason"] = f"{reason or 'timeout'}:{timeout_stage}".strip(":")
+                    # 正規化（軽量）だけ実施して保存する
+                    normalized_found_address = normalize_address(found_address) if found_address else ""
+                    company.update({
+                        "homepage": homepage or "",
+                        "phone": phone or "",
+                        "found_address": normalized_found_address,
+                        "rep_name": rep_name_val or "",
+                        "description": description_val or "",
+                        "listing": listing_val or "",
+                        "revenue": revenue_val or "",
+                        "profit": profit_val or "",
+                        "capital": capital_val or "",
+                        "fiscal_month": fiscal_val or "",
+                        "founded_year": founded_val or "",
+                        "phone_source": phone_source or "",
+                        "address_source": address_source or "",
+                        "ai_used": int(ai_used or 0),
+                        "ai_model": ai_model or "",
+                        "extract_confidence": confidence,
+                        "source_url_phone": src_phone or "",
+                        "source_url_address": src_addr or "",
+                        "source_url_rep": src_rep or "",
+                        "homepage_official_flag": int(homepage_official_flag or 0),
+                        "homepage_official_source": homepage_official_source or "",
+                        "homepage_official_score": float(homepage_official_score or 0.0),
+                        "address_confidence": address_ai_confidence,
+                        "address_evidence": address_ai_evidence,
+                        "deep_pages_visited": int(deep_pages_visited or 0),
+                        "deep_fetch_count": int(deep_fetch_count or 0),
+                        "deep_fetch_failures": int(deep_fetch_failures or 0),
+                        "deep_skip_reason": company.get("deep_skip_reason", "") or deep_skip_reason or "",
+                        "deep_urls_visited": json.dumps(list(deep_urls_visited or [])[:5], ensure_ascii=False),
+                        "deep_phone_candidates": int(deep_phone_candidates or 0),
+                        "deep_address_candidates": int(deep_address_candidates or 0),
+                        "deep_rep_candidates": int(deep_rep_candidates or 0),
+                    })
+                    manager.save_company_data(company, status="review")
+                    timeout_saved = True
+                except Exception:
+                    log.warning("[%s] timeout partial save failed", cid, exc_info=True)
 
             fatal_error = False
             try:
@@ -1301,6 +1433,14 @@ async def process():
                     search_phase_end = 0.0
                     official_phase_end = 0.0
                     deep_phase_end = 0.0
+                    deep_pages_visited = 0
+                    deep_fetch_count = 0
+                    deep_fetch_failures = 0
+                    deep_skip_reason = ""
+                    deep_urls_visited: list[str] = []
+                    deep_phone_candidates = 0
+                    deep_address_candidates = 0
+                    deep_rep_candidates = 0
 
                     fetch_sem = asyncio.Semaphore(FETCH_CONCURRENCY)
 
@@ -2934,16 +3074,27 @@ async def process():
                                     src_rep = info_url
 
                         # ???????????????????????????????
+                        deep_pages_visited = 0
+                        deep_fetch_count = 0
+                        deep_fetch_failures = 0
+                        deep_skip_reason = ""
+                        deep_urls_visited: list[str] = []
+                        deep_phone_candidates = 0
+                        deep_address_candidates = 0
+                        deep_rep_candidates = 0
+
                         missing_contact, missing_extra = refresh_need_flags()
                         need_extra_fields = missing_extra > 0
                         if missing_contact == 0 and not need_extra_fields:
                             related = {}
+                            deep_skip_reason = "no_missing_fields"
                         else:
                             related_page_limit = RELATED_BASE_PAGES + (1 if missing_extra else 0)
                             if need_phone:
                                 related_page_limit += RELATED_EXTRA_PHONE
                             related_page_limit = max(0, min(3, related_page_limit))
                             related = {}
+                            related_meta: dict[str, Any] = {}
                             weak_provisional_target = (
                                 homepage_official_flag == 0
                                 and homepage_official_source.startswith("provisional")
@@ -2952,8 +3103,11 @@ async def process():
                                 and not provisional_name_present
                                 and not provisional_address_ok
                             )
+                            if weak_provisional_target:
+                                deep_skip_reason = "weak_provisional_target"
                             if not weak_provisional_target and not timed_out and ((missing_contact > 0) or need_extra_fields):
                                 if over_time_limit() or over_deep_limit() or over_hard_deadline() or over_deep_phase_deadline():
+                                    deep_skip_reason = "over_limit_before_deep"
                                     timed_out = True
                                     if over_hard_deadline():
                                         raise_hard_timeout("related_crawl")
@@ -2961,7 +3115,7 @@ async def process():
                                     max_hops = RELATED_MAX_HOPS_PHONE if need_phone else RELATED_MAX_HOPS_BASE
                                     max_hops = max(0, min(3, int(max_hops or 0)))
                                     try:
-                                        related = await asyncio.wait_for(
+                                        related, related_meta = await asyncio.wait_for(
                                             scraper.crawl_related(
                                                 homepage,
                                                 need_phone,
@@ -2978,20 +3132,48 @@ async def process():
                                                 need_description=need_description,
                                                 initial_info=info_dict if info_url == homepage else None,
                                                 expected_address=addr,
+                                                return_meta=True,
+                                                allow_slow=bool(need_addr) and bool(
+                                                    (homepage_official_flag == 1)
+                                                    or (chosen_domain_score >= 4)
+                                                    or provisional_host_token
+                                                    or provisional_name_present
+                                                    or provisional_address_ok
+                                                ),
                                             ),
                                             timeout=clamp_timeout(PAGE_FETCH_TIMEOUT_SEC),
                                         )
                                     except Exception:
                                         related = {}
+                                        related_meta = {}
+                                        deep_skip_reason = deep_skip_reason or "deep_exception"
+                            deep_pages_visited = int((related_meta or {}).get("pages_visited") or len(related))
+                            deep_fetch_count = int((related_meta or {}).get("fetch_count") or 0)
+                            deep_fetch_failures = int((related_meta or {}).get("fetch_failures") or 0)
+                            deep_urls_visited = list((related_meta or {}).get("urls_visited") or list(related.keys()))
                             if related:
                                 try:
                                     log.info("[%s] deep_crawl visited=%s", cid, list(related.keys()))
                                 except Exception:
                                     pass
+                            try:
+                                log.info(
+                                    "[%s] deep_crawl summary pages=%s fetch=%s fail=%s reason=%s",
+                                    cid,
+                                    deep_pages_visited,
+                                    deep_fetch_count,
+                                    deep_fetch_failures,
+                                    deep_skip_reason or (related_meta or {}).get("stop_reason") or "",
+                                )
+                            except Exception:
+                                pass
                             for url, data in related.items():
                                 text = data.get("text", "") or ""
                                 html_content = data.get("html", "") or ""
                                 cc = scraper.extract_candidates(text, html_content)
+                                deep_phone_candidates += len(cc.get("phone_numbers") or [])
+                                deep_address_candidates += len(cc.get("addresses") or [])
+                                deep_rep_candidates += len(cc.get("rep_names") or [])
                                 if need_phone and cc.get("phone_numbers"):
                                     cand = pick_best_phone(cc["phone_numbers"])
                                     if cand:
@@ -3273,6 +3455,14 @@ async def process():
                             "homepage_official_score": homepage_official_score,
                             "address_confidence": address_ai_confidence,
                             "address_evidence": address_ai_evidence,
+                            "deep_pages_visited": int(deep_pages_visited or 0),
+                            "deep_fetch_count": int(deep_fetch_count or 0),
+                            "deep_fetch_failures": int(deep_fetch_failures or 0),
+                            "deep_skip_reason": deep_skip_reason or "",
+                            "deep_urls_visited": json.dumps(list(deep_urls_visited or [])[:5], ensure_ascii=False),
+                            "deep_phone_candidates": int(deep_phone_candidates or 0),
+                            "deep_address_candidates": int(deep_address_candidates or 0),
+                            "deep_rep_candidates": int(deep_rep_candidates or 0),
                         })
 
                         had_verify_target = bool(
@@ -3428,7 +3618,11 @@ async def process():
                         processed += 1
 
             except HardTimeout:
-                pass
+                # 60秒超え等で打ち切り：ここまでに分かっている情報を保存して次へ
+                try:
+                    save_partial("timeout")
+                except Exception:
+                    pass
             except Exception as e:
                 log.error("[%s] エラー: %s (worker=%s)", cid, e, WORKER_ID, exc_info=True)
                 manager.update_status(cid, "error")

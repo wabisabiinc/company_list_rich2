@@ -278,6 +278,30 @@ class DatabaseManager:
         if "source_url_rep" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN source_url_rep TEXT;")
             cols.add("source_url_rep")
+        if "deep_pages_visited" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN deep_pages_visited INTEGER;")
+            cols.add("deep_pages_visited")
+        if "deep_fetch_count" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN deep_fetch_count INTEGER;")
+            cols.add("deep_fetch_count")
+        if "deep_fetch_failures" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN deep_fetch_failures INTEGER;")
+            cols.add("deep_fetch_failures")
+        if "deep_skip_reason" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN deep_skip_reason TEXT;")
+            cols.add("deep_skip_reason")
+        if "deep_urls_visited" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN deep_urls_visited TEXT;")
+            cols.add("deep_urls_visited")
+        if "deep_phone_candidates" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN deep_phone_candidates INTEGER;")
+            cols.add("deep_phone_candidates")
+        if "deep_address_candidates" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN deep_address_candidates INTEGER;")
+            cols.add("deep_address_candidates")
+        if "deep_rep_candidates" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN deep_rep_candidates INTEGER;")
+            cols.add("deep_rep_candidates")
 
         self.conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_companies_name_addr ON companies(company_name, address);"
@@ -764,6 +788,14 @@ class DatabaseManager:
         set_value("homepage_official_flag", company.get("homepage_official_flag"))
         set_value("homepage_official_source", company.get("homepage_official_source", "") or "")
         set_value("homepage_official_score", company.get("homepage_official_score"))
+        set_value("deep_pages_visited", company.get("deep_pages_visited"))
+        set_value("deep_fetch_count", company.get("deep_fetch_count"))
+        set_value("deep_fetch_failures", company.get("deep_fetch_failures"))
+        set_value("deep_skip_reason", company.get("deep_skip_reason", "") or "")
+        set_value("deep_urls_visited", company.get("deep_urls_visited", "") or "")
+        set_value("deep_phone_candidates", company.get("deep_phone_candidates"))
+        set_value("deep_address_candidates", company.get("deep_address_candidates"))
+        set_value("deep_rep_candidates", company.get("deep_rep_candidates"))
 
         if "last_checked_at" in cols:
             updates.append("last_checked_at = datetime('now')")

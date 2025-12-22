@@ -246,8 +246,8 @@ TABLE_LABEL_MAP = {
     "fiscal_months": ("決算月", "決算期", "決算日", "決算", "会計期", "会計年度", "決算期(年)"),
     "founded_years": ("設立", "創業", "創立", "設立年", "創立年", "創業年"),
     "listing": ("上場区分", "上場", "市場", "上場先", "証券コード", "非上場", "未上場", "コード番号"),
-    "phone_numbers": ("電話", "電話番号", "TEL", "Tel"),
-    "addresses": ("所在地", "住所", "本社所在地", "所在地住所", "所在地(本社)"),
+    "phone_numbers": ("電話", "電話番号", "TEL", "Tel", "連絡先"),
+    "addresses": ("所在地", "住所", "本社所在地", "所在地住所", "所在地(本社)", "本社", "本店"),
 }
 SECURITIES_CODE_RE = re.compile(
     r"(?:証券コード|証券ｺｰﾄﾞ|証券番号|コード番号)\s*[:：]?\s*([0-9]{4})"
@@ -2949,11 +2949,18 @@ class CompanyScraper:
         if cached and (cached_shot or not need_screenshot):
             return cached
 
+        http_fallback: Dict[str, Any] | None = None
         # まずHTTPで軽量取得を試す（スクショ不要の場合）
         if self.use_http_first and not need_screenshot:
             http_info = await self._fetch_http_info(url)
             text_len = len((http_info.get("text") or "").strip())
             html_len = len(http_info.get("html") or "")
+            http_fallback = {
+                "url": url,
+                "text": http_info.get("text", "") or "",
+                "html": http_info.get("html", "") or "",
+                "screenshot": b"",
+            }
             # 軽量取得で十分な本文/HTMLが取れた場合のみ即返す。薄い場合はブラウザで再取得。
             if text_len >= 200 or html_len >= 1800:
                 self.page_cache[url] = {
@@ -2965,7 +2972,13 @@ class CompanyScraper:
                 return self.page_cache[url]
 
         if not self.context:
-            await self.start()
+            try:
+                await self.start()
+            except Exception:
+                # ブラウザ起動に失敗した場合は HTTP 取得結果（同一呼び出し内）にフォールバックする
+                if http_fallback is not None:
+                    return http_fallback
+                raise
 
         eff_timeout = timeout or self.page_timeout_ms
         if self.slow_page_threshold_ms > 0:
@@ -3026,6 +3039,23 @@ class CompanyScraper:
                         html = await page.content()
                     except Exception:
                         html = ""
+                    # JS生成で本文が薄い場合の最小フォールバック（待機のみ。追加fetchはしない）
+                    if (not text or len(text.strip()) < 80) and html:
+                        try:
+                            spa_hint = bool(
+                                ("__NEXT_DATA__" in html)
+                                or ("id=\"app\"" in html)
+                                or ("id=\"root\"" in html)
+                                or ("data-reactroot" in html)
+                                or ("nuxt" in html.lower())
+                            )
+                            if spa_hint:
+                                await page.wait_for_selector("table,dl,footer,address", timeout=min(1500, attempt_timeout))
+                                await page.wait_for_timeout(250)
+                                text = await page.inner_text("body")
+                                html = await page.content()
+                        except Exception:
+                            pass
                     screenshot: bytes = b""
                     if need_screenshot:
                         screenshot = await page.screenshot(full_page=True)
@@ -3069,6 +3099,9 @@ class CompanyScraper:
             fallback["text"] = cached.get("text", "")
             fallback["html"] = cached.get("html", "")
             fallback["screenshot"] = cached.get("screenshot", b"") or b""
+        elif http_fallback is not None:
+            fallback["text"] = http_fallback.get("text", "")
+            fallback["html"] = http_fallback.get("html", "")
         self.page_cache[url] = fallback
         return fallback
 
@@ -3365,20 +3398,35 @@ class CompanyScraper:
         need_description: bool = False,
         initial_info: Optional[Dict[str, Any]] = None,
         expected_address: Optional[str] = None,
-    ) -> Dict[str, Dict[str, Any]]:
+        return_meta: bool = False,
+        allow_slow: bool = False,
+    ) -> Dict[str, Dict[str, Any]] | tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
         results: Dict[str, Dict[str, Any]] = {}
+        meta: Dict[str, Any] = {
+            "max_pages_requested": int(max_pages or 0),
+            "max_hops_requested": int(max_hops or 0),
+            "pages_visited": 0,
+            "fetch_count": 0,
+            "fetch_failures": 0,
+            "skipped_pref_mismatch": 0,
+            "urls_visited": [],
+            "stop_reason": "",
+        }
         if not homepage:
-            return results
+            meta["stop_reason"] = "no_homepage"
+            return (results, meta) if return_meta else results
         if not (
             need_phone or need_addr or need_rep or need_listing or need_capital
             or need_revenue or need_profit or need_fiscal or need_founded or need_description
         ):
-            return results
+            meta["stop_reason"] = "no_missing_fields"
+            return (results, meta) if return_meta else results
         # 欠損が少ない場合は探索幅を縮小する
         missing_contact = int(need_phone) + int(need_addr) + int(need_rep)
         missing_extra = int(need_listing) + int(need_capital) + int(need_revenue) + int(need_profit) + int(need_fiscal) + int(need_founded) + int(need_description)
         if missing_contact == 0 and missing_extra == 0:
-            return results
+            meta["stop_reason"] = "no_missing_fields"
+            return (results, meta) if return_meta else results
         # 必要最低限のページ/ホップに調整
         if missing_contact == 0 and missing_extra <= 2:
             max_pages = min(max_pages, 1)
@@ -3393,6 +3441,11 @@ class CompanyScraper:
         # 探索の上限は軽め（2〜3ページ）に抑える
         max_pages = max(0, min(int(max_pages or 0), 3))
         max_hops = max(0, min(int(max_hops or 0), 3))
+        meta["max_pages"] = int(max_pages)
+        meta["max_hops"] = int(max_hops)
+        if max_pages <= 0:
+            meta["stop_reason"] = "max_pages=0"
+            return (results, meta) if return_meta else results
 
         expected_pref = self._extract_prefecture(expected_address or "")
         visited: set[str] = {homepage}
@@ -3400,10 +3453,12 @@ class CompanyScraper:
         sem = asyncio.Semaphore(concurrency)
 
         async def fetch_info(target: str) -> Optional[Dict[str, Any]]:
+            meta["fetch_count"] += 1
             async with sem:
                 try:
-                    return await self.get_page_info(target)
+                    return await self.get_page_info(target, allow_slow=allow_slow)
                 except Exception:
+                    meta["fetch_failures"] += 1
                     return None
 
         queue: deque[tuple[int, str, Optional[Any]]] = deque()
@@ -3441,6 +3496,7 @@ class CompanyScraper:
             if expected_pref:
                 found_prefs = set(PREFECTURE_NAME_RE.findall(results[url]["text"] or ""))
                 if 0 < len(found_prefs) <= 3 and expected_pref not in found_prefs:
+                    meta["skipped_pref_mismatch"] += 1
                     continue
 
             missing: List[str] = []
@@ -3491,7 +3547,16 @@ class CompanyScraper:
         for task in pending_tasks:
             if not task.done():
                 task.cancel()
-        return results
+        meta["pages_visited"] = len(results)
+        meta["urls_visited"] = list(results.keys())
+        if not meta.get("stop_reason"):
+            if len(results) >= max_pages:
+                meta["stop_reason"] = "max_pages_reached"
+            elif not queue:
+                meta["stop_reason"] = "queue_empty"
+            else:
+                meta["stop_reason"] = "unknown"
+        return (results, meta) if return_meta else results
 
     # ===== 抽出 =====
     def extract_candidates(self, text: str, html: Optional[str] = None) -> Dict[str, List[str]]:
@@ -3503,7 +3568,14 @@ class CompanyScraper:
 
         for p in PHONE_RE.finditer(text or ""):
             cand = _normalize_phone_strict(p.group(0))
-            if cand:
+            if not cand:
+                continue
+            ctx = (text or "")[max(0, p.start() - 12):p.start()]
+            fax_hint = bool(re.search(r"(FAX|Fax|fax|ファックス|ﾌｧｯｸｽ|ＦＡＸ)", ctx))
+            tel_hint = bool(re.search(r"(TEL|Tel|tel|電話)", ctx))
+            if fax_hint and not tel_hint:
+                phones.append(f"[FAX]{cand}")
+            else:
                 phones.append(cand)
 
         def _extract_addrs_from_text() -> None:
@@ -3825,11 +3897,32 @@ class CompanyScraper:
                             rep_from_label = True
                             matched = True
                     elif field == "phone_numbers":
-                        for p in PHONE_RE.finditer(raw_value):
-                            cand = _normalize_phone_strict(f"{p.group(1)}-{p.group(2)}-{p.group(3)}")
-                            if cand:
-                                phones.append(cand if not is_table_pair else f"[TABLE]{cand}")
+                        label_text = unicodedata.normalize("NFKC", norm_label or "")
+                        label_has_tel = bool(re.search(r"(TEL|電話)", label_text, re.I))
+                        label_has_fax = bool(re.search(r"(FAX|ファックス|ﾌｧｯｸｽ)", label_text, re.I))
+                        if label_has_fax and not label_has_tel:
+                            # FAX専用行は代表電話候補として扱わない
+                            continue
+                        value_nfkc = unicodedata.normalize("NFKC", raw_value)
+                        fax_pos = re.search(r"(FAX|ファックス|ﾌｧｯｸｽ)", value_nfkc, re.I) if label_has_fax else None
+                        tel_part = value_nfkc[: fax_pos.start()] if fax_pos else value_nfkc
+                        fax_part = value_nfkc[fax_pos.start():] if fax_pos else ""
+                        def _emit(part: str, is_fax: bool) -> None:
+                            nonlocal matched
+                            for p in PHONE_RE.finditer(part or ""):
+                                cand = _normalize_phone_strict(f"{p.group(1)}-{p.group(2)}-{p.group(3)}")
+                                if not cand:
+                                    continue
+                                prefix = ""
+                                if is_table_pair:
+                                    prefix += "[TABLE]"
+                                if is_fax:
+                                    prefix += "[FAX]"
+                                phones.append(f"{prefix}{cand}")
                                 matched = True
+                        _emit(tel_part, False)
+                        if fax_part:
+                            _emit(fax_part, True)
                     elif field == "addresses":
                         norm_addr = self._normalize_address_candidate(raw_value)
                         if norm_addr and self.looks_like_address(norm_addr):
