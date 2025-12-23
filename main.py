@@ -69,10 +69,10 @@ USE_AI_OFFICIAL = os.getenv("USE_AI_OFFICIAL", "true").lower() == "true"
 AI_OFFICIAL_ALL_CANDIDATES = os.getenv("AI_OFFICIAL_ALL_CANDIDATES", "true").lower() == "true"
 # AI公式判定が使える場合、公式採用の最終判断をAI優先にする
 AI_OFFICIAL_PRIMARY = os.getenv("AI_OFFICIAL_PRIMARY", "true").lower() == "true"
-# AI公式判定の候補数上限（0以下で無制限）
-AI_OFFICIAL_CANDIDATE_LIMIT = int(os.getenv("AI_OFFICIAL_CANDIDATE_LIMIT", "0"))
-# AI公式判定の同時実行数（API/モデル負荷対策）
-AI_OFFICIAL_CONCURRENCY = max(1, int(os.getenv("AI_OFFICIAL_CONCURRENCY", "2")))
+# AI公式判定の候補数上限（0以下で無制限）。デフォルトは3件。
+AI_OFFICIAL_CANDIDATE_LIMIT = int(os.getenv("AI_OFFICIAL_CANDIDATE_LIMIT", "3"))
+# AI公式判定の同時実行数（API/モデル負荷対策）。デフォルトは3。
+AI_OFFICIAL_CONCURRENCY = max(1, int(os.getenv("AI_OFFICIAL_CONCURRENCY", "3")))
 # description はAIで常時生成（verify_infoで同時生成）。追加の説明専用AI呼び出しを有効にしたい場合のみ true。
 USE_AI_DESCRIPTION = os.getenv("USE_AI_DESCRIPTION", "false").lower() == "true"
 AI_FINAL_WITH_OFFICIAL = os.getenv("AI_FINAL_WITH_OFFICIAL", "false").lower() == "true"
@@ -494,6 +494,8 @@ def should_skip_by_url_flag(flag_info: dict | None) -> bool:
     source = (flag_info.get("judge_source") or "").strip().lower()
     if source.startswith("ai_provisional"):
         return False
+    if source.startswith("ai_conflict"):
+        return False
     conf = flag_info.get("confidence")
     try:
         conf_f = float(conf) if conf is not None else None
@@ -696,7 +698,7 @@ def _strip_rep_tags(value: str) -> tuple[str, list[str]]:
 def _rep_candidate_meta(candidates: list[str], chosen: str) -> dict[str, bool]:
     chosen_norm = re.sub(r"\s+", " ", chosen or "").strip()
     if not chosen_norm:
-        return {"low_role": False, "table": False, "label": False, "role": False}
+        return {"low_role": False, "table": False, "label": False, "role": False, "jsonld": False}
     for raw in candidates:
         base, tags = _strip_rep_tags(str(raw))
         if base == chosen_norm:
@@ -706,8 +708,9 @@ def _rep_candidate_meta(candidates: list[str], chosen: str) -> dict[str, bool]:
                 "table": "TABLE" in tag_set,
                 "label": "LABEL" in tag_set,
                 "role": "ROLE" in tag_set,
+                "jsonld": "JSONLD" in tag_set,
             }
-    return {"low_role": False, "table": False, "label": False, "role": False}
+    return {"low_role": False, "table": False, "label": False, "role": False, "jsonld": False}
 
 def _is_profile_like_url(url: str | None) -> bool:
     if not url:
@@ -729,7 +732,12 @@ def _rep_candidate_ok(
     meta = _rep_candidate_meta(candidates, chosen)
     low_role = meta.get("low_role", False)
     profile_like = _is_profile_like_url(source_url)
-    strong_source = meta.get("table", False) or meta.get("label", False) or meta.get("role", False)
+    strong_source = (
+        meta.get("table", False)
+        or meta.get("label", False)
+        or meta.get("role", False)
+        or meta.get("jsonld", False)
+    )
     if page_type == "COMPANY_PROFILE":
         return True, ""
     if page_type == "ACCESS_CONTACT":
@@ -738,6 +746,12 @@ def _rep_candidate_ok(
         if profile_like or strong_source:
             return True, ""
         return False, "contact_not_profile"
+    if page_type == "BASES_LIST":
+        if low_role:
+            return False, "low_role_bases"
+        if profile_like or strong_source:
+            return True, ""
+        return False, "bases_not_profile"
     if page_type == "OTHER":
         if low_role:
             return False, "low_role_other"
@@ -822,14 +836,12 @@ def pick_best_rep(names: list[str], source_url: str | None = None) -> str | None
     for raw in names:
         if not raw:
             continue
-        cleaned = str(raw).strip()
-        is_table = cleaned.startswith("[TABLE]")
-        if is_table:
-            cleaned = cleaned.replace("[TABLE]", "", 1).strip()
-        low_role = False
-        if cleaned.startswith("[LOWROLE]"):
-            low_role = True
-            cleaned = cleaned.replace("[LOWROLE]", "", 1).strip()
+        cleaned_raw = str(raw).strip()
+        cleaned, tags = _strip_rep_tags(cleaned_raw)
+        tag_set = set(tags)
+        is_table = "TABLE" in tag_set
+        is_label = "LABEL" in tag_set
+        low_role = "LOWROLE" in tag_set
         if not cleaned:
             continue
         if any(b in cleaned for b in blocked):
@@ -837,6 +849,8 @@ def pick_best_rep(names: list[str], source_url: str | None = None) -> str | None
         score = len(cleaned) + url_bonus
         if is_table:
             score += 5
+        if is_label:
+            score += 3
         if any(k in cleaned for k in role_keywords):
             score += 8
         if low_role:
@@ -1220,7 +1234,7 @@ def append_jsonl(path: str, payload: dict[str, Any]) -> None:
     except Exception:
         log.debug("append_jsonl failed: %s", path, exc_info=True)
 
-def build_official_ai_text(text: str, html: str) -> str:
+def build_official_ai_text(text: str, html: str, signals: dict[str, Any] | None = None) -> str:
     """
     AI公式判定向けに、1回fetch済みの text/html から根拠を落としにくい形で短文化する。
     追加fetchはしない（CPUのみ）。
@@ -1238,11 +1252,51 @@ def build_official_ai_text(text: str, html: str) -> str:
             h1 = soup.find("h1")
             if h1:
                 parts.append(f"[H1] {h1.get_text(' ', strip=True)}")
+            header = soup.find("header")
+            if header:
+                header_text = header.get_text(" ", strip=True)
+                if header_text:
+                    parts.append(f"[HEADER] {header_text[:200]}")
+                logo_hints: list[str] = []
+                for node in header.find_all(["img", "a", "span", "div"]):
+                    for attr in ("alt", "aria-label", "title"):
+                        val = node.get(attr)
+                        if not isinstance(val, str):
+                            continue
+                        val = val.strip()
+                        if not val or len(val) > 40:
+                            continue
+                        if val not in logo_hints:
+                            logo_hints.append(val)
+                    if len(logo_hints) >= 5:
+                        break
+                if logo_hints:
+                    parts.append(f"[LOGO] {' / '.join(logo_hints)}")
             footer = soup.find("footer")
             if footer:
                 ft = footer.get_text(" ", strip=True)
                 if ft:
                     parts.append(f"[FOOTER] {ft}")
+        except Exception:
+            pass
+    if signals:
+        try:
+            keys = (
+                "page_type",
+                "domain_score",
+                "host_token_hit",
+                "name_match_ratio",
+                "name_match_exact",
+                "name_match_partial_only",
+                "official_evidence_score",
+                "directory_like",
+            )
+            sig_parts = []
+            for key in keys:
+                if key in signals and signals[key] is not None:
+                    sig_parts.append(f"{key}={signals[key]}")
+            if sig_parts:
+                parts.append(f"[SIGNALS] {' '.join(sig_parts)}")
         except Exception:
             pass
     joined = "\n".join([p for p in parts if p and str(p).strip()])
@@ -1265,6 +1319,10 @@ def clean_founded_year(val: str) -> str:
 
 
 def record_needs_official_ai(record: dict[str, Any]) -> bool:
+    if record.get("ai_judge"):
+        return False
+    if record.get("ai_checked"):
+        return False
     if AI_OFFICIAL_ALL_CANDIDATES:
         rule_details = record.get("rule") or {}
         # 企業DB/ディレクトリ臭が強いものはAIコストを掛けない
@@ -1987,16 +2045,19 @@ async def process():
                             },
                         )
 
-                    prepare_tasks = [
-                        asyncio.create_task(prepare_candidate(idx, candidate))
-                        for idx, candidate in enumerate(urls)
-                    ]
-                    candidate_records: list[dict[str, Any]] = []
-                    prepare_timed_out = False
-                    prepared: list[Any] = []
-                    if prepare_tasks:
+                    async def _prepare_batch(
+                        pairs: list[tuple[int, str]],
+                        deadline: float | None,
+                    ) -> tuple[list[dict[str, Any]], bool]:
+                        prepared: list[Any] = []
+                        prepare_timed_out = False
+                        if not pairs:
+                            return [], False
+                        prepare_tasks = [
+                            asyncio.create_task(prepare_candidate(idx, candidate))
+                            for idx, candidate in pairs
+                        ]
                         pending: set[asyncio.Task] = set(prepare_tasks)
-                        deadline = time.monotonic() + SEARCH_PHASE_TIMEOUT_SEC if SEARCH_PHASE_TIMEOUT_SEC > 0 else None
                         try:
                             while pending:
                                 if deadline is not None:
@@ -2020,7 +2081,7 @@ async def process():
                                     except Exception:
                                         continue
                                     prepared.append(result)
-                                if len(prepared) >= len(urls):
+                                if len(prepared) >= len(pairs):
                                     pending.clear()
                                     break
                         finally:
@@ -2035,21 +2096,18 @@ async def process():
                                 continue
                             ordered.append(result)
                         ordered.sort(key=lambda x: x[0])
-                        candidate_records = [record for _, record in ordered]
-                        if prepare_timed_out and candidate_records:
+                        records = [record for _, record in ordered]
+                        if prepare_timed_out and records:
                             log.info(
                                 "[%s] prepare_candidate partial timeout (recorded %d/%d)",
                                 cid,
-                                len(candidate_records),
+                                len(records),
                                 len(prepared),
                             )
-                    search_phase_end = elapsed()
+                        return records, prepare_timed_out
 
-                    if prepare_timed_out and not candidate_records:
-                        log.info("[%s] prepare_candidate timeout -> review/search_timeout", cid)
-
-                    if candidate_records:
-                        for record in candidate_records:
+                    def _postprocess_candidates(records: list[dict[str, Any]]) -> None:
+                        for record in records:
                             normalized_url = record.get("normalized_url") or record.get("url") or ""
                             domain_score_val = scraper._domain_score(company_tokens, normalized_url)  # type: ignore
                             host_token_hit = scraper._host_token_hit(company_tokens, normalized_url)  # type: ignore
@@ -2059,6 +2117,23 @@ async def process():
                             record["strong_domain_host"] = (domain_score_val >= 5 or (company_has_corp and domain_score_val >= 4)) and host_token_hit
                             record.setdefault("order_idx", 0)
                             record.setdefault("search_rank", 0)
+
+                    candidate_records: list[dict[str, Any]] = []
+                    prepare_timed_out = False
+                    url_pairs = list(enumerate(urls))
+                    first_pairs = url_pairs[:3]
+                    remaining_pairs = url_pairs[3:]
+                    search_deadline = time.monotonic() + SEARCH_PHASE_TIMEOUT_SEC if SEARCH_PHASE_TIMEOUT_SEC > 0 else None
+                    initial_records, timed_out = await _prepare_batch(first_pairs, search_deadline)
+                    candidate_records.extend(initial_records)
+                    prepare_timed_out = prepare_timed_out or timed_out
+                    search_phase_end = elapsed()
+
+                    if prepare_timed_out and not candidate_records:
+                        log.info("[%s] prepare_candidate timeout -> review/search_timeout", cid)
+
+                    if candidate_records:
+                        _postprocess_candidates(candidate_records)
                         candidate_records.sort(
                             key=lambda rec: (
                                 not rec.get("strong_domain_host", False),
@@ -2115,559 +2190,634 @@ async def process():
                         USE_AI_OFFICIAL and USE_AI and verifier is not None and hasattr(verifier, "judge_official_homepage")
                     )
                     ai_official_primary = bool(AI_OFFICIAL_PRIMARY and ai_official_enabled)
-                    if ai_official_enabled:
-                        ai_tasks: list[asyncio.Task] = []
-                        ai_sem = asyncio.Semaphore(AI_OFFICIAL_CONCURRENCY)
+                    processed_urls: set[str] = set()
+                    fetched_remaining = False
+                    while True:
+                        if ai_official_enabled:
+                            ai_tasks: list[asyncio.Task] = []
+                            ai_sem = asyncio.Semaphore(AI_OFFICIAL_CONCURRENCY)
 
-                        async def run_official_ai(record: dict[str, Any]) -> dict[str, Any] | None:
-                            nonlocal ai_official_attempted, ai_time_spent
-                            async with ai_sem:
-                                remaining = remaining_time_budget()
-                                if remaining <= AI_MIN_REMAINING_SEC:
-                                    log.info(
-                                        "[%s] skip AI公式判定（残り%.1fs）: %s",
-                                        cid,
-                                        max(0.0, remaining),
+                            async def run_official_ai(record: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
+                                nonlocal ai_official_attempted, ai_time_spent
+                                record["ai_checked"] = True
+                                async with ai_sem:
+                                    remaining = remaining_time_budget()
+                                    if remaining <= AI_MIN_REMAINING_SEC:
+                                        log.info(
+                                            "[%s] skip AI公式判定（残り%.1fs）: %s",
+                                            cid,
+                                            max(0.0, remaining),
+                                            record.get("url"),
+                                        )
+                                        return record, None
+                                    normalized_for_ai = record.get("normalized_url") or record.get("url") or ""
+                                    domain_score = int(record.get("domain_score") or 0)
+                                    if normalized_for_ai and domain_score == 0:
+                                        domain_score = scraper._domain_score(company_tokens, normalized_for_ai)  # type: ignore
+                                        record["domain_score"] = domain_score
+                                    info_payload = record.get("info") or {}
+                                    info_payload = await ensure_info_text(
+                                        scraper,
                                         record.get("url"),
+                                        info_payload,
                                     )
-                                    return None
-                                normalized_for_ai = record.get("normalized_url") or record.get("url") or ""
-                                domain_score = int(record.get("domain_score") or 0)
-                                if normalized_for_ai and domain_score == 0:
-                                    domain_score = scraper._domain_score(company_tokens, normalized_for_ai)  # type: ignore
-                                    record["domain_score"] = domain_score
-                                info_payload = record.get("info") or {}
-                                info_payload = await ensure_info_text(
-                                    scraper,
-                                    record.get("url"),
-                                    info_payload,
-                                )
-                                record["info"] = info_payload
-                                remaining = remaining_time_budget()
-                                if remaining <= AI_MIN_REMAINING_SEC:
-                                    log.info(
-                                        "[%s] skip AI公式判定（残り%.1fs, info取得後）: %s",
-                                        cid,
-                                        max(0.0, remaining),
-                                        record.get("url"),
+                                    if OFFICIAL_AI_USE_SCREENSHOT:
+                                        info_payload = await ensure_info_has_screenshot(
+                                            scraper,
+                                            record.get("url"),
+                                            info_payload,
+                                            need_screenshot=True,
+                                        )
+                                    record["info"] = info_payload
+                                    remaining = remaining_time_budget()
+                                    if remaining <= AI_MIN_REMAINING_SEC:
+                                        log.info(
+                                            "[%s] skip AI公式判定（残り%.1fs, info取得後）: %s",
+                                            cid,
+                                            max(0.0, remaining),
+                                            record.get("url"),
+                                        )
+                                        return record, None
+                                    pages_for_ai: list[dict[str, Any]] = []
+                                    base_url = normalized_for_ai or record.get("url") or ""
+                                    base_text = info_payload.get("text", "") or ""
+                                    base_html = info_payload.get("html", "") or ""
+                                    try:
+                                        base_pt = scraper.classify_page_type(
+                                            base_url, text=base_text, html=base_html
+                                        ).get("page_type") or "OTHER"
+                                    except Exception:
+                                        base_pt = "OTHER"
+                                    rule_for_ai = record.get("rule") or {}
+                                    signals = {
+                                        "page_type": base_pt,
+                                        "domain_score": int(record.get("domain_score") or 0),
+                                        "host_token_hit": bool(record.get("host_token_hit")),
+                                        "name_match_ratio": rule_for_ai.get("name_match_ratio"),
+                                        "name_match_exact": rule_for_ai.get("name_match_exact"),
+                                        "name_match_partial_only": rule_for_ai.get("name_match_partial_only"),
+                                        "official_evidence_score": rule_for_ai.get("official_evidence_score"),
+                                        "directory_like": rule_for_ai.get("directory_like"),
+                                    }
+                                    base_snippet_full = build_official_ai_text(base_text, base_html, signals=signals)
+                                    base_snippet = base_snippet_full[:1800] if len(base_snippet_full) > 1800 else base_snippet_full
+                                    pages_for_ai.append(
+                                        {
+                                            "url": base_url,
+                                            "page_type": base_pt,
+                                            "snippet": base_snippet,
+                                            "screenshot": info_payload.get("screenshot"),
+                                        }
                                     )
-                                    return None
-                                ai_started = time.monotonic()
-                                try:
+                                    priority_docs: dict[str, dict[str, Any]] = {}
+                                    if remaining_time_budget() > AI_MIN_REMAINING_SEC:
+                                        try:
+                                            priority_docs = await scraper.fetch_priority_documents(
+                                                base_url or record.get("url"),
+                                                base_html,
+                                                max_links=2,
+                                                concurrency=FETCH_CONCURRENCY,
+                                                target_types=["about", "contact"],
+                                                exclude_urls={base_url} if base_url else None,
+                                            )
+                                        except Exception:
+                                            priority_docs = {}
+                                    for url, pdata in priority_docs.items():
+                                        page_info = {
+                                            "url": url,
+                                            "text": pdata.get("text", "") or "",
+                                            "html": pdata.get("html", "") or "",
+                                        }
+                                        ptext = page_info.get("text", "") or ""
+                                        phtml = page_info.get("html", "") or ""
+                                        try:
+                                            pt = scraper.classify_page_type(url, text=ptext, html=phtml).get("page_type") or "OTHER"
+                                        except Exception:
+                                            pt = "OTHER"
+                                        snippet_full = build_official_ai_text(ptext, phtml)
+                                        snippet = snippet_full[:1800] if len(snippet_full) > 1800 else snippet_full
+                                        pages_for_ai.append(
+                                            {
+                                                "url": url,
+                                                "page_type": pt,
+                                                "snippet": snippet,
+                                                "screenshot": None,
+                                            }
+                                        )
+                                    pages_for_ai = [p for p in pages_for_ai if p.get("snippet")] or pages_for_ai
+                                    if len(pages_for_ai) > 3:
+                                        pages_for_ai = pages_for_ai[:3]
+                                    ai_started = time.monotonic()
+                                    try:
+                                        if remaining_time_budget() <= AI_MIN_REMAINING_SEC:
+                                            return record, None
+                                        if hasattr(verifier, "judge_official_homepage_multi") and pages_for_ai:
+                                            ai_verdict = await asyncio.wait_for(
+                                                verifier.judge_official_homepage_multi(
+                                                    pages_for_ai,
+                                                    name,
+                                                    addr,
+                                                    base_url or record.get("url"),
+                                                ),
+                                                timeout=clamp_timeout(max(ai_call_timeout, 5.0)),
+                                            )
+                                        else:
+                                            ai_verdict = await asyncio.wait_for(
+                                                verifier.judge_official_homepage(
+                                                    base_snippet_full,
+                                                    info_payload.get("screenshot"),
+                                                    name,
+                                                    addr,
+                                                    record.get("normalized_url") or record.get("url"),
+                                                ),
+                                                timeout=clamp_timeout(max(ai_call_timeout, 5.0)),
+                                            )
+                                    except Exception:
+                                        log.warning("[%s] AI公式判定失敗: %s", cid, record.get("url"), exc_info=True)
+                                        return record, None
+                                    ai_time_spent += time.monotonic() - ai_started
+                                    ai_official_attempted = True
+                                    # AI公式のうち、ドメイン/ルール根拠が弱いものは「確定公式には使わない」が、
+                                    # deep起点としては保持する（除外扱いに落とさない）。
+                                    if ai_verdict and ai_verdict.get("is_official") and domain_score < 4 and not record.get("rule", {}).get("address_match"):
+                                        rule = record.get("rule", {}) or {}
+                                        evidence_score = int(rule.get("official_evidence_score") or 0)
+                                        directory_like = bool(rule.get("directory_like"))
+                                        if directory_like or evidence_score < 9:
+                                            ai_verdict["weak_signals"] = True
+                                    return record, ai_verdict
+
+                            ranked_for_ai_official = sorted(
+                                candidate_records,
+                                key=lambda r: (int(r.get("search_rank", 1_000_000_000) or 1_000_000_000), int(r.get("order_idx", 1_000_000_000) or 1_000_000_000)),
+                            )
+                            if not AI_OFFICIAL_ALL_CANDIDATES:
+                                ranked_for_ai_official = ranked_for_ai_official[:3]
+                            elif AI_OFFICIAL_CANDIDATE_LIMIT > 0:
+                                ranked_for_ai_official = ranked_for_ai_official[:AI_OFFICIAL_CANDIDATE_LIMIT]
+                            for record in ranked_for_ai_official:
+                                if not record_needs_official_ai(record):
+                                    continue
+                                if remaining_time_budget() <= AI_MIN_REMAINING_SEC:
+                                    break
+                                ai_tasks.append(asyncio.create_task(run_official_ai(record)))
+
+                            if ai_tasks and not ai_official_primary:
+                                results = await asyncio.gather(*ai_tasks, return_exceptions=True)
+                                for res in results:
+                                    if not isinstance(res, tuple) or len(res) != 2:
+                                        continue
+                                    rec, verdict = res
+                                    if verdict:
+                                        rec["ai_judge"] = verdict
+                            if ai_official_primary:
+                                for record in ranked_for_ai_official:
+                                    if not record_needs_official_ai(record):
+                                        continue
                                     if remaining_time_budget() <= AI_MIN_REMAINING_SEC:
-                                        return None
-                                    ai_verdict = await asyncio.wait_for(
-                                        verifier.judge_official_homepage(
-                                            build_official_ai_text(
-                                                info_payload.get("text", "") or "",
-                                                info_payload.get("html", "") or "",
-                                            ),
-                                            info_payload.get("screenshot"),
-                                            name,
-                                            addr,
-                                            record.get("normalized_url") or record.get("url"),
-                                        ),
-                                        timeout=clamp_timeout(max(ai_call_timeout, 5.0)),
-                                    )
-                                except Exception:
-                                    log.warning("[%s] AI公式判定失敗: %s", cid, record.get("url"), exc_info=True)
-                                    return None
-                                ai_time_spent += time.monotonic() - ai_started
-                                ai_official_attempted = True
-                                # AI公式のうち、ドメイン/ルール根拠が弱いものは「確定公式には使わない」が、
-                                # deep起点としては保持する（除外扱いに落とさない）。
-                                if ai_verdict and ai_verdict.get("is_official") and domain_score < 4 and not record.get("rule", {}).get("address_match"):
-                                    rule = record.get("rule", {}) or {}
-                                    evidence_score = int(rule.get("official_evidence_score") or 0)
-                                    directory_like = bool(rule.get("directory_like"))
-                                    if directory_like or evidence_score < 9:
-                                        ai_verdict["weak_signals"] = True
-                                return ai_verdict
+                                        break
+                                    rec, verdict = await run_official_ai(record)
+                                    if verdict:
+                                        rec["ai_judge"] = verdict
+                                        if ai_official_hint_from_judge(verdict, AI_VERIFY_MIN_CONFIDENCE):
+                                            log.info("[%s] AI公式判定で早期確定候補を取得 -> 以降のAI判定を省略", cid)
+                                            break
 
-                        def _attach_ai_task(record: dict[str, Any]) -> None:
-                            if not record_needs_official_ai(record):
-                                return
-                            if remaining_time_budget() <= AI_MIN_REMAINING_SEC:
-                                return
-                            task = asyncio.create_task(run_official_ai(record))
-                            ai_tasks.append(task)
-
-                            def _on_done(t: asyncio.Task, rec: dict[str, Any] = record) -> None:
+                            # AI公式が複数出るケースに備え、AI判定が強い候補を先に評価する
+                            def _ai_select_score(rec: dict[str, Any]) -> float:
+                                aj = rec.get("ai_judge") or {}
+                                if not isinstance(aj, dict):
+                                    aj = {}
+                                ai_is = aj.get("is_official_site")
+                                if ai_is is None:
+                                    ai_is = aj.get("is_official")
+                                conf = aj.get("official_confidence")
+                                if conf is None:
+                                    conf = aj.get("confidence")
                                 try:
-                                    verdict = t.result()
+                                    conf_f = float(conf) if conf is not None else 0.0
                                 except Exception:
-                                    return
-                                if verdict:
-                                    rec["ai_judge"] = verdict
+                                    conf_f = 0.0
+                                rd = rec.get("rule") or {}
+                                evidence = float(rd.get("official_evidence_score") or 0.0)
+                                domain = float(rec.get("domain_score") or 0.0)
+                                directory_like = bool(rd.get("directory_like"))
+                                host_token_hit = bool(rec.get("host_token_hit"))
+                                strong_domain_host = bool(rec.get("strong_domain_host"))
+                                name_present = bool(rd.get("name_present"))
+                                # 公式と判定されたものを優先しつつ、低confは過信しない
+                                score = 0.0
+                                if ai_is is True and conf_f >= AI_VERIFY_MIN_CONFIDENCE:
+                                    score += 1000.0 + conf_f * 100.0
+                                elif ai_is is True:
+                                    score += conf_f * 10.0
+                                elif ai_is is False:
+                                    score -= 200.0
+                                score += domain * 5.0 + evidence * 2.0
+                                score += 20.0 if host_token_hit else 0.0
+                                score += 12.0 if strong_domain_host else 0.0
+                                score += 10.0 if name_present else 0.0
+                                score -= 500.0 if directory_like else 0.0
+                                return score
 
-                            task.add_done_callback(_on_done)
-                            task.add_done_callback(lambda t: t.exception() if t.done() else None)
-
-                        ranked_for_ai_official = sorted(
-                            candidate_records,
-                            key=lambda r: (int(r.get("search_rank", 1_000_000_000) or 1_000_000_000), int(r.get("order_idx", 1_000_000_000) or 1_000_000_000)),
-                        )
-                        if not AI_OFFICIAL_ALL_CANDIDATES:
-                            ranked_for_ai_official = ranked_for_ai_official[:3]
-                        elif AI_OFFICIAL_CANDIDATE_LIMIT > 0:
-                            ranked_for_ai_official = ranked_for_ai_official[:AI_OFFICIAL_CANDIDATE_LIMIT]
-                        for record in ranked_for_ai_official:
-                            _attach_ai_task(record)
-
-                        if ai_tasks:
-                            await asyncio.gather(*ai_tasks, return_exceptions=True)
-
-                        # AI公式が複数出るケースに備え、AI判定が強い候補を先に評価する
-                        def _ai_select_score(rec: dict[str, Any]) -> float:
-                            aj = rec.get("ai_judge") or {}
-                            if not isinstance(aj, dict):
-                                aj = {}
-                            ai_is = aj.get("is_official_site")
-                            if ai_is is None:
-                                ai_is = aj.get("is_official")
-                            conf = aj.get("official_confidence")
-                            if conf is None:
-                                conf = aj.get("confidence")
-                            try:
-                                conf_f = float(conf) if conf is not None else 0.0
-                            except Exception:
-                                conf_f = 0.0
-                            rd = rec.get("rule") or {}
-                            evidence = float(rd.get("official_evidence_score") or 0.0)
-                            domain = float(rec.get("domain_score") or 0.0)
-                            directory_like = bool(rd.get("directory_like"))
-                            host_token_hit = bool(rec.get("host_token_hit"))
-                            strong_domain_host = bool(rec.get("strong_domain_host"))
-                            name_present = bool(rd.get("name_present"))
-                            # 公式と判定されたものを優先しつつ、低confは過信しない
-                            score = 0.0
-                            if ai_is is True and conf_f >= AI_VERIFY_MIN_CONFIDENCE:
-                                score += 1000.0 + conf_f * 100.0
-                            elif ai_is is True:
-                                score += conf_f * 10.0
-                            elif ai_is is False:
-                                score -= 200.0
-                            score += domain * 5.0 + evidence * 2.0
-                            score += 20.0 if host_token_hit else 0.0
-                            score += 12.0 if strong_domain_host else 0.0
-                            score += 10.0 if name_present else 0.0
-                            score -= 500.0 if directory_like else 0.0
-                            return score
-
-                        candidate_records.sort(
-                            key=lambda r: (
-                                -_ai_select_score(r),
-                                int(r.get("search_rank", 1_000_000_000) or 1_000_000_000),
-                                int(r.get("order_idx", 1_000_000_000) or 1_000_000_000),
-                            )
-                        )
-
-                    for record in candidate_records:
-                        normalized_url = record.get("normalized_url") or record.get("url")
-                        extracted = record.get("extracted") or {}
-                        rule_details = record.get("rule") or {}
-                        domain_score = int(record.get("domain_score") or 0)
-                        if normalized_url and domain_score == 0:
-                            domain_score = scraper._domain_score(company_tokens, normalized_url)  # type: ignore
-                            record["domain_score"] = domain_score
-                        host_token_hit = bool(record.get("host_token_hit"))
-                        strong_domain_host = bool(record.get("strong_domain_host"))
-                        addr_hit = bool(rule_details.get("address_match"))
-                        pref_hit = bool(rule_details.get("prefecture_match"))
-                        zip_hit = bool(rule_details.get("postal_code_match"))
-                        # ドメイン一致だけで「社名一致」と扱うと誤採用しやすいので、ページ内の社名シグナルを重視する
-                        name_present = bool(rule_details.get("name_present"))
-                        name_match_exact = bool(rule_details.get("name_match_exact"))
-                        name_match_partial_only = bool(rule_details.get("name_match_partial_only"))
-                        try:
-                            name_match_ratio = float(rule_details.get("name_match_ratio") or 0.0)
-                        except Exception:
-                            name_match_ratio = 0.0
-                        name_match_source = str(rule_details.get("name_match_source") or "")
-                        high_signal_sources = {"title", "h1", "og_site_name", "og_title", "app_name"}
-                        official_evidence = rule_details.get("official_evidence") or []
-                        strong_name_hit = bool(
-                            name_match_exact
-                            or ("jsonld:org_name" in official_evidence)
-                            or ("h1" in official_evidence)
-                            or ("title" in official_evidence)
-                            or (
-                                name_match_ratio >= 0.92
-                                and not name_match_partial_only
-                                and name_match_source in high_signal_sources
-                            )
-                        )
-                        name_hit = strong_name_hit
-                        pref_only_ok = bool(
-                            input_addr_pref_only
-                            and pref_hit
-                            and (name_hit or strong_domain_host or host_token_hit or domain_score >= 4)
-                        )
-                        address_ok = bool(addr) and (addr_hit or zip_hit or pref_only_ok)
-                        evidence_score = int(rule_details.get("official_evidence_score") or 0)
-                        directory_like = bool(rule_details.get("directory_like"))
-                        host_name, _, allowed_tld, whitelist_host, _ = CompanyScraper._allowed_official_host(normalized_url or "")
-                        content_strong = name_hit and (address_ok or evidence_score >= 9)
-                        ai_judge = record.get("ai_judge")
-                        flag_info = record.get("flag_info")
-
-                        if directory_like:
-                            manager.upsert_url_flag(
-                                normalized_url,
-                                is_official=False,
-                                source="rule",
-                                reason="directory_like",
-                                confidence=rule_details.get("directory_score"),
-                            )
-                            fallback_cands.append((record.get("url"), extracted))
-                            log.info("[%s] 企業DB/ディレクトリ判定のため除外: %s", cid, record.get("url"))
-                            continue
-
-                        ai_is_official = None
-                        ai_is_official_effective = None
-                        ai_conf_f = 0.0
-                        ai_official_hint = False
-
-                        if ai_judge:
-                            ai_is_official = ai_judge.get("is_official_site")
-                            if ai_is_official is None:
-                                ai_is_official = ai_judge.get("is_official")
-                            ai_conf = ai_judge.get("official_confidence")
-                            if ai_conf is None:
-                                ai_conf = ai_judge.get("confidence")
-                            try:
-                                ai_conf_f = float(ai_conf) if ai_conf is not None else 0.0
-                            except Exception:
-                                ai_conf_f = 0.0
-                            ai_official_hint = ai_official_hint_from_judge(ai_judge, AI_VERIFY_MIN_CONFIDENCE)
-                            # weak_signals 付きのAI公式は「確定公式」判定には使わず、暫定候補としてのみ保持する
-                            if ai_official_hint and bool(ai_judge.get("weak_signals")):
-                                ai_is_official_effective = None
-                            else:
-                                ai_is_official_effective = (
-                                    ai_is_official if ai_conf_f >= AI_VERIFY_MIN_CONFIDENCE else None
+                            candidate_records.sort(
+                                key=lambda r: (
+                                    -_ai_select_score(r),
+                                    int(r.get("search_rank", 1_000_000_000) or 1_000_000_000),
+                                    int(r.get("order_idx", 1_000_000_000) or 1_000_000_000),
                                 )
-                            # AIが「非公式」かつconfidenceが十分高い場合のみ、強い除外として扱う
-                            if ai_is_official_effective is False:
-                                rule_strong_for_conflict = bool(
-                                    content_strong
-                                    or host_token_hit
-                                    or strong_domain_host
-                                    or rule_details.get("strong_domain")
-                                    or domain_score >= 5
-                                    or evidence_score >= 10
+                            )
+
+                        for record in candidate_records:
+                            normalized_url = record.get("normalized_url") or record.get("url")
+                            if normalized_url and normalized_url in processed_urls:
+                                continue
+                            if normalized_url:
+                                processed_urls.add(normalized_url)
+                            extracted = record.get("extracted") or {}
+                            rule_details = record.get("rule") or {}
+                            domain_score = int(record.get("domain_score") or 0)
+                            if normalized_url and domain_score == 0:
+                                domain_score = scraper._domain_score(company_tokens, normalized_url)  # type: ignore
+                                record["domain_score"] = domain_score
+                            host_token_hit = bool(record.get("host_token_hit"))
+                            strong_domain_host = bool(record.get("strong_domain_host"))
+                            addr_hit = bool(rule_details.get("address_match"))
+                            pref_hit = bool(rule_details.get("prefecture_match"))
+                            zip_hit = bool(rule_details.get("postal_code_match"))
+                            # ドメイン一致だけで「社名一致」と扱うと誤採用しやすいので、ページ内の社名シグナルを重視する
+                            name_present = bool(rule_details.get("name_present"))
+                            name_match_exact = bool(rule_details.get("name_match_exact"))
+                            name_match_partial_only = bool(rule_details.get("name_match_partial_only"))
+                            try:
+                                name_match_ratio = float(rule_details.get("name_match_ratio") or 0.0)
+                            except Exception:
+                                name_match_ratio = 0.0
+                            name_match_source = str(rule_details.get("name_match_source") or "")
+                            high_signal_sources = {"title", "h1", "og_site_name", "og_title", "app_name"}
+                            official_evidence = rule_details.get("official_evidence") or []
+                            strong_name_hit = bool(
+                                name_match_exact
+                                or ("jsonld:org_name" in official_evidence)
+                                or ("h1" in official_evidence)
+                                or ("title" in official_evidence)
+                                or (
+                                    name_match_ratio >= 0.92
+                                    and not name_match_partial_only
+                                    and name_match_source in high_signal_sources
                                 )
-                                if not rule_strong_for_conflict:
+                            )
+                            name_hit = strong_name_hit
+                            pref_only_ok = bool(
+                                input_addr_pref_only
+                                and pref_hit
+                                and (name_hit or strong_domain_host or host_token_hit or domain_score >= 4)
+                            )
+                            address_ok = bool(addr) and (addr_hit or zip_hit or pref_only_ok)
+                            evidence_score = int(rule_details.get("official_evidence_score") or 0)
+                            directory_like = bool(rule_details.get("directory_like"))
+                            host_name, _, allowed_tld, whitelist_host, _ = CompanyScraper._allowed_official_host(normalized_url or "")
+                            content_strong = name_hit and (address_ok or evidence_score >= 9)
+                            ai_judge = record.get("ai_judge")
+                            flag_info = record.get("flag_info")
+
+
+                            ai_is_official = None
+                            ai_is_official_effective = None
+                            ai_conf_f = 0.0
+                            ai_official_hint = False
+
+                            if ai_judge:
+                                ai_is_official = ai_judge.get("is_official_site")
+                                if ai_is_official is None:
+                                    ai_is_official = ai_judge.get("is_official")
+                                ai_conf = ai_judge.get("official_confidence")
+                                if ai_conf is None:
+                                    ai_conf = ai_judge.get("confidence")
+                                try:
+                                    ai_conf_f = float(ai_conf) if ai_conf is not None else 0.0
+                                except Exception:
+                                    ai_conf_f = 0.0
+                                ai_official_hint = ai_official_hint_from_judge(ai_judge, AI_VERIFY_MIN_CONFIDENCE)
+                                if ai_is_official is True:
+                                    ai_is_official_effective = True
+                                elif ai_is_official is False and ai_conf_f >= AI_VERIFY_MIN_CONFIDENCE:
+                                    ai_is_official_effective = False
+                                # AI negative with high confidence can exclude
+                                if ai_is_official_effective is False:
+                                    name_signal_ok = bool(
+                                        strong_name_hit
+                                        or (name_match_ratio >= 0.85 and not name_match_partial_only)
+                                    )
+                                    rule_strong_for_conflict = bool(
+                                        content_strong
+                                        or host_token_hit
+                                        or strong_domain_host
+                                        or rule_details.get("strong_domain")
+                                        or domain_score >= 5
+                                        or evidence_score >= 10
+                                        or (name_signal_ok and evidence_score >= 3)
+                                    )
+                                    if not rule_strong_for_conflict:
+                                        manager.upsert_url_flag(
+                                            normalized_url,
+                                            is_official=False,
+                                            source="ai",
+                                            reason=ai_judge.get("reason", "") or "ai_not_official",
+                                            confidence=ai_conf_f,
+                                        )
+                                        fallback_cands.append((record.get("url"), extracted))
+                                        log.info(
+                                            "[%s] AI reject: %s (is_official=%s confidence=%.2f)",
+                                            cid,
+                                            record.get("url"),
+                                            ai_is_official,
+                                            ai_conf_f,
+                                        )
+                                        continue
+                                    # AI negative conflict: keep as review-only
+                                    record["ai_conflict"] = True
+                                    record["ai_conflict_confidence"] = ai_conf_f
+                                    force_review = True
                                     manager.upsert_url_flag(
                                         normalized_url,
                                         is_official=False,
-                                        source="ai",
-                                        reason=ai_judge.get("reason", "") or "ai_not_official",
+                                        source="ai_conflict",
+                                        reason=ai_judge.get("reason", "") or "ai_not_official_rule_conflict",
                                         confidence=ai_conf_f,
                                     )
                                     fallback_cands.append((record.get("url"), extracted))
                                     log.info(
-                                        "[%s] AI判定で除外: %s (is_official=%s confidence=%.2f)",
+                                        "[%s] AI negative conflict (review): %s (domain=%s evidence=%s conf=%.2f)",
                                         cid,
                                         record.get("url"),
-                                        ai_is_official,
+                                        domain_score,
+                                        evidence_score,
                                         ai_conf_f,
                                     )
-                                    continue
-                                # AI優先モードでは「AI非公式」は公式採用しない（review候補としてのみ保持）
-                                record["ai_conflict"] = True
-                                record["ai_conflict_confidence"] = ai_conf_f
-                                force_review = True
+                                    if ai_official_primary:
+                                        continue
+                                elif ai_is_official is not None and ai_conf_f < AI_VERIFY_MIN_CONFIDENCE:
+                                    # Low confidence: keep for rule evaluation
+                                    record["ai_low_confidence"] = True
+
+                            if directory_like and not ai_is_official_effective:
                                 manager.upsert_url_flag(
                                     normalized_url,
                                     is_official=False,
-                                    source="ai",
-                                    reason=ai_judge.get("reason", "") or "ai_not_official_rule_conflict",
-                                    confidence=ai_conf_f,
+                                    source="rule",
+                                    reason="directory_like",
+                                    confidence=rule_details.get("directory_score"),
                                 )
                                 fallback_cands.append((record.get("url"), extracted))
-                                log.info(
-                                    "[%s] AI非公式のため公式採用せず(review候補): %s (domain=%s evidence=%s conf=%.2f)",
-                                    cid,
-                                    record.get("url"),
-                                    domain_score,
-                                    evidence_score,
-                                    ai_conf_f,
-                                )
-                                if ai_official_primary:
-                                    continue
-                            elif ai_conf_f < AI_VERIFY_MIN_CONFIDENCE:
-                                # 低confidenceは誤爆しやすいので除外には使わず、ルール判定で続行する
-                                record["ai_low_confidence"] = True
+                                log.info("[%s] directory_like -> skip: %s", cid, record.get("url"))
+                                continue
 
-                        fast_phone_hit = bool(extracted.get("phone_numbers"))
-                        fast_address_ok = address_ok or bool(rule_details.get("address_match"))
-                        fast_domain_ok = (
-                            domain_score >= 4
-                            or host_token_hit
-                            or strong_domain_host
-                            or rule_details.get("strong_domain")
-                        )
-                        ai_content_ok = fast_address_ok or fast_phone_hit or name_hit or host_token_hit
-                        ai_provisional = False
-                        if ai_is_official_effective is True:
-                            if input_addr_pref_only and not ai_content_ok:
-                                # AI公式は探索起点として正義：除外せず provisional として保持する（確定公式にはしない）
-                                record["ai_official_provisional"] = True
-                                record["ai_official_provisional_reason"] = "pref_only_input_no_name_host"
-                                ai_provisional = True
-                                force_review = True
-                                log.info("[%s] AI公式だが都道府県のみ＆根拠不足 -> provisional保持: %s", cid, record.get("url"))
-                            if not ai_content_ok:
-                                # AI公式は除外しない（確定公式にもせず、deep起点として扱う）
-                                record["ai_official_provisional"] = True
-                                record["ai_official_provisional_reason"] = "ai_no_content_signal"
-                                ai_provisional = True
-                                force_review = True
-                                log.info("[%s] AI公式だがコンテンツ根拠が乏しい -> provisional保持: %s", cid, record.get("url"))
-                            info = record.get("info")
-                            primary_cands = extracted
-                            homepage = normalized_url
-                            homepage_official_flag = 0 if ai_provisional else 1
-                            homepage_official_source = (
-                                "ai_provisional" if ai_provisional else ("ai_fast" if fast_domain_ok else "ai_review")
+                            fast_phone_hit = bool(extracted.get("phone_numbers"))
+                            fast_address_ok = address_ok or bool(rule_details.get("address_match"))
+                            fast_domain_ok = (
+                                domain_score >= 4
+                                or host_token_hit
+                                or strong_domain_host
+                                or rule_details.get("strong_domain")
                             )
-                            homepage_official_score = float(rule_details.get("score") or 0.0)
-                            if not ai_provisional:
+                            if ai_is_official_effective is True:
+                                candidate_url = normalized_url
+                                candidate_source = "ai_fast" if fast_domain_ok else "ai_review"
+                                candidate_score = float(rule_details.get("score") or 0.0)
+                                info = record.get("info")
+                                primary_cands = extracted
+                                homepage = candidate_url
+                                homepage_official_flag = 1
+                                homepage_official_source = candidate_source
+                                homepage_official_score = candidate_score
                                 ai_official_description = ai_judge.get("description") if isinstance(ai_judge, dict) else None
-                            chosen_domain_score = domain_score
-                            selected_candidate_record = record
-                            if not fast_domain_ok or (addr and not address_ok):
-                                force_review = True
-                            free_host = _is_free_host(homepage)
-                            if (free_host and evidence_score < 10) or not _official_signal_ok(
-                                host_token_hit=host_token_hit,
-                                strong_domain_host=strong_domain_host,
-                                domain_score=domain_score,
-                                name_hit=name_hit,
-                                address_ok=address_ok,
-                                official_evidence_score=evidence_score,
+                                chosen_domain_score = domain_score
+                                selected_candidate_record = record
+                                if not fast_domain_ok or (addr and not address_ok):
+                                    force_review = True
+                                manager.upsert_url_flag(
+                                    candidate_url,
+                                    is_official=True,
+                                    source=homepage_official_source,
+                                    reason=ai_judge.get("reason", "") if isinstance(ai_judge, dict) else "",
+                                    confidence=ai_judge.get("confidence") if isinstance(ai_judge, dict) else None,
+                                )
+                                log.info(
+                                    "[%s] AI official selected: %s (source=%s domain=%s host=%s addr=%s phone=%s review=%s)",
+                                    cid,
+                                    candidate_url,
+                                    homepage_official_source,
+                                    domain_score,
+                                    host_token_hit,
+                                    fast_address_ok,
+                                    fast_phone_hit,
+                                    force_review,
+                                )
+                                break
+
+                            brand_allowed = (allowed_tld or whitelist_host) and not host_token_hit
+                            if (
+                                not homepage
+                                and brand_allowed
+                                and content_strong
+                                and not flag_info
                             ):
-                                # AI公式は「除外禁止」: 公式確定できない場合も URL 自体は保持し、review で保存する
-                                homepage_official_flag = 0
+                                homepage = normalized_url
+                                info = record.get("info")
+                                primary_cands = extracted
+                                # AI公式判定が使える場合、この分岐だけで公式確定しない（review候補として保持）
+                                homepage_official_flag = 0 if ai_official_primary else 1
+                                homepage_official_source = "name_addr"
+                                homepage_official_score = float(rule_details.get("score") or 0.0)
+                                chosen_domain_score = domain_score
+                                selected_candidate_record = record
                                 force_review = True
-                                if ai_is_official_effective is True:
-                                    homepage_official_source = "ai_provisional"
-                                    forced_provisional_homepage = normalized_url
-                                    forced_provisional_reason = "ai_official_but_weak_signals"
+                                if record.get("ai_conflict"):
+                                    homepage_official_source = "name_addr_ai_conflict"
+                                if not ai_official_primary:
+                                    manager.upsert_url_flag(
+                                        normalized_url,
+                                        is_official=True,
+                                        source="name_addr",
+                                        reason="name_address_match_brand_host",
+                                        confidence=rule_details.get("score"),
+                                    )
+                                log.info(
+                                    "[%s] 名前+住所一致（ブランドドメイン）でreview候補保存: %s host=%s",
+                                    cid,
+                                    normalized_url,
+                                    host_name,
+                                )
+                                break
+
+                            # 社名トークンなし＆住所一致だけの候補は公式扱いしない
+                            if not host_token_hit and not name_hit and address_ok:
+                                manager.upsert_url_flag(
+                                    normalized_url,
+                                    is_official=False,
+                                    source="rule",
+                                    reason="address_only_no_name_host",
+                                )
+                                fallback_cands.append((record.get("url"), extracted))
+                                log.info("[%s] ホスト社名なし・名称一致なし・住所一致のみのため非公式扱い: %s", cid, record.get("url"))
+                                continue
+                            if rule_details.get("blocked_host"):
+                                manager.upsert_url_flag(
+                                    normalized_url,
+                                    is_official=False,
+                                    source="rule",
+                                    reason=f"blocked_host:{rule_details.get('host', '')}",
+                                    scope="host",
+                                )
+                                fallback_cands.append((record.get("url"), extracted))
+                                log.info("[%s] 除外ホスト(%s)をスキップ: %s", cid, rule_details.get("host"), record.get("url"))
+                                continue
+                            # キャッシュ公式は採用しない（参考のみ）
+                            if rule_details.get("is_official"):
+                                if input_addr_pref_only and not (host_token_hit or name_hit or strong_domain_host or domain_score >= 4):
                                     manager.upsert_url_flag(
                                         normalized_url,
                                         is_official=False,
-                                        source="ai_provisional",
-                                        reason="ai_official_but_weak_signals",
-                                        confidence=ai_judge.get("confidence"),
+                                        source="rule",
+                                        reason="pref_only_input_no_name_host",
                                     )
-                                else:
+                                    fallback_cands.append((record.get("url"), extracted))
+                                    log.info("[%s] 公式判定だが都道府県だけの入力で社名/ホスト根拠なしのため除外: %s", cid, record.get("url"))
+                                    continue
+                                if addr and not address_ok:
+                                    # 住所根拠なしなら review 送りでURLは維持
+                                    force_review = True
+                                    log.info("[%s] 公式判定だが入力住所と一致せず -> review: %s", cid, record.get("url"))
+                                if not host_token_hit and not address_ok:
+                                    manager.upsert_url_flag(
+                                        normalized_url,
+                                        is_official=False,
+                                        source="rule",
+                                        reason="host_no_name_no_address",
+                                    )
+                                    fallback_cands.append((record.get("url"), extracted))
+                                    log.info("[%s] 公式判定でもホストに社名なし・住所根拠なしのため除外: %s", cid, record.get("url"))
+                                    continue
+                                if not host_token_hit and not name_hit:
+                                    manager.upsert_url_flag(
+                                        normalized_url,
+                                        is_official=False,
+                                        source="rule",
+                                        reason="no_host_token_no_name",
+                                    )
+                                    fallback_cands.append((record.get("url"), extracted))
+                                    log.info("[%s] 名称/ホストトークンなしのため公式判定を除外: %s", cid, record.get("url"))
+                                    continue
+                                name_or_domain_ok = (
+                                    name_hit
+                                    or strong_domain_host
+                                    or rule_details.get("strong_domain")
+                                    or domain_score >= 5
+                                )
+                                if not (name_or_domain_ok or address_ok):
+                                    manager.upsert_url_flag(
+                                        normalized_url,
+                                        is_official=False,
+                                        source="rule",
+                                        reason="name_domain_mismatch",
+                                    )
+                                    fallback_cands.append((record.get("url"), extracted))
+                                    log.info("[%s] 名称/ドメイン一致弱のため公式判定を除外: %s", cid, record.get("url"))
+                                    continue
+                                # 低ドメイン一致は name/address/host が強い場合のみ採用
+                                if domain_score < 3 and not strong_domain_host and not rule_details.get("strong_domain") and not address_ok and not name_hit and not host_token_hit:
+                                    manager.upsert_url_flag(
+                                        normalized_url,
+                                        is_official=False,
+                                        source="rule",
+                                        reason=f"weak_domain_score={domain_score}",
+                                    )
+                                    fallback_cands.append((record.get("url"), extracted))
+                                    log.info("[%s] 低ドメイン一致のため公式判定を見送り: %s", cid, record.get("url"))
+                                    continue
+                                if not address_ok and not name_hit:
+                                    force_review = True
+                                    log.info("[%s] 名称/住所一致弱いが公式扱い→review: %s", cid, record.get("url"))
+                                homepage = normalized_url
+                                info = record.get("info")
+                                primary_cands = extracted
+                                selected_candidate_record = record
+                                # AI公式判定が使える場合 rule だけで公式確定しない（AI公式の方で採用される）
+                                homepage_official_flag = 0 if ai_official_primary else 1
+                                homepage_official_source = "rule" if not ai_official_primary else "rule_review"
+                                homepage_official_score = float(rule_details.get("score") or 0.0)
+                                chosen_domain_score = domain_score
+                                if ai_official_primary:
+                                    force_review = True
+                                if record.get("ai_conflict"):
+                                    homepage_official_source = "rule_ai_conflict" if not ai_official_primary else "rule_review_ai_conflict"
+                                    force_review = True
+                                free_host = _is_free_host(homepage)
+                                if (free_host and evidence_score < 10) or not _official_signal_ok(
+                                    host_token_hit=host_token_hit,
+                                    strong_domain_host=strong_domain_host,
+                                    domain_score=domain_score,
+                                    name_hit=name_hit,
+                                    address_ok=address_ok,
+                                    official_evidence_score=evidence_score,
+                                ):
+                                    homepage_official_flag = 0
                                     homepage_official_source = "provisional_freehost"
+                                    force_review = True
+                                    if normalized_url:
+                                        forced_provisional_homepage = normalized_url
+                                        forced_provisional_reason = "free_host_or_weak_signals"
                                     manager.upsert_url_flag(
                                         normalized_url,
                                         is_official=False,
                                         source="rule",
                                         reason="free_host_or_weak_signals",
                                     )
-                            elif not ai_provisional:
+                                if not ai_official_primary:
+                                    manager.upsert_url_flag(
+                                        normalized_url,
+                                        is_official=True,
+                                        source="rule",
+                                        reason=f"score={rule_details.get('score', 0.0):.1f}",
+                                    )
+                                break
+                            score_val = float(rule_details.get("score") or 0.0)
+                            if score_val <= 1 and not rule_details.get("strong_domain"):
                                 manager.upsert_url_flag(
                                     normalized_url,
-                                    is_official=True,
-                                    source=homepage_official_source,
-                                    reason=ai_judge.get("reason", ""),
-                                    confidence=ai_judge.get("confidence"),
+                                    is_official=False,
+                                    source="rule",
+                                    reason=f"score={score_val:.1f}",
                                 )
-                            log.info(
-                                "[%s] AI公式採用: %s (source=%s domain=%s host=%s addr=%s phone=%s review=%s)",
-                                cid,
-                                normalized_url,
-                                homepage_official_source,
-                                domain_score,
-                                host_token_hit,
-                                fast_address_ok,
-                                fast_phone_hit,
-                                force_review,
-                            )
-                            break
+                                fallback_cands.append((record.get("url"), extracted))
+                            log.info("[%s] 非公式と判断: %s", cid, record.get("url"))
 
-                        brand_allowed = (allowed_tld or whitelist_host) and not host_token_hit
-                        if (
-                            not homepage
-                            and brand_allowed
-                            and content_strong
-                            and not flag_info
-                        ):
-                            homepage = normalized_url
-                            info = record.get("info")
-                            primary_cands = extracted
-                            # AI公式判定が使える場合、この分岐だけで公式確定しない（review候補として保持）
-                            homepage_official_flag = 0 if ai_official_primary else 1
-                            homepage_official_source = "name_addr"
-                            homepage_official_score = float(rule_details.get("score") or 0.0)
-                            chosen_domain_score = domain_score
-                            selected_candidate_record = record
-                            force_review = True
-                            if record.get("ai_conflict"):
-                                homepage_official_source = "name_addr_ai_conflict"
-                            if not ai_official_primary:
-                                manager.upsert_url_flag(
-                                    normalized_url,
-                                    is_official=True,
-                                    source="name_addr",
-                                    reason="name_address_match_brand_host",
-                                    confidence=rule_details.get("score"),
-                                )
-                            log.info(
-                                "[%s] 名前+住所一致（ブランドドメイン）でreview候補保存: %s host=%s",
-                                cid,
-                                normalized_url,
-                                host_name,
-                            )
+                        if homepage:
                             break
-
-                        # 社名トークンなし＆住所一致だけの候補は公式扱いしない
-                        if not host_token_hit and not name_hit and address_ok:
-                            manager.upsert_url_flag(
-                                normalized_url,
-                                is_official=False,
-                                source="rule",
-                                reason="address_only_no_name_host",
-                            )
-                            fallback_cands.append((record.get("url"), extracted))
-                            log.info("[%s] ホスト社名なし・名称一致なし・住所一致のみのため非公式扱い: %s", cid, record.get("url"))
-                            continue
-                        if rule_details.get("blocked_host"):
-                            manager.upsert_url_flag(
-                                normalized_url,
-                                is_official=False,
-                                source="rule",
-                                reason=f"blocked_host:{rule_details.get('host', '')}",
-                                scope="host",
-                            )
-                            fallback_cands.append((record.get("url"), extracted))
-                            log.info("[%s] 除外ホスト(%s)をスキップ: %s", cid, rule_details.get("host"), record.get("url"))
-                            continue
-                        # キャッシュ公式は採用しない（参考のみ）
-                        if rule_details.get("is_official"):
-                            if input_addr_pref_only and not (host_token_hit or name_hit or strong_domain_host or domain_score >= 4):
-                                manager.upsert_url_flag(
-                                    normalized_url,
-                                    is_official=False,
-                                    source="rule",
-                                    reason="pref_only_input_no_name_host",
-                                )
-                                fallback_cands.append((record.get("url"), extracted))
-                                log.info("[%s] 公式判定だが都道府県だけの入力で社名/ホスト根拠なしのため除外: %s", cid, record.get("url"))
-                                continue
-                            if addr and not address_ok:
-                                # 住所根拠なしなら review 送りでURLは維持
-                                force_review = True
-                                log.info("[%s] 公式判定だが入力住所と一致せず -> review: %s", cid, record.get("url"))
-                            if not host_token_hit and not address_ok:
-                                manager.upsert_url_flag(
-                                    normalized_url,
-                                    is_official=False,
-                                    source="rule",
-                                    reason="host_no_name_no_address",
-                                )
-                                fallback_cands.append((record.get("url"), extracted))
-                                log.info("[%s] 公式判定でもホストに社名なし・住所根拠なしのため除外: %s", cid, record.get("url"))
-                                continue
-                            if not host_token_hit and not name_hit:
-                                manager.upsert_url_flag(
-                                    normalized_url,
-                                    is_official=False,
-                                    source="rule",
-                                    reason="no_host_token_no_name",
-                                )
-                                fallback_cands.append((record.get("url"), extracted))
-                                log.info("[%s] 名称/ホストトークンなしのため公式判定を除外: %s", cid, record.get("url"))
-                                continue
-                            name_or_domain_ok = (
-                                name_hit
-                                or strong_domain_host
-                                or rule_details.get("strong_domain")
-                                or domain_score >= 5
-                            )
-                            if not (name_or_domain_ok or address_ok):
-                                manager.upsert_url_flag(
-                                    normalized_url,
-                                    is_official=False,
-                                    source="rule",
-                                    reason="name_domain_mismatch",
-                                )
-                                fallback_cands.append((record.get("url"), extracted))
-                                log.info("[%s] 名称/ドメイン一致弱のため公式判定を除外: %s", cid, record.get("url"))
-                                continue
-                            # 低ドメイン一致は name/address/host が強い場合のみ採用
-                            if domain_score < 3 and not strong_domain_host and not rule_details.get("strong_domain") and not address_ok and not name_hit and not host_token_hit:
-                                manager.upsert_url_flag(
-                                    normalized_url,
-                                    is_official=False,
-                                    source="rule",
-                                    reason=f"weak_domain_score={domain_score}",
-                                )
-                                fallback_cands.append((record.get("url"), extracted))
-                                log.info("[%s] 低ドメイン一致のため公式判定を見送り: %s", cid, record.get("url"))
-                                continue
-                            if not address_ok and not name_hit:
-                                force_review = True
-                                log.info("[%s] 名称/住所一致弱いが公式扱い→review: %s", cid, record.get("url"))
-                            homepage = normalized_url
-                            info = record.get("info")
-                            primary_cands = extracted
-                            selected_candidate_record = record
-                            # AI公式判定が使える場合 rule だけで公式確定しない（AI公式の方で採用される）
-                            homepage_official_flag = 0 if ai_official_primary else 1
-                            homepage_official_source = "rule" if not ai_official_primary else "rule_review"
-                            homepage_official_score = float(rule_details.get("score") or 0.0)
-                            chosen_domain_score = domain_score
-                            if ai_official_primary:
-                                force_review = True
-                            if record.get("ai_conflict"):
-                                homepage_official_source = "rule_ai_conflict" if not ai_official_primary else "rule_review_ai_conflict"
-                                force_review = True
-                            free_host = _is_free_host(homepage)
-                            if (free_host and evidence_score < 10) or not _official_signal_ok(
-                                host_token_hit=host_token_hit,
-                                strong_domain_host=strong_domain_host,
-                                domain_score=domain_score,
-                                name_hit=name_hit,
-                                address_ok=address_ok,
-                                official_evidence_score=evidence_score,
-                            ):
-                                homepage_official_flag = 0
-                                homepage_official_source = "provisional_freehost"
-                                force_review = True
-                                if normalized_url:
-                                    forced_provisional_homepage = normalized_url
-                                    forced_provisional_reason = "free_host_or_weak_signals"
-                                manager.upsert_url_flag(
-                                    normalized_url,
-                                    is_official=False,
-                                    source="rule",
-                                    reason="free_host_or_weak_signals",
-                                )
-                            if not ai_official_primary:
-                                manager.upsert_url_flag(
-                                    normalized_url,
-                                    is_official=True,
-                                    source="rule",
-                                    reason=f"score={rule_details.get('score', 0.0):.1f}",
-                                )
+                        if fetched_remaining or not remaining_pairs:
                             break
-                        score_val = float(rule_details.get("score") or 0.0)
-                        if score_val <= 1 and not rule_details.get("strong_domain"):
-                            manager.upsert_url_flag(
-                                normalized_url,
-                                is_official=False,
-                                source="rule",
-                                reason=f"score={score_val:.1f}",
+                        if prepare_timed_out or over_fetch_limit() or over_time_limit():
+                            break
+                        fetched_remaining = True
+                        more_records, more_timed_out = await _prepare_batch(remaining_pairs, search_deadline)
+                        remaining_pairs = []
+                        if more_records:
+                            _postprocess_candidates(more_records)
+                            candidate_records.extend(more_records)
+                            candidate_records.sort(
+                                key=lambda rec: (
+                                    not rec.get('strong_domain_host', False),
+                                    -int(rec.get('domain_score') or 0),
+                                    rec.get('order_idx', 0),
+                                )
                             )
-                            fallback_cands.append((record.get("url"), extracted))
-                        log.info("[%s] 非公式と判断: %s", cid, record.get("url"))
-
+                            top3_ranked = sorted(candidate_records, key=lambda r: r.get('search_rank', 1e9))[:3]
+                            for r in top3_ranked:
+                                r['force_ai_official'] = True
+                        prepare_timed_out = prepare_timed_out or more_timed_out
+                        search_phase_end = elapsed()
+                        continue
                     provisional_homepage = ""
                     provisional_info = None
                     provisional_cands: dict[str, list[str]] = {}
@@ -2964,6 +3114,7 @@ async def process():
                         and isinstance(homepage_official_source, str)
                         and homepage_official_source.startswith("ai")
                     )
+                    deep_allowed = (not ai_official_primary) or ai_official_selected
 
                     def absorb_doc_data(url: str, pdata: dict[str, Any]) -> None:
                         nonlocal rule_phone, rule_address, rule_rep
@@ -3172,14 +3323,17 @@ async def process():
                             priority_docs = {}
                         else:
                             should_fetch_priority = (
-                                missing_contact > 0
-                                or need_description
-                                or need_founded
-                                or need_listing
-                                or need_revenue
-                                or need_profit
-                                or need_capital
-                                or need_fiscal
+                                deep_allowed
+                                and (
+                                    missing_contact > 0
+                                    or need_description
+                                    or need_founded
+                                    or need_listing
+                                    or need_revenue
+                                    or need_profit
+                                    or need_capital
+                                    or need_fiscal
+                                )
                             )
                             try:
                                 early_priority_docs = await asyncio.wait_for(
@@ -3418,8 +3572,11 @@ async def process():
     
                         missing_contact, missing_extra = refresh_need_flags()
                         need_extra_fields = missing_extra > 0
-                        if missing_contact == 0 and not need_extra_fields:
-                            related = {}
+                        related = {}
+                        related_meta: dict[str, Any] = {}
+                        if not deep_allowed:
+                            deep_skip_reason = "ai_not_selected"
+                        elif missing_contact == 0 and not need_extra_fields:
                             deep_skip_reason = "no_missing_fields"
                         else:
                             related_page_limit = RELATED_BASE_PAGES + (1 if missing_extra else 0)
@@ -3427,9 +3584,7 @@ async def process():
                                 related_page_limit += RELATED_EXTRA_PHONE
                             related_cap = 6 if ai_official_selected else 3
                             related_page_limit = max(0, min(related_cap, related_page_limit))
-                            related = {}
-                            related_meta: dict[str, Any] = {}
-    
+
                             deep_on_weak = os.getenv("DEEP_ON_WEAK_PROVISIONAL", "true").lower() == "true"
                             weak_provisional_target = (
                                 homepage_official_flag == 0
