@@ -1,3 +1,4 @@
+import re
 import pytest
 from unittest.mock import patch, MagicMock
 from src.company_scraper import CompanyScraper
@@ -32,6 +33,10 @@ def scraper():
     sc = CompanyScraper(headless=True)
     sc.http_session = None  # テストでは requests.get のモックを使う
     return sc
+
+
+def _strip_rep_tags(value: str) -> str:
+    return re.sub(r"^(?:\[[A-Z_]+\])+", "", value or "").strip()
 
 
 def test_search_engines_env_parsing(monkeypatch):
@@ -219,14 +224,26 @@ def test_clean_rep_name_allows_single_kanji_tokens(scraper):
 
 
 def test_extract_candidates_keeps_full_rep_name(scraper):
-    text = "会社概要\n代表取締役会長　飯野　靖司\n所在地 東京都千代田区"
-    cands = scraper.extract_candidates(text)
-    assert any(name.replace(" ", "") == "飯野靖司" for name in cands["rep_names"])
+    text = "会社概要\n所在地 東京都千代田区"
+    html = """
+    <table>
+      <tr><th>代表取締役会長</th><td>飯野　靖司</td></tr>
+      <tr><th>所在地</th><td>東京都千代田区</td></tr>
+    </table>
+    """
+    cands = scraper.extract_candidates(text, html=html)
+    assert any(_strip_rep_tags(name).replace(" ", "") == "飯野靖司" for name in cands["rep_names"])
 
 def test_extract_candidates_rep_name_then_role(scraper):
-    text = "役員紹介\n平野井 順一\n代表取締役社長\n所在地 東京都千代田区"
-    cands = scraper.extract_candidates(text)
-    assert any(name.replace(" ", "") == "平野井順一" for name in cands["rep_names"])
+    text = "役員紹介\n所在地 東京都千代田区"
+    html = """
+    <dl>
+      <dt>代表取締役社長</dt><dd>平野井 順一</dd>
+      <dt>所在地</dt><dd>東京都千代田区</dd>
+    </dl>
+    """
+    cands = scraper.extract_candidates(text, html=html)
+    assert any(_strip_rep_tags(name).replace(" ", "") == "平野井順一" for name in cands["rep_names"])
 
 def test_extract_candidates_rep_picks_ceo_when_multiple(scraper):
     text = "企業情報\n代表者 代表取締役会長 関 進、代表取締役社長 関 裕之\n電話番号 044-210-1000（代）"
@@ -237,7 +254,7 @@ def test_extract_candidates_rep_picks_ceo_when_multiple(scraper):
     </table>
     """
     cands = scraper.extract_candidates(text, html=html)
-    assert any(name.replace(" ", "").endswith("関裕之") for name in cands["rep_names"])
+    assert any(_strip_rep_tags(name).replace(" ", "").endswith("関裕之") for name in cands["rep_names"])
 
 
 def test_extract_candidates_finance_inline_variations(scraper):

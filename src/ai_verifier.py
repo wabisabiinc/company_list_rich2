@@ -80,6 +80,18 @@ _NOISE_RE = re.compile(
 )
 
 # ---- utils ------------------------------------------------------
+def _looks_mojibake(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    if "\ufffd" in text:
+        return True
+    if re.search(r"[ぁ-んァ-ン一-龥]", text):
+        return False
+    latin_count = sum(1 for ch in text if "\u00c0" <= ch <= "\u00ff")
+    if latin_count >= 3 and latin_count / max(len(text), 1) >= 0.15:
+        return True
+    return bool(re.search(r"[ÃÂãâæçïðñöøûüÿ]", text) and latin_count >= 2)
+
 def _extract_first_json(text: str) -> Optional[Dict[str, Any]]:
     if not text:
         return None
@@ -115,6 +127,8 @@ def _normalize_phone(s: Optional[str]) -> Optional[str]:
 
 def _normalize_address(addr: Optional[str]) -> Optional[str]:
     if not addr:
+        return None
+    if _looks_mojibake(addr):
         return None
     a = re.sub(r"\s+", " ", addr.strip())
     # 住所の後ろに混入しがちな付帯情報をカット（AI出力の誤混入対策）
@@ -377,6 +391,8 @@ class AIVerifier:
     def _validate_description(desc: Optional[str]) -> Optional[str]:
         if not desc:
             return None
+        if _looks_mojibake(desc):
+            return None
         if "http://" in desc or "https://" in desc or "＠" in desc or "@" in desc:
             return None
         desc = re.sub(r"\s+", " ", desc.strip())
@@ -391,6 +407,8 @@ class AIVerifier:
     @staticmethod
     def _validate_rich_description(desc: Optional[str]) -> Optional[str]:
         if not desc:
+            return None
+        if _looks_mojibake(desc):
             return None
         if "http://" in desc or "https://" in desc or "＠" in desc or "@" in desc:
             return None
@@ -788,6 +806,9 @@ class AIVerifier:
             "- 企業名・所在地・サービス内容の一致を確認。\n"
             "- 口コミ/求人/まとめサイト・予約サイトは false。\n"
             "- URLが企業ドメインや自治体/学校の公式ドメインなら true に寄せる。\n"
+            "- 採用/求人ページでも、同一ドメインで社名一致が確認できるなら true に寄せる。\n"
+            "- title/og:site_name/h1/ロゴ等で社名一致が強ければ公式寄り。\n"
+            "- [SIGNALS] があれば参考情報として扱う（directory_like=true は注意）。\n"
             "description のルール:\n"
             "- 事業内容だけを60〜120文字の日本語1文で要約（推測せず、根拠が弱ければ null）\n"
             "- 禁止: URL/メール/電話番号/住所/採用/問い合わせ/アクセス/代表者情報\n"
@@ -920,3 +941,140 @@ class AIVerifier:
                 "official_evidence": official_evidence_list,
                 "description": desc,
             }
+
+    async def judge_official_homepage_multi(
+        self,
+        pages: list[dict[str, Any]],
+        company_name: str,
+        address: str,
+        url: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not self.model:
+            return None
+        if not pages:
+            return None
+        page_blocks: list[str] = []
+        images: list[bytes] = []
+        for idx, page in enumerate(pages[:3], 1):
+            page_url = str(page.get("url") or "").strip()
+            page_type = str(page.get("page_type") or "").strip() or "OTHER"
+            snippet = str(page.get("snippet") or "").strip()
+            if len(snippet) > 1800:
+                snippet = snippet[:1800]
+            block = (
+                f"[PAGE {idx}]\n"
+                f"url: {page_url}\n"
+                f"page_type: {page_type}\n"
+                f"text:\n{snippet}\n"
+            )
+            page_blocks.append(block)
+            shot = page.get("screenshot")
+            if isinstance(shot, (bytes, bytearray)) and shot:
+                images.append(bytes(shot))
+        pages_text = "\n".join(page_blocks).strip()
+        if not pages_text:
+            return None
+        prompt = (
+            "あなたは企業サイトの審査官です。候補URLが公式ホームページかどうかを判定してください。\n"
+            "以下の複数ページの本文抜粋と、提供されたスクリーンショットを根拠に、true/false と理由、信頼度(0-1)をJSONのみで出力してください。説明やマークダウンは禁止。\n"
+            "出力フォーマット:\n"
+            "{\\\"is_official\\\": true/false, \\\"confidence\\\": 0.0-1.0, \\\"reason\\\": \"簡潔な根拠\","
+            " \\\"is_official_site\\\": true/false, \\\"official_confidence\\\": 0.0-1.0, \\\"official_evidence\\\": [\"根拠\", ...],"
+            " \\\"description\\\": \"事業内容の要約(60?120文字・日本語1文)\" または null}\n"
+            "判断基準:\n"
+            "- 企業名・所在地・サービス内容の一致を確認。\n"
+            "- 口コミ/求人/まとめサイト・予約サイトは false。\n"
+            "- URLが企業ドメインや自治体/学校の公式ドメインなら true に寄せる。\n"
+            "- 採用/求人ページでも、同一ドメインで社名一致が確認できるなら true に寄せる。\n"
+            "- title/og:site_name/h1/ロゴ等で社名一致が強ければ公式寄り。\n"
+            "- [SIGNALS] があれば参考情報として扱う（directory_like=true は注意）。\n"
+            "description のルール:\n"
+            "- 事業内容だけを60?120文字の日本語1文に要約（推測せず、根拠が弱ければ null）\n"
+            "- 禁止: URL/メール/電話番号/住所/採用/問い合わせ/アクセス/代表者情報\n"
+            f"企業名: {company_name}\n住所: {address}\n候補URL: {url}\n"
+            f"ページ情報:\n{pages_text}\n"
+        )
+
+        def _build_content(use_images: bool) -> list[Any]:
+            payload: list[Any] = [prompt]
+            if use_images and images:
+                for shot in images:
+                    try:
+                        b64 = base64.b64encode(shot).decode("utf-8")
+                        payload.append({"inline_data": {"mime_type": "image/png", "data": b64}})
+                    except Exception:
+                        continue
+            return payload
+
+        def _parse_result(raw_text: str) -> Optional[Dict[str, Any]]:
+            result = _extract_first_json(raw_text)
+            if not isinstance(result, dict):
+                return None
+            verdict = result.get("is_official")
+            if isinstance(verdict, str):
+                verdict = verdict.strip().lower()
+                verdict = verdict in {"true", "yes", "official", "1"}
+            elif isinstance(verdict, (int, float)):
+                verdict = bool(verdict)
+            elif not isinstance(verdict, bool):
+                return None
+            confidence_val = result.get("confidence")
+            try:
+                confidence = float(confidence_val) if confidence_val is not None else None
+            except Exception:
+                confidence = None
+            reason = result.get("reason")
+            if isinstance(reason, str):
+                reason = reason.strip()
+            else:
+                reason = ""
+            official_verdict = result.get("is_official_site")
+            if isinstance(official_verdict, bool):
+                is_official_site = official_verdict
+            else:
+                is_official_site = bool(verdict)
+            official_conf_val = result.get("official_confidence")
+            try:
+                official_confidence = float(official_conf_val) if official_conf_val is not None else confidence
+            except Exception:
+                official_confidence = confidence
+            official_evidence = result.get("official_evidence")
+            if isinstance(official_evidence, list):
+                official_evidence_list = [str(x) for x in official_evidence if str(x).strip()][:8]
+            else:
+                official_evidence_list = [reason] if reason else []
+            desc = result.get("description")
+            if isinstance(desc, str):
+                desc = self._validate_description(desc)
+            else:
+                desc = None
+            return {
+                "is_official": bool(verdict),
+                "confidence": confidence,
+                "reason": reason,
+                "is_official_site": bool(is_official_site),
+                "official_confidence": official_confidence,
+                "official_evidence": official_evidence_list,
+                "description": desc,
+            }
+
+        content = _build_content(True)
+        try:
+            resp = await self._generate_with_timeout(content)
+            if resp is None:
+                log.warning(f"judge_official_homepage_multi timed out/failed for {company_name} ({url}); retrying text-only.")
+                resp = await self._generate_with_timeout(_build_content(False))
+                if resp is None:
+                    return None
+            raw = _resp_text(resp)
+            parsed = _parse_result(raw)
+            if parsed is not None:
+                return parsed
+        except Exception as exc:  # pylint: disable=broad-except
+            log.warning(f"judge_official_homepage_multi failed for {company_name} ({url}) with image: {exc}")
+        try:
+            resp = await self._generate_with_timeout(_build_content(False))
+        except Exception:
+            return None
+        raw = _resp_text(resp)
+        return _parse_result(raw)

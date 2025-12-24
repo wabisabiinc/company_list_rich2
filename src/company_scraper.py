@@ -43,6 +43,7 @@ PRIO_WORDS = [
     "会社概要", "企業情報", "企業概要", "会社情報", "法人案内", "法人概要", "会社案内",
     # 連絡先系
     "お問い合わせ", "アクセス", "連絡先", "所在地", "本社", "本店", "窓口", "役員",
+    "代表", "代表者", "代表取締役", "社長", "CEO", "ceo", "代表挨拶", "トップメッセージ", "メッセージ", "役員紹介",
     # IR/決算系
     "IR", "ir", "investor", "financial", "ディスクロージャー", "決算",
 ]
@@ -51,6 +52,7 @@ ANCHOR_PRIORITY_WORDS = [
     "会社概要", "企業情報", "法人案内", "法人概要", "会社案内", "会社紹介", "会社情報", "法人紹介",
     # 連絡先系
     "お問い合わせ", "連絡先", "アクセス", "所在地", "本社", "本店", "窓口", "役員",
+    "代表", "代表者", "代表取締役", "社長", "CEO", "ceo", "代表挨拶", "トップメッセージ", "メッセージ", "役員紹介",
     # IR/決算系
     "IR", "ir", "investor", "financial", "ディスクロージャー", "決算",
     # 英語系
@@ -62,6 +64,7 @@ PRIORITY_SECTION_KEYWORDS = (
     "団体概要", "施設案内", "園紹介", "学校案内", "沿革", "会社情報",
     "corporate", "about", "profile", "overview", "information", "access",
     "お問い合わせ", "連絡先", "アクセス", "窓口", "役員",
+    "代表", "代表者", "代表取締役", "社長", "CEO", "ceo", "代表挨拶", "トップメッセージ", "メッセージ", "役員紹介",
     "決算", "ir", "investor", "ディスクロージャー", "financial"
 )
 PRIORITY_CONTACT_KEYWORDS = (
@@ -114,7 +117,8 @@ REP_NAME_SUBSTR_BLOCKLIST = (
     "センター", "法人", "こと", "公印", "いただき", "役", "組織"
 )
 REP_NAME_EXACT_BLOCKLIST_LOWER = {s.lower() for s in REP_NAME_EXACT_BLOCKLIST}
-NAME_CHUNK_RE = re.compile(r"[一-龥]{1,3}(?:[・･\s]{0,1}[一-龥]{1,3})+")
+NAME_CHUNK_RE = re.compile(r"[\u4E00-\u9FFF]{1,3}(?:[??\s]{0,1}[\u4E00-\u9FFF]{1,3})+")
+KANA_NAME_RE = re.compile(r"[\u3041-\u3096\u30A1-\u30FA\u30FC]{2,}(?:[\u3041-\u3096\u30A1-\u30FA\u30FC\s][\u3041-\u3096\u30A1-\u30FA\u30FC]{2,})+")
 REP_BUSINESS_TERMS = (
     "事業",
     "経営",
@@ -185,7 +189,8 @@ ADDRESS_FORM_NOISE_RE = re.compile(
 _BINARY_EXTS = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx")
 REP_RE = re.compile(
     r"(?:代表者|代表取締役|理事長|学長|院長|組合長|会頭|会長|社長)"
-    r"\s*[:：]?\s*([^\n\r<>\|（）\(\)]{1,40})"
+    r"(?:\s*[:：]\s*|\s+)"
+    r"([一-龥ァ-ンA-Za-z][^\n\r<>\|（）\(\)]{0,39})"
 )
 LISTING_RE = re.compile(r"(?:上場(?:区分|市場|先)?|株式上場|未上場|非上場|未公開|非公開)\s*[:：]?\s*([^\s、。\n]+)")
 KANJI_AMOUNT_CHARS = "0-9０-９零〇一二三四五六七八九十百千万億兆"
@@ -534,15 +539,21 @@ class CompanyScraper:
         self.context: Optional[BrowserContext] = None
         self.browser_disabled = False
         self.browser_disabled_reason = ""
-        # ページ単位のタイムアウトを短めに（デフォルト6秒）
-        self.page_timeout_ms = int(os.getenv("PAGE_TIMEOUT_MS", "6000"))
-        self.slow_page_threshold_ms = int(os.getenv("SLOW_PAGE_THRESHOLD_MS", "6000"))
+        # ページ単位のタイムアウトを短めに（デフォルト7秒）
+        self.page_timeout_ms = int(os.getenv("PAGE_TIMEOUT_MS", "7000"))
+        self.slow_page_threshold_ms = int(os.getenv("SLOW_PAGE_THRESHOLD_MS", "7000"))
+        # networkidle は長く待つと誤検知になりやすいので短めに抑える
+        self.network_idle_timeout_ms = int(os.getenv("NETWORK_IDLE_TIMEOUT_MS", "1500"))
+        # load イベント待ちも短めに抑えて遅延を避ける
+        self.load_wait_timeout_ms = int(os.getenv("LOAD_WAIT_TIMEOUT_MS", "2500"))
         self.skip_slow_hosts = os.getenv("SKIP_SLOW_HOSTS", "true").lower() == "true"
-        self.slow_hosts: set[str] = set()
+        self.slow_hosts: Dict[str, Dict[str, int]] = {}
         self.slow_hosts_path = os.getenv("SLOW_HOSTS_PATH", "logs/slow_hosts.txt")
+        self.slow_host_ttl_sec = int(os.getenv("SLOW_HOST_TTL_SEC", str(7 * 24 * 3600)))
+        self.slow_host_hits = max(1, int(os.getenv("SLOW_HOST_HITS", "2")))
         self.page_cache: Dict[str, Dict[str, Any]] = {}
         self.use_http_first = os.getenv("USE_HTTP_FIRST", "true").lower() == "true"
-        self.http_timeout_ms = int(os.getenv("HTTP_TIMEOUT_MS", "5000"))
+        self.http_timeout_ms = int(os.getenv("HTTP_TIMEOUT_MS", "6000"))
         self.search_cache: Dict[tuple[str, str], List[str]] = {}
         # 共有 HTTP セッションでコネクションを再利用し、検索/HTTP取得のレイテンシを抑える
         self.http_session: Optional[requests.Session] = requests.Session()
@@ -560,6 +571,8 @@ class CompanyScraper:
             if token not in engines:
                 engines.append(token)
         self.search_engines = engines or ["ddg"]
+        # 代表者は構造化ソース（テーブル/ラベル/JSON-LD）のみ許可するか
+        self.rep_strict_sources = os.getenv("REP_STRICT_SOURCES", "true").lower() == "true"
         # ブラウザ操作専用セマフォ（HTTPとは別枠で制御し渋滞を防ぐ）
         self.browser_concurrency = max(1, int(os.getenv("BROWSER_CONCURRENCY", "1")))
         self._browser_sem: asyncio.Semaphore | None = None
@@ -859,6 +872,19 @@ class CompanyScraper:
         return None
 
     @staticmethod
+    def _looks_mojibake(text: str) -> bool:
+        if not text:
+            return False
+        if "\ufffd" in text:
+            return True
+        if re.search(r"[ぁ-んァ-ン一-龥]", text):
+            return False
+        latin_count = sum(1 for ch in text if "\u00c0" <= ch <= "\u00ff")
+        if latin_count >= 3 and latin_count / max(len(text), 1) >= 0.15:
+            return True
+        return bool(re.search(r"[ÃÂãâæçïðñöøûüÿ]", text) and latin_count >= 2)
+
+    @staticmethod
     def _is_address_form_noise(text: str) -> bool:
         if not text:
             return False
@@ -878,6 +904,8 @@ class CompanyScraper:
     @staticmethod
     def _normalize_address_candidate(val: str) -> str:
         if not val:
+            return ""
+        if CompanyScraper._looks_mojibake(str(val)):
             return ""
         val = unicodedata.normalize("NFKC", val)
         # HTML断片を除去
@@ -992,7 +1020,7 @@ class CompanyScraper:
             return False
         if re.search(r"[0-9@]", name):
             return False
-        return bool(NAME_CHUNK_RE.search(name))
+        return bool(NAME_CHUNK_RE.search(name) or KANA_NAME_RE.search(name))
 
     @staticmethod
     def _looks_like_full_address(text: str) -> bool:
@@ -1090,6 +1118,12 @@ class CompanyScraper:
         text = text.strip()
         if not text:
             return None
+        compact = re.sub(r"[\s\u3000]+", "", text)
+        kana_only = bool(re.fullmatch(r"[ぁ-んァ-ンー・･\s]+", text))
+        if kana_only and KANA_NAME_RE.search(text):
+            text = re.sub(r"\s+", " ", text).strip()
+            if 2 <= len(text) <= 40:
+                return text
         if len(text) < 2 or len(text) > 40:
             return None
         generic_words = {
@@ -1111,33 +1145,33 @@ class CompanyScraper:
             "法人",
             "会社",
         }
-        if text in generic_words:
+        if text in generic_words or compact in generic_words:
             return None
-        if re.search(r"(氏名|お名前|名前|役職|役名|役割|担当|担当者|選任|代表者)", text):
+        if re.search(r"(氏名|お名前|名前|役職|役名|役割|担当|担当者|選任|代表者)", text) or re.search(r"(氏名|お名前|名前|役職|役名|役割|担当|担当者|選任|代表者)", compact):
             return None
-        if re.search(r"(概要|会社概要|事業概要|法人概要)", text):
+        if re.search(r"(概要|会社概要|事業概要|法人概要)", text) or re.search(r"(概要|会社概要|事業概要|法人概要)", compact):
             return None
-        if any(word in text for word in ("株式会社", "有限会社", "合名会社", "合資会社", "合同会社")):
+        if any(word in text for word in ("株式会社", "有限会社", "合名会社", "合資会社", "合同会社")) or any(word in compact for word in ("株式会社", "有限会社", "合名会社", "合資会社", "合同会社")):
             return None
         for stop in (
             "創業", "創立", "創設", "メッセージ", "ご挨拶", "からの", "決裁",
             "沿革", "代表挨拶", "お問い合わせ", "お問合せ", "問合せ", "取引先", "主な取引",
             "顧問", "顧問弁護士", "顧問社労士", "弁護士", "司法書士", "行政書士", "税理士", "社労士",
         ):
-            if stop in text:
+            if stop in text or stop in compact:
                 return None
         for stop in ("就任", "あいさつ", "ごあいさつ", "挨拶", "あいさつ文", "就任のご挨拶"):
-            if stop in text:
+            if stop in text or stop in compact:
                 return None
         # 住所/所在地が混入しているケースを除外
-        if re.search(r"(所在地|住所|本社|所在地:|住所:)", text):
+        if re.search(r"(所在地|住所|本社|所在地:|住所:)", text) or re.search(r"(所在地|住所|本社|所在地:|住所:)", compact):
             return None
         # 業務/部門名が混入しているケースを除外
         business_terms = (
             "建設", "建築", "土木", "工事", "施工", "管理", "品質", "安全", "環境",
             "技術", "技能", "営業", "企画", "製造", "サービス", "メンテ", "生産", "部", "課", "室"
         )
-        if any(term in text for term in business_terms):
+        if any(term in text for term in business_terms) or any(term in compact for term in business_terms):
             return None
         # 役職併記を除去してから判定（兼社長/兼CEO 等）
         text = re.sub(r"兼.{0,10}$", "", text)
@@ -1148,12 +1182,19 @@ class CompanyScraper:
         # 文末の助詞/説明終端を落とす
         text = re.sub(r"(さん|は|です|でした|となります|となっております)$", "", text).strip()
         lower_text = text.lower()
-        if text in REP_NAME_EXACT_BLOCKLIST or lower_text in REP_NAME_EXACT_BLOCKLIST_LOWER:
+        compact = re.sub(r"[\s\u3000]+", "", text)
+        lower_compact = compact.lower()
+        if (
+            text in REP_NAME_EXACT_BLOCKLIST
+            or lower_text in REP_NAME_EXACT_BLOCKLIST_LOWER
+            or compact in REP_NAME_EXACT_BLOCKLIST
+            or lower_compact in REP_NAME_EXACT_BLOCKLIST_LOWER
+        ):
             return None
         for stop_word in REP_NAME_SUBSTR_BLOCKLIST:
-            if stop_word in text or stop_word in lower_text:
+            if stop_word in text or stop_word in lower_text or stop_word in compact or stop_word in lower_compact:
                 return None
-        if text in PREFECTURE_NAMES:
+        if text in PREFECTURE_NAMES or compact in PREFECTURE_NAMES:
             return None
         if "@" in text or re.search(r"https?://", text):
             return None
@@ -1167,7 +1208,7 @@ class CompanyScraper:
         if re.fullmatch(r"(取締役|執行役(?:員)?|監査役|役員|部長|課長|主任|係長|担当|マネージャ|manager|director)", text, flags=re.I):
             return None
         # 氏名らしさチェック（1文字姓も許容: 例「関 進」「東 太郎」）
-        if not NAME_CHUNK_RE.search(text):
+        if not (NAME_CHUNK_RE.search(text) or KANA_NAME_RE.search(text)):
             return None
         tokens = [tok for tok in re.split(r"\s+", text) if tok]
         if len(tokens) > 4:
@@ -1175,8 +1216,14 @@ class CompanyScraper:
         if any(len(tok) > 8 for tok in tokens if re.search(r"[一-龥]", tok)):
             return None
         policy_words = (
+            "社是",
+            "社訓",
             "方針",
             "理念",
+            "スローガン",
+            "ミッション",
+            "ビジョン",
+            "バリュー",
             "ポリシー",
             "コンプライアンス",
             "品質",
@@ -1272,18 +1319,18 @@ class CompanyScraper:
                 return True
             # ローマ字表記揺れ（echo/eiko/eiko-sha等）を許容するゆるい類似判定
             for dt in domain_tokens:
-                if len(token) >= 3 and len(dt) >= 3:
+                if dt in generic_tokens:
+                    continue
+                if len(token) >= 4 and len(dt) >= 4:
                     try:
                         ratio = SequenceMatcher(None, token, dt).ratio()
                     except Exception:
                         ratio = 0.0
-                    if ratio >= 0.75:
+                    if ratio >= 0.85:
                         return True
-                # 会社名ローマ字に施設種別が付いているだけのケースを許容（例: umezono + ryokan）
                 if (
                     len(token) >= 4
                     and len(dt) >= 4
-                    and dt not in generic_tokens
                     and (token.startswith(dt) or dt.startswith(token))
                 ):
                     return True
@@ -1312,6 +1359,8 @@ class CompanyScraper:
             if not token:
                 continue
             token_len = len(token)
+            if token_len <= 2:
+                continue
             exact = token in host_no_port or token in host_compact
             if exact:
                 score += 6
@@ -1319,13 +1368,15 @@ class CompanyScraper:
                 score += 4
             if token in path_lower:
                 score += 3
-            if token_len >= 4:
+            if token_len >= 5:
                 for dt in domain_tokens:
+                    if dt in generic_tokens:
+                        continue
                     try:
                         ratio = SequenceMatcher(None, token, dt).ratio()
                     except Exception:
                         ratio = 0
-                    if ratio >= 0.8:
+                    if ratio >= 0.88:
                         score += 2
                         break
 
@@ -1602,6 +1653,38 @@ class CompanyScraper:
         text = base.get_text(separator="\n", strip=True)
         text = unicodedata.normalize("NFKC", text)
         text = cls._filter_noise_lines(text)
+        if len(text) < 120:
+            attr_keys = (
+                "aria-label",
+                "alt",
+                "title",
+                "data-label",
+                "data-title",
+                "data-name",
+                "data-value",
+                "data-content",
+            )
+            label_keywords: set[str] = set()
+            for kws in TABLE_LABEL_MAP.values():
+                label_keywords.update(kws)
+            attr_texts: set[str] = set()
+            for node in base.find_all(True):
+                for key in attr_keys:
+                    val = node.get(key)
+                    if not isinstance(val, str):
+                        continue
+                    cleaned = unicodedata.normalize("NFKC", val).strip()
+                    if not cleaned or len(cleaned) > 80:
+                        continue
+                    if (
+                        PHONE_RE.search(cleaned)
+                        or ZIP_RE.search(cleaned)
+                        or FISCAL_RE.search(cleaned)
+                        or any(kw in cleaned for kw in label_keywords)
+                    ):
+                        attr_texts.add(cleaned)
+            if attr_texts:
+                text = f"{text}\n" + "\n".join(sorted(attr_texts))
         return text or cls._filter_noise_lines(fallback_text or "")
 
     @staticmethod
@@ -1990,13 +2073,20 @@ class CompanyScraper:
             return finalize(False, host_value=host, blocked_host=True)
         if host.endswith(".lg.jp"):
             return finalize(False, host_value=host, blocked_host=True)
+        company_tokens = self._company_tokens(company_name)
+        domain_match_score = self._domain_score(company_tokens, url)
+        host_token_hit = self._host_token_hit(company_tokens, url) if company_tokens else False
         if not (allowed_tld or whitelist_hit or is_google_sites):
-            return finalize(False, host_value=host, blocked_host=True)
+            if domain_match_score < 6 and not host_token_hit:
+                return finalize(False, host_value=host, blocked_host=True)
         parsed = urllib.parse.urlparse(url)
         base_name = (company_name or "").strip()
         is_prefecture_exact = base_name in PREFECTURE_NAMES
         expected_pref = self._extract_prefecture(expected_address or "")
         expected_zip = self._extract_postal_code(expected_address or "")
+        expected_city_match = CITY_RE.search(expected_address or "")
+        expected_city = expected_city_match.group(1) if expected_city_match else ""
+        input_addr_weak = bool(expected_pref and not expected_city and not expected_zip)
         if is_prefecture_exact:
             allowed_suffixes = self.ENTITY_SITE_SUFFIXES.get("gov", ())
             if not any(self._host_matches_suffix(host, suffix) for suffix in allowed_suffixes):
@@ -2074,7 +2164,7 @@ class CompanyScraper:
         company_has_corp = any(suffix in (company_name or "") for suffix in self.CORP_SUFFIXES) or bool(entity_tags)
         host_token_hit = self._host_token_hit(company_tokens, url)
         if not company_tokens:
-            host_token_hit = True  # Fallback when romaji tokens cannot be generated
+            host_token_hit = False  # Avoid treating unknown tokens as strong evidence
         loose_host_hit = host_token_hit or (company_has_corp and allowed_tld and domain_match_score >= 3)
         name_present_flag = (
             bool(norm_name and norm_name in combined)
@@ -2132,8 +2222,7 @@ class CompanyScraper:
 
         # 入力住所がある場合、ページ側の都道府県が明確に不一致なら低スコア
         pref_mismatch = False
-        expected_city = ""
-        if expected_pref:
+        if expected_pref and not input_addr_weak:
             expected_city_match = CITY_RE.search(expected_address or "")
             expected_city = expected_city_match.group(1) if expected_city_match else ""
             found_prefs = set(PREFECTURE_NAME_RE.findall(combined or ""))
@@ -2194,7 +2283,7 @@ class CompanyScraper:
                 pref_ok = bool(expected_pref and cand_pref and expected_pref == cand_pref)
                 zip_ok = bool(expected_zip and cand_zip and expected_zip == cand_zip)
                 addr_ok = self._address_matches(expected_address, cand)
-                if expected_pref and cand_pref and not pref_ok:
+                if expected_pref and cand_pref and not pref_ok and not input_addr_weak:
                     pref_mismatch_in_address = True
                     score -= 6
                 if expected_city and cand and expected_city not in cand:
@@ -2214,8 +2303,20 @@ class CompanyScraper:
                     score += 1
                     pref_hit = True
 
+        address_strong = address_hit or postal_hit
+        pref_hit_strong = (
+            pref_hit
+            and not address_strong
+            and (
+                name_match.exact
+                or (name_match.ratio >= 0.92 and not name_match.partial_only)
+                or official_evidence_score >= 9
+            )
+            and (strong_domain_flag or host_token_hit or domain_match_score >= 3 or whitelist_hit or is_google_sites)
+        )
+
         # 住所シグナルがあり、法人TLD (.co.jp 等) ならドメイントークンが弱くても公式として許容する
-        if allowed_tld and (address_hit or pref_hit or postal_hit):
+        if allowed_tld and (address_strong or pref_hit_strong):
             if domain_match_score >= 2 or host_token_hit:
                 return finalize(
                     True,
@@ -2322,7 +2423,7 @@ class CompanyScraper:
                     directory_reasons=directory_reasons,
                 )
 
-        if (address_hit or pref_hit or postal_hit) and (allowed_tld or whitelist_hit or is_google_sites):
+        if (address_strong or pref_hit_strong) and (allowed_tld or whitelist_hit or is_google_sites):
             return finalize(
                 True,
                 score=score,
@@ -2663,22 +2764,89 @@ class CompanyScraper:
                 return
             with open(path, "r", encoding="utf-8") as f:
                 for line in f:
-                    host = line.strip().split(",")[0]
-                    if host:
-                        self.slow_hosts.add(host)
+                    parts = [p.strip() for p in line.strip().split(",") if p.strip()]
+                    if not parts:
+                        continue
+                    host = parts[0]
+                    ts = 0
+                    count = 1
+                    if len(parts) >= 2:
+                        try:
+                            ts = int(float(parts[1]))
+                        except Exception:
+                            ts = 0
+                    if len(parts) >= 3:
+                        try:
+                            count = max(1, int(float(parts[2])))
+                        except Exception:
+                            count = 1
+                    if not host:
+                        continue
+                    meta = self.slow_hosts.get(host)
+                    if meta:
+                        if len(parts) >= 3:
+                            meta["count"] = max(meta.get("count", 1), count)
+                        else:
+                            meta["count"] = meta.get("count", 1) + 1
+                        meta["last_ts"] = max(meta.get("last_ts", 0), ts)
+                    else:
+                        self.slow_hosts[host] = {"count": count, "last_ts": ts}
+            self._prune_slow_hosts()
+            self._persist_slow_hosts()
         except Exception:
             log.warning("failed to load slow hosts", exc_info=True)
 
     def _add_slow_host(self, host: str) -> None:
-        if not host or host in self.slow_hosts:
+        if not host:
             return
-        self.slow_hosts.add(host)
+        now_ts = int(time.time())
+        meta = self.slow_hosts.get(host)
+        if meta:
+            meta["count"] = int(meta.get("count", 1)) + 1
+            meta["last_ts"] = now_ts
+        else:
+            self.slow_hosts[host] = {"count": 1, "last_ts": now_ts}
+        self._prune_slow_hosts()
         try:
-            os.makedirs(os.path.dirname(self.slow_hosts_path) or ".", exist_ok=True)
-            with open(self.slow_hosts_path, "a", encoding="utf-8") as f:
-                f.write(f"{host},{int(time.time())}\n")
+            self._persist_slow_hosts()
         except Exception:
             log.debug("failed to persist slow host: %s", host, exc_info=True)
+
+    def _persist_slow_hosts(self) -> None:
+        path = self.slow_hosts_path
+        if not path:
+            return
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            for host, meta in sorted(self.slow_hosts.items()):
+                count = int(meta.get("count", 1))
+                last_ts = int(meta.get("last_ts", 0))
+                f.write(f"{host},{last_ts},{count}\n")
+
+    def _prune_slow_hosts(self) -> None:
+        if self.slow_host_ttl_sec <= 0:
+            return
+        now_ts = int(time.time())
+        expired = [
+            host for host, meta in self.slow_hosts.items()
+            if now_ts - int(meta.get("last_ts", 0)) > self.slow_host_ttl_sec
+        ]
+        for host in expired:
+            self.slow_hosts.pop(host, None)
+
+    def _is_slow_host(self, host: str) -> bool:
+        if not host:
+            return False
+        meta = self.slow_hosts.get(host)
+        if not meta:
+            return False
+        if self.slow_host_ttl_sec > 0:
+            now_ts = int(time.time())
+            last_ts = int(meta.get("last_ts", 0))
+            if now_ts - last_ts > self.slow_host_ttl_sec:
+                self.slow_hosts.pop(host, None)
+                return False
+        return int(meta.get("count", 1)) >= self.slow_host_hits
 
     async def _handle_route(self, route: Route):
         rtype = route.request.resource_type
@@ -2866,7 +3034,7 @@ class CompanyScraper:
                         host = (parsed_target.netloc or "").lower().split(":")[0]
                     except Exception:
                         host = ""
-                    if host and self.skip_slow_hosts and host in self.slow_hosts:
+                    if host and self.skip_slow_hosts and self._is_slow_host(host):
                         continue
                 info = await self.get_page_info(target, allow_slow=allow_slow)
             except Exception:
@@ -2978,7 +3146,12 @@ class CompanyScraper:
         return result
 
     # ===== ページ取得（HTTP優先＋ブラウザ再利用） =====
-    async def _fetch_http_info(self, url: str) -> Dict[str, Any]:
+    async def _fetch_http_info(
+        self,
+        url: str,
+        timeout_ms: int | None = None,
+        allow_slow: bool = False,
+    ) -> Dict[str, Any]:
         """
         軽量なHTTPリクエストで本文/HTMLのみ取得。失敗時は空を返す。
         """
@@ -2990,11 +3163,12 @@ class CompanyScraper:
         if host and (host in self.HARD_EXCLUDE_HOSTS or self._is_excluded(host)):
             return {"url": url, "text": "", "html": ""}
         # 公式候補ホストはスキップ対象から除外するため、上位層で呼び分ける
-        if host and self.skip_slow_hosts and host in self.slow_hosts:
+        if host and self.skip_slow_hosts and self._is_slow_host(host) and not allow_slow:
             log.info("[http] skip slow host %s url=%s", host, url)
             return {"url": url, "text": "", "html": ""}
 
-        timeout_sec = max(2, self.http_timeout_ms / 1000)
+        eff_timeout_ms = self.http_timeout_ms if timeout_ms is None else max(500, int(timeout_ms))
+        timeout_sec = max(2, eff_timeout_ms / 1000)
         started = time.monotonic()
         try:
             resp = await asyncio.to_thread(
@@ -3087,7 +3261,7 @@ class CompanyScraper:
 
         # 公式候補などで明示的に許可された場合は skip_slow_hosts を無視できるようにする
         # 上位で allow_slow=True をセットする呼び出しを追加する。
-        if host and self.skip_slow_hosts and host in self.slow_hosts and not allow_slow:
+        if host and self.skip_slow_hosts and self._is_slow_host(host) and not allow_slow:
             log.info("[page] skip slow host %s url=%s", host, url)
             fallback = {"url": url, "text": "", "html": "", "screenshot": b""}
             if cached:
@@ -3104,20 +3278,34 @@ class CompanyScraper:
             attempt_timeout = min(eff_timeout, remaining_ms)
             started = time.monotonic()
             page: Page | None = None
+            goto_ms = 0.0
+            network_idle_ms = 0.0
+            marked_slow = False
             try:
                 async with browser_sem:
                     page = await self.context.new_page()
                     page.set_default_timeout(attempt_timeout)
+                    goto_started = time.monotonic()
                     await page.goto(url, timeout=attempt_timeout, wait_until="domcontentloaded")
-                    try:
-                        await page.wait_for_load_state("networkidle", timeout=attempt_timeout)
-                    except Exception:
-                        pass
+                    goto_ms = (time.monotonic() - goto_started) * 1000
+                    if self.network_idle_timeout_ms > 0:
+                        net_started = time.monotonic()
+                        try:
+                            await page.wait_for_load_state(
+                                "networkidle",
+                                timeout=min(self.network_idle_timeout_ms, attempt_timeout),
+                            )
+                        except Exception:
+                            pass
+                        network_idle_ms = (time.monotonic() - net_started) * 1000
                     try:
                         text = await page.inner_text("body", timeout=5000)
                     except Exception:
                         try:
-                            await page.wait_for_load_state("load", timeout=attempt_timeout)
+                            await page.wait_for_load_state(
+                                "load",
+                                timeout=min(self.load_wait_timeout_ms, attempt_timeout),
+                            )
                         except Exception:
                             pass
                         text = await page.inner_text("body") if await page.locator("body").count() else ""
@@ -3162,12 +3350,27 @@ class CompanyScraper:
                     if not html:
                         result["html"] = cached.get("html", "")
                 elapsed_ms = (time.monotonic() - started) * 1000
+                effective_elapsed_ms = max(0.0, elapsed_ms - network_idle_ms)
                 if elapsed_ms >= eff_timeout:
-                    log.info("[page] slow fetch (%.0f ms) -> host=%s url=%s", elapsed_ms, host, url)
-                if self.slow_page_threshold_ms > 0 and elapsed_ms > self.slow_page_threshold_ms:
+                    log.info(
+                        "[page] slow fetch (elapsed=%.0f ms goto=%.0f ms net_idle=%.0f ms) -> host=%s url=%s",
+                        elapsed_ms,
+                        goto_ms,
+                        network_idle_ms,
+                        host,
+                        url,
+                    )
+                if self.slow_page_threshold_ms > 0 and effective_elapsed_ms > self.slow_page_threshold_ms:
                     if host:
                         self._add_slow_host(host)
-                    log.info("[page] mark slow host (%.0f ms) %s", elapsed_ms, host or "")
+                        marked_slow = True
+                    log.info(
+                        "[page] mark slow host (elapsed=%.0f ms goto=%.0f ms net_idle=%.0f ms) %s",
+                        effective_elapsed_ms,
+                        goto_ms,
+                        network_idle_ms,
+                        host or "",
+                    )
                 self.page_cache[url] = result
                 return result
 
@@ -3179,10 +3382,21 @@ class CompanyScraper:
                 await asyncio.sleep(0.7 * (attempt + 1))
             finally:
                 elapsed_ms = (time.monotonic() - started) * 1000
-                if self.slow_page_threshold_ms > 0 and elapsed_ms > self.slow_page_threshold_ms:
+                effective_elapsed_ms = max(0.0, elapsed_ms - network_idle_ms)
+                if (
+                    self.slow_page_threshold_ms > 0
+                    and effective_elapsed_ms > self.slow_page_threshold_ms
+                    and not marked_slow
+                ):
                     if host:
                         self._add_slow_host(host)
-                    log.warning("[page] timeout/slow (%.0f ms) -> skip host next time: %s", elapsed_ms, host or "")
+                    log.warning(
+                        "[page] timeout/slow (elapsed=%.0f ms goto=%.0f ms net_idle=%.0f ms) -> skip host next time: %s",
+                        effective_elapsed_ms,
+                        goto_ms,
+                        network_idle_ms,
+                        host or "",
+                    )
                 if page:
                     await page.close()
 
@@ -3219,11 +3433,13 @@ class CompanyScraper:
         },
         "rep": {
             "anchor": (
-                "役員", "代表者", "代表取締役", "代表理事", "理事長",
+                "役員", "代表", "代表者", "代表取締役", "代表理事", "理事長",
+                "社長", "CEO", "ceo", "代表挨拶", "トップメッセージ", "メッセージ", "役員紹介", "経営陣", "役員一覧",
                 "会社概要", "会社案内", "会社情報", "企業情報", "法人概要", "profile", "corporate",
             ),
             "path": (
                 "/company", "/about", "/profile", "/corporate", "/overview",
+                "/message", "/greeting", "/president", "/ceo", "/executive", "/leadership", "/management",
             ),
         },
         "contact": {
@@ -3442,6 +3658,88 @@ class CompanyScraper:
         scored.sort(key=lambda x: (-x[0], x[1], x[2], x[3]))
         return [url for _, _, _, url in scored[:max_links]]
 
+    def _allow_slow_for_priority_link(self, url: str, target_types: Optional[list[str]] = None) -> bool:
+        if not url:
+            return False
+        if target_types:
+            has_about = "about" in target_types
+            has_contact = "contact" in target_types
+            if not (has_about or has_contact):
+                return False
+        try:
+            path = urllib.parse.urlparse(url).path.lower()
+        except Exception:
+            return False
+        allow_segments = (
+            "/company", "/about", "/profile", "/overview", "/outline", "/corporate",
+            "/contact", "/contactus", "/inquiry", "/toiawase", "/access", "/form",
+            "/companyinfo", "/info",
+        )
+        return any(seg in path for seg in allow_segments)
+
+
+    def _fallback_priority_links(
+        self,
+        base_url: str,
+        target_types: Optional[list[str]] = None,
+    ) -> list[str]:
+        if not base_url:
+            return []
+        try:
+            parsed = urllib.parse.urlparse(base_url)
+            base_root = f"{parsed.scheme}://{parsed.netloc}"
+        except Exception:
+            return []
+        if not base_root:
+            return []
+        types = target_types or ["about", "contact"]
+        fallback_map = {
+            "about": [
+                "/company",
+                "/about",
+                "/profile",
+                "/overview",
+                "/outline",
+                "/corporate",
+                "/company/outline",
+                "/company/profile",
+                "/company/overview",
+                "/company.html",
+                "/about.html",
+                "/company.php",
+                "/about.php",
+            ],
+            "contact": [
+                "/contact",
+                "/contactus",
+                "/inquiry",
+                "/contact.html",
+                "/contact.php",
+                "/inquiry.html",
+                "/form",
+            ],
+            "finance": [
+                "/ir",
+                "/ir/financial",
+                "/ir/finance",
+                "/ir/library",
+                "/ir.html",
+            ],
+        }
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for t in types:
+            for path in fallback_map.get(t, []):
+                try:
+                    url = urllib.parse.urljoin(base_root + "/", path.lstrip("/"))
+                except Exception:
+                    continue
+                if not url or url in seen:
+                    continue
+                seen.add(url)
+                ordered.append(url)
+        return ordered
+
     async def fetch_priority_documents(
         self,
         base_url: str,
@@ -3466,10 +3764,18 @@ class CompanyScraper:
             except Exception:
                 html = ""
         links = self._find_priority_links(base_url, html, max_links=max_links, target_types=target_types)
-        if not links:
-            return docs
         if exclude_urls:
             links = [url for url in links if url not in exclude_urls]
+        if len(links) < max_links:
+            fallback_links = self._fallback_priority_links(base_url, target_types=target_types)
+            if exclude_urls:
+                fallback_links = [url for url in fallback_links if url not in exclude_urls]
+            for url in fallback_links:
+                if url in links:
+                    continue
+                links.append(url)
+                if len(links) >= max_links:
+                    break
         if not links:
             return docs
 
@@ -3477,7 +3783,8 @@ class CompanyScraper:
 
         async def fetch(link: str):
             async with sem:
-                info = await self.get_page_info(link, allow_slow=allow_slow)
+                allow_slow_link = bool(allow_slow and self._allow_slow_for_priority_link(link, target_types))
+                info = await self.get_page_info(link, allow_slow=allow_slow_link)
             return link, info
 
         tasks = [asyncio.create_task(fetch(link)) for link in links]
@@ -3551,8 +3858,10 @@ class CompanyScraper:
             max_hops = max_hops
 
         # 探索の上限は軽め（2〜3ページ）に抑える
-        max_pages = max(0, min(int(max_pages or 0), 3))
-        max_hops = max(0, min(int(max_hops or 0), 3))
+        max_pages_cap = 6 if (need_rep or need_description) else 4
+        max_hops_cap = 4 if (need_rep or need_description) else 3
+        max_pages = max(0, min(int(max_pages or 0), max_pages_cap))
+        max_hops = max(0, min(int(max_hops or 0), max_hops_cap))
         meta["max_pages"] = int(max_pages)
         meta["max_hops"] = int(max_hops)
         if max_pages <= 0:
@@ -3637,6 +3946,26 @@ class CompanyScraper:
             elif (need_listing or need_capital or need_revenue or need_profit or need_fiscal or need_founded):
                 focus_targets.add("overview")
             ranked_links = self._rank_links(url, html, focus=focus_targets)
+            priority_types: list[str] = []
+            if need_phone or need_addr:
+                priority_types.append("contact")
+            if need_rep or need_description:
+                priority_types.append("about")
+            if need_listing or need_capital or need_revenue or need_profit or need_fiscal or need_founded:
+                priority_types.append("finance")
+            priority_links: list[str] = []
+            if priority_types:
+                priority_links = self._find_priority_links(url, html, max_links=3, target_types=priority_types)
+                if len(priority_links) < 3:
+                    fallback_links = self._fallback_priority_links(url, target_types=priority_types)
+                    for link in fallback_links:
+                        if link not in priority_links:
+                            priority_links.append(link)
+                        if len(priority_links) >= 3:
+                            break
+            if priority_links:
+                priority_set = set(priority_links)
+                ranked_links = priority_links + [link for link in ranked_links if link not in priority_set]
             # 入力住所の都道府県があるのに、ページ側の都道府県が明確に不一致なら深掘りを縮小する。
             # ただし「会社概要/企業情報」導線が欲しい場合が多いので profile/overview を狙う場合は継続する。
             if expected_pref and ("profile" not in focus_targets) and ("overview" not in focus_targets):
@@ -3740,13 +4069,22 @@ class CompanyScraper:
         ):
             if kw.lower() in text_low:
                 label_hits += 1
+        rep_label_hit = bool(
+            re.search(r"(代表取締役|代表理事長|代表理事|代表者|社長|会長|CEO)", text_nfkc)
+        )
 
         is_profile_heading = any(kw in head_low for kw in (k.lower() for k in profile_kw))
         is_profile_path = any(seg in (url.lower()) for seg in ("/company", "/about", "/corporate", "/profile", "/overview", "/outline"))
         has_hq_marker = ("本社所在地" in text_nfkc) or ("本店所在地" in text_nfkc) or ("本社" in text_nfkc) or ("本店" in text_nfkc)
 
-        # BASES_LIST: 住所/拠点が多数並ぶページ
-        zip_count = len(re.findall(r"\d{3}[-‐―－ー]?\d{4}", text_nfkc))
+        # BASES_LIST: 住所/拠点が多数並ぶページ（電話番号由来の誤検知を除外）
+        phone_spans = [(m.start(), m.end()) for m in PHONE_RE.finditer(text_nfkc)]
+        zip_hits = 0
+        for m in re.finditer(r"\d{3}[-‐―－ー]?\d{4}", text_nfkc):
+            if any(s <= m.start() < e for s, e in phone_spans):
+                continue
+            zip_hits += 1
+        zip_count = zip_hits
         branch_hits = sum(1 for kw in bases_kw if kw.lower() in text_low)
         pref_count = len(set(PREFECTURE_NAME_RE.findall(text_nfkc)))
         is_bases_like = ("拠点一覧" in head_all) or ("店舗一覧" in head_all) or ("営業所一覧" in head_all) or zip_count >= 3 or pref_count >= 6 or branch_hits >= 6
@@ -3754,9 +4092,19 @@ class CompanyScraper:
             # 拠点一覧に見えても「会社概要(本社所在地など)」が同ページに強く載っている場合はプロフィール扱いに寄せる
             if (is_profile_heading or is_profile_path) and has_table_or_dl and label_hits >= 4 and has_hq_marker:
                 return {"page_type": "COMPANY_PROFILE", "score": label_hits, "reason": "bases_list_with_profile_signals"}
+            # 拠点一覧でも代表者ラベルが強く出ている場合はプロフィール扱いに寄せる
+            if (
+                has_table_or_dl
+                and rep_label_hit
+                and (is_profile_heading or is_profile_path or has_hq_marker)
+                and label_hits >= 3
+            ):
+                return {"page_type": "COMPANY_PROFILE", "score": label_hits, "reason": "bases_list_with_rep_label"}
             return {"page_type": "BASES_LIST", "score": max(zip_count, pref_count, branch_hits), "reason": "bases_list_signals"}
         if (is_profile_heading or is_profile_path) and has_table_or_dl and label_hits >= 4:
             return {"page_type": "COMPANY_PROFILE", "score": label_hits, "reason": "profile_heading+labels"}
+        if is_profile_path and label_hits >= 4 and (has_hq_marker or rep_label_hit):
+            return {"page_type": "COMPANY_PROFILE", "score": label_hits, "reason": "profile_path+labels"}
         if is_profile_heading and label_hits >= 3:
             return {"page_type": "COMPANY_PROFILE", "score": label_hits, "reason": "profile_heading"}
 
@@ -3773,6 +4121,63 @@ class CompanyScraper:
         reps: List[str] = []
         label_reps: List[str] = []
         rep_from_label = False
+
+        def _normalize_label_text(raw: str) -> tuple[str, str]:
+            cleaned = unicodedata.normalize("NFKC", raw or "")
+            cleaned = cleaned.replace("\u200b", "").strip()
+            if cleaned.startswith("・"):
+                cleaned = cleaned.lstrip("・").strip()
+            cleaned = cleaned.rstrip(":：").strip()
+            compact = re.sub(r"[\s\u3000]+", "", cleaned)
+            compact = compact.replace("・", "").replace("･", "")
+            compact = compact.replace("（", "").replace("）", "").replace("(", "").replace(")", "")
+            compact = compact.replace("：", "").replace(":", "")
+            return cleaned, compact
+
+        def _label_matches(label_text: str, keyword: str) -> bool:
+            cleaned, compact = _normalize_label_text(label_text)
+            kw_cleaned, kw_compact = _normalize_label_text(keyword)
+            if not kw_cleaned:
+                return False
+            if cleaned == kw_cleaned or cleaned.startswith(kw_cleaned) or kw_cleaned in cleaned:
+                return True
+            if compact and kw_compact and (compact == kw_compact or compact.startswith(kw_compact) or kw_compact in compact):
+                return True
+            return False
+
+        def _field_for_label(label_text: str) -> str | None:
+            for field, keywords in TABLE_LABEL_MAP.items():
+                if any(_label_matches(label_text, kw) for kw in keywords):
+                    return field
+            return None
+
+        def _is_value_for_field(field: str, raw_text: str) -> bool:
+            cleaned = self._clean_text_value(raw_text)
+            if not cleaned:
+                return False
+            if field == "rep_names":
+                cand = self.clean_rep_name(cleaned)
+                return bool(cand and self._looks_like_person_name(cand))
+            if field == "phone_numbers":
+                return bool(PHONE_RE.search(cleaned))
+            if field == "addresses":
+                norm = self._normalize_address_candidate(cleaned)
+                if norm and self._looks_like_full_address(norm):
+                    return True
+                return self.looks_like_address(cleaned)
+            if field in {"capitals", "revenues", "profits"}:
+                return self._is_amount_like(cleaned)
+            if field == "fiscal_months":
+                return bool(FISCAL_RE.search(cleaned))
+            if field == "founded_years":
+                return bool(self._parse_founded_year(cleaned))
+            if field == "listing":
+                return bool(
+                    SECURITIES_CODE_RE.search(cleaned)
+                    or MARKET_CODE_RE.search(cleaned)
+                    or any(term in cleaned for term in LISTING_KEYWORDS)
+                )
+            return False
 
         for p in PHONE_RE.finditer(text or ""):
             cand = _normalize_phone_strict(p.group(0))
@@ -3845,40 +4250,41 @@ class CompanyScraper:
                         addrs.append(f"[TEXT]{norm}")
                         added_any = True
 
-        for rm in REP_RE.finditer(text or ""):
-            cleaned = self.clean_rep_name(rm.group(1))
-            if cleaned:
-                reps.append(cleaned)
-
-        # 追加の代表者抽出: キーワードの近傍にある漢字氏名を拾う
-        if not reps:
-            rep_kw_pattern = re.compile(
-                r"(代表取締役社長|代表取締役会長|代表取締役|代表理事長|代表理事|代表者|社長|会長|理事長|組合長|院長|学長|園長|校長)"
-                r"[^\n\r]{0,20}?"
-                r"([一-龥]{1,3}(?:[・･ \u3000]{0,1}[一-龥]{1,3})+)"
-            )
-            for m in rep_kw_pattern.finditer(text or ""):
-                name_cand = m.group(2)
-                cleaned = self.clean_rep_name(name_cand)
-                if cleaned:
-                    reps.append(cleaned)
-
-        # 追加の代表者抽出: 氏名 → 役職 の並び（カードUI等）に対応
-        if not reps:
-            lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
-            role_re = re.compile(
-                r"(代表取締役社長|代表執行役社長|代表取締役会長|代表取締役|代表理事長|代表理事|代表社員|代表者|代表|社長|会長|CEO)",
-                flags=re.I,
-            )
-            for idx in range(len(lines) - 1):
-                cand_line = lines[idx]
-                role_line = lines[idx + 1]
-                if not role_re.search(role_line):
-                    continue
-                cleaned = self.clean_rep_name(cand_line)
+        if not self.rep_strict_sources:
+            for rm in REP_RE.finditer(text or ""):
+                cleaned = self.clean_rep_name(rm.group(1))
                 if cleaned and self._looks_like_person_name(cleaned):
                     reps.append(cleaned)
-                    break
+
+            # 追加の代表者抽出: キーワードの近傍にある漢字氏名を拾う
+            if not reps:
+                rep_kw_pattern = re.compile(
+                    r"(代表取締役社長|代表取締役会長|代表取締役|代表理事長|代表理事|代表者|社長|会長|理事長|組合長|院長|学長|園長|校長)"
+                    r"[^\n\r]{0,20}?"
+                    r"([一-龥]{1,3}(?:[・･ \u3000]{0,1}[一-龥]{1,3})+)"
+                )
+                for m in rep_kw_pattern.finditer(text or ""):
+                    name_cand = m.group(2)
+                    cleaned = self.clean_rep_name(name_cand)
+                    if cleaned:
+                        reps.append(cleaned)
+
+            # 追加の代表者抽出: 氏名 → 役職 の並び（カードUI等）に対応
+            if not reps:
+                lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+                role_re = re.compile(
+                    r"(代表取締役社長|代表執行役社長|代表取締役会長|代表取締役|代表理事長|代表理事|代表社員|代表者|代表|社長|会長|CEO)",
+                    flags=re.I,
+                )
+                for idx in range(len(lines) - 1):
+                    cand_line = lines[idx]
+                    role_line = lines[idx + 1]
+                    if not role_re.search(role_line):
+                        continue
+                    cleaned = self.clean_rep_name(cand_line)
+                    if cleaned and self._looks_like_person_name(cleaned):
+                        reps.append(cleaned)
+                        break
 
         listings: List[str] = []
         capitals: List[str] = []
@@ -3993,9 +4399,15 @@ class CompanyScraper:
                             continue
                         label = cells[0].get_text(separator=" ", strip=True)
                         value = cells[1].get_text(separator=" ", strip=True)
+                        if len(cells) >= 3:
+                            sep = cells[1].get_text(separator=" ", strip=True)
+                            third = cells[2].get_text(separator=" ", strip=True)
+                            sep_norm = sep.replace("\uff1a", ":").strip()
+                            if third and (sep_norm in {":", ""}):
+                                value = third
                         if label and value:
                             # 代表者ラベルは優先度を上げるため先頭に積む
-                            if any(rep_kw in label for rep_kw in TABLE_LABEL_MAP["rep_names"]):
+                            if any(_label_matches(label, rep_kw) for rep_kw in TABLE_LABEL_MAP["rep_names"]):
                                 pair_values.insert(0, (label, value, True))
                             else:
                                 pair_values.append((label, value, True))
@@ -4007,13 +4419,33 @@ class CompanyScraper:
                         label = dt.get_text(separator=" ", strip=True)
                         value = dd.get_text(separator=" ", strip=True)
                         if label and value:
-                            if any(rep_kw in label for rep_kw in TABLE_LABEL_MAP["rep_names"]):
+                            if any(_label_matches(label, rep_kw) for rep_kw in TABLE_LABEL_MAP["rep_names"]):
                                 pair_values.insert(0, (label, value, True))
                             else:
                                 pair_values.append((label, value, True))
 
                 try:
+                    def _is_nav_like_node(node: Any) -> bool:
+                        try:
+                            current = node
+                            while current is not None:
+                                name = (current.name or "").lower()
+                                if name in {"nav", "header"}:
+                                    return True
+                                role = (current.get("role") or "").lower()
+                                if role in {"navigation", "menubar"}:
+                                    return True
+                                classes = " ".join(current.get("class") or []).lower()
+                                if re.search(r"\b(nav|menu|breadcrumb|gnav|global-nav)\b", classes):
+                                    return True
+                                current = current.parent
+                        except Exception:
+                            return False
+                        return False
+
                     for block in soup.find_all(["p", "li", "span", "div"]):
+                        if _is_nav_like_node(block):
+                            continue
                         text = block.get_text(separator=" ", strip=True)
                         text = text.replace("\u200b", "")
                         text = re.sub(r"\s+", " ", text)
@@ -4027,22 +4459,39 @@ class CompanyScraper:
                 except Exception:
                     sequential_texts = []
 
+        if not sequential_texts:
+            sequential_texts = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+
+        if self.rep_strict_sources and sequential_texts:
+            role_kw = re.compile(
+                r"(代表取締役社長|代表執行役社長|代表取締役会長|代表取締役|代表理事長|代表理事|代表社員|代表者|代表|社長|会長|CEO)",
+                flags=re.I,
+            )
+            added_roles = 0
+            for line in sequential_texts:
+                if not role_kw.search(line):
+                    continue
+                stripped = role_kw.sub(" ", line)
+                name_match = NAME_CHUNK_RE.search(stripped) or KANA_NAME_RE.search(stripped)
+                if not name_match:
+                    continue
+                cleaned = self.clean_rep_name(name_match.group(0))
+                if cleaned and self._looks_like_person_name(cleaned):
+                    reps.append(f"[ROLE]{cleaned}")
+                    added_roles += 1
+                    if added_roles >= 2:
+                        break
+
         def _looks_like_label(text: str) -> tuple[bool, str]:
             if not text:
                 return False, ""
-            cleaned = text.replace("\u200b", "").strip()
-            if cleaned.startswith("・"):
-                cleaned = cleaned.lstrip("・").strip()
-            cleaned = cleaned.rstrip(":：").strip()
-            if not cleaned or len(cleaned) > 20:
+            cleaned, compact = _normalize_label_text(text)
+            if not cleaned:
+                return False, ""
+            if len(cleaned) > 20 and (not compact or len(compact) > 20):
                 return False, ""
             for keywords in TABLE_LABEL_MAP.values():
-                if any(
-                    cleaned == kw
-                    or cleaned.startswith(kw)
-                    or kw in cleaned
-                    for kw in keywords
-                ):
+                if any(_label_matches(cleaned, kw) for kw in keywords):
                     return True, cleaned
             return False, ""
 
@@ -4075,24 +4524,79 @@ class CompanyScraper:
                     looks_like_next, _ = _looks_like_label(candidate)
                     if not looks_like_next:
                         value_text = candidate
+            if not value_text:
+                field = _field_for_label(normalized)
+                if field:
+                    max_offset_default = 4
+                    if field in {"rep_names", "addresses"}:
+                        max_offset_default = 6
+                    max_offset = min(max_offset_default, len(sequential_texts) - idx - 1)
+                    for offset in range(1, max_offset + 1):
+                        candidate = sequential_texts[idx + offset].replace("\u200b", "").strip()
+                        if not candidate or candidate.startswith("・"):
+                            continue
+                        looks_like_next, _ = _looks_like_label(candidate)
+                        if looks_like_next:
+                            continue
+                        if field == "addresses":
+                            if _is_value_for_field(field, candidate):
+                                value_text = candidate
+                                break
+                            if ZIP_RE.search(candidate):
+                                next_line = ""
+                                if idx + offset + 1 < len(sequential_texts):
+                                    next_line = sequential_texts[idx + offset + 1].replace("\u200b", "").strip()
+                                if next_line and not _looks_like_label(next_line)[0]:
+                                    combined = f"{candidate} {next_line}".strip()
+                                    if _is_value_for_field(field, combined):
+                                        value_text = combined
+                                        break
+                            continue
+                        if _is_value_for_field(field, candidate):
+                            value_text = candidate
+                            break
             if not value_text or len(value_text) > 120:
                 continue
             pair_values.append((normalized, value_text, False))
 
+        # 役職→氏名の並びではなく、氏名→役職の並び（カードUI等）を構造として扱う
+        if self.rep_strict_sources and sequential_texts:
+            role_re = re.compile(
+                r"(代表取締役社長|代表執行役社長|代表取締役会長|代表取締役|代表理事長|代表理事|代表社員|代表者|代表|社長|会長|CEO)",
+                flags=re.I,
+            )
+            for idx in range(len(sequential_texts) - 1):
+                name_line = sequential_texts[idx].replace("\u200b", "").strip()
+                role_line = sequential_texts[idx + 1].replace("\u200b", "").strip()
+                if not name_line or not role_line:
+                    continue
+                _, role_compact = _normalize_label_text(role_line)
+                if not (role_re.search(role_line) or (role_compact and role_re.search(role_compact))):
+                    continue
+                cleaned = self.clean_rep_name(name_line)
+                if cleaned and self._looks_like_person_name(cleaned):
+                    pair_values.append((role_line, name_line, False))
+                    break
+
         for label, value, is_table_pair in pair_values:
             norm_label = label.replace("：", ":").strip()
+            _, compact_label = _normalize_label_text(norm_label)
             raw_value = self._clean_text_value(value)
             if not raw_value:
                 continue
-            if "顧問" in norm_label or "弁護士" in norm_label or "社労士" in norm_label:
+            if (
+                ("顧問" in norm_label or "顧問" in compact_label)
+                or ("弁護士" in norm_label or "弁護士" in compact_label)
+                or ("社労士" in norm_label or "社労士" in compact_label)
+            ):
                 continue
             # ニュース/人事系のラベルはスキップ
             label_block = ("退任", "就任", "人事", "異動", "お知らせ", "ニュース", "採用")
-            if any(b in norm_label for b in label_block):
+            if any((b in norm_label) or (b in compact_label) for b in label_block):
                 continue
             matched = False
             for field, keywords in TABLE_LABEL_MAP.items():
-                if any(keyword in norm_label for keyword in keywords):
+                if any(_label_matches(norm_label, keyword) for keyword in keywords):
                     if field == "rep_names":
                         def _pick_best_rep_name(val: str) -> tuple[str | None, bool]:
                             if not val:
@@ -4139,9 +4643,14 @@ class CompanyScraper:
 
                         cleaned, strong_role = _pick_best_rep_name(raw_value)
                         if cleaned:
-                            normalized_rep = cleaned if not is_table_pair else f"[TABLE]{cleaned}"
-                            if ("役員" in norm_label) and not strong_role:
-                                normalized_rep = f"[LOWROLE]{normalized_rep}"
+                            if (not strong_role) and (
+                                ("役員" in norm_label)
+                                or any(term in norm_label for term in ("一覧", "組織図", "メッセージ", "挨拶", "紹介"))
+                            ):
+                                matched = True
+                                continue
+                            prefix = "[TABLE]" if is_table_pair else "[LABEL]"
+                            normalized_rep = f"{prefix}{cleaned}"
                             label_reps.append(normalized_rep)
                             reps.append(normalized_rep)
                             rep_from_label = True
@@ -4207,10 +4716,13 @@ class CompanyScraper:
                         matched = True
             if matched:
                 continue
-            if not matched and self._is_exec_title(norm_label):
+            if not matched and (self._is_exec_title(norm_label) or self._is_exec_title(compact_label)):
                 cleaned = self.clean_rep_name(raw_value)
                 if cleaned and not rep_from_label and self._looks_like_person_name(cleaned):
-                    reps.append(cleaned)
+                    normalized_rep = f"[LABEL]{cleaned}"
+                    label_reps.append(normalized_rep)
+                    reps.append(normalized_rep)
+                    rep_from_label = True
 
         if soup:
             def walk_ld(entity: Any) -> None:
@@ -4273,7 +4785,7 @@ class CompanyScraper:
                         for name in founder_vals:
                             cleaned = self.clean_rep_name(name)
                             if cleaned and not rep_from_label and self._looks_like_person_name(cleaned):
-                                reps.append(cleaned)
+                                reps.append(f"[JSONLD]{cleaned}")
 
                         founding_date = entity.get("foundingDate") or entity.get("foundingYear")
                         if isinstance(founding_date, str):
@@ -4327,10 +4839,11 @@ class CompanyScraper:
                     listings.append(term)
                     break
 
-        for m in REP_RE.finditer(text or ""):
-            cand = self.clean_rep_name(m.group(1))
-            if cand and not rep_from_label and self._looks_like_person_name(cand):
-                reps.append(cand)
+        if not self.rep_strict_sources:
+            for m in REP_RE.finditer(text or ""):
+                cand = self.clean_rep_name(m.group(1))
+                if cand and not rep_from_label and self._looks_like_person_name(cand):
+                    reps.append(cand)
 
         capitals.extend(m.group(1).strip() for m in CAPITAL_RE.finditer(text or ""))
         revenues.extend(m.group(1).strip() for m in REVENUE_RE.finditer(text or ""))
@@ -4353,7 +4866,13 @@ class CompanyScraper:
 
         # ラベル由来の代表者があればそれを優先
         if label_reps:
-            reps = label_reps
+            reps = label_reps + [r for r in reps if "[JSONLD]" in r]
+
+        if self.rep_strict_sources:
+            reps = [
+                r for r in reps
+                if any(tag in r for tag in ("[TABLE]", "[LABEL]", "[JSONLD]", "[ROLE]"))
+            ]
 
         return {
             "phone_numbers": dedupe(phones),
