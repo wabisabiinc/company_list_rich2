@@ -218,6 +218,40 @@ def test_clean_rep_name_strips_exec_officer_variants(scraper):
 def test_clean_rep_name_rejects_generic_company_word(scraper):
     assert scraper.clean_rep_name("企業") is None
 
+
+def test_extract_candidates_bold_label_pairs(scraper):
+    html = """
+    <html><body>
+      <p>
+        <b>会社名</b> 志満や運送株式会社<br /><br />
+        <b>所在地</b> 徳島県阿南市橘町土井崎29-1<br /><br />
+        <b>代表者</b> 湯浅恭介<br /><br />
+        <b>資本金</b> 10,000,000円<br /><br />
+      </p>
+    </body></html>
+    """
+    text = "会社名\\n志満や運送株式会社\\n所在地\\n徳島県阿南市橘町土井崎29-1\\n代表者\\n湯浅恭介\\n資本金\\n10,000,000円"
+    extracted = scraper.extract_candidates(text, html)
+    assert any("徳島県阿南市橘町土井崎29-1" in a for a in (extracted.get("addresses") or []))
+    assert any("湯浅恭介" in _strip_rep_tags(r) for r in (extracted.get("rep_names") or []))
+    assert any("10,000,000円" in c for c in (extracted.get("capitals") or []))
+
+
+def test_extract_candidates_div_row_label_pairs(scraper):
+    html = """
+    <html><body>
+      <div class="company-outline">
+        <div class="row"><div class="label">社名</div><div class="value">F-LINE株式会社</div></div>
+        <div class="row"><div class="label">本社</div><div class="value">〒104-6130 東京都中央区晴海一丁目8番11号</div></div>
+        <div class="row"><div class="label">設立</div><div class="value">1952年10月2日</div></div>
+        <div class="row"><div class="label">資本金</div><div class="value">24億80百万円</div></div>
+      </div>
+    </body></html>
+    """
+    extracted = scraper.extract_candidates("", html)
+    assert any("東京都中央区晴海一丁目8番11号" in a for a in (extracted.get("addresses") or []))
+    assert any("24億80百万円" in c for c in (extracted.get("capitals") or []))
+
 def test_clean_rep_name_allows_single_kanji_tokens(scraper):
     assert scraper.clean_rep_name("関 進") == "関 進"
     assert scraper.clean_rep_name("関進") == "関進"

@@ -578,6 +578,96 @@ class CompanyScraper:
         self._browser_sem: asyncio.Semaphore | None = None
         self._load_slow_hosts()
 
+    @staticmethod
+    def _cache_key_url(url: str) -> str:
+        """
+        get_page_info のキャッシュキー用URL正規化。
+        - フラグメント除去
+        - host/scheme小文字化
+        - デフォルトポート除去
+        - パスの連続スラッシュ除去 + 末尾/の統一（root以外）
+        - 追跡系クエリの削除（utm_* 等）
+        """
+        if not url:
+            return ""
+        try:
+            parsed = urllib.parse.urlparse(url)
+        except Exception:
+            return url
+        scheme = (parsed.scheme or "").lower()
+        if not scheme:
+            return url
+        host = (parsed.hostname or "").lower()
+        if not host:
+            return url
+        port = parsed.port
+        if port and ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
+            port = None
+        netloc = host + (f":{port}" if port else "")
+        path = parsed.path or "/"
+        path = re.sub(r"/{2,}", "/", path)
+        if path != "/" and path.endswith("/"):
+            path = path.rstrip("/")
+        query = parsed.query or ""
+        if query:
+            try:
+                pairs = urllib.parse.parse_qsl(query, keep_blank_values=True)
+            except Exception:
+                pairs = []
+            drop_keys = {
+                "gclid",
+                "fbclid",
+                "yclid",
+                "mc_cid",
+                "mc_eid",
+                "ref",
+                "ref_src",
+                "_gl",
+            }
+            kept: list[tuple[str, str]] = []
+            for k, v in pairs:
+                lk = (k or "").lower()
+                if lk.startswith("utm_") or lk in drop_keys:
+                    continue
+                kept.append((k, v))
+            if kept:
+                try:
+                    query = urllib.parse.urlencode(kept, doseq=True)
+                except Exception:
+                    query = parsed.query or ""
+            else:
+                query = ""
+        try:
+            return urllib.parse.urlunparse((scheme, netloc, path, "", query, ""))
+        except Exception:
+            return url
+
+    @staticmethod
+    def _looks_js_heavy_template(html: str, text: str) -> bool:
+        if not html:
+            return False
+        text_len = len((text or "").strip())
+        low = (html or "").lower()
+        if any(
+            marker in low
+            for marker in (
+                "id=\"__next\"",
+                "id=\"__nuxt\"",
+                "__next_data__",
+                "data-reactroot",
+                "webpackjson",
+                "react-dom",
+                "window.__initial_state__",
+            )
+        ):
+            return text_len < 220
+        script_count = low.count("<script")
+        if script_count >= 8 and text_len < 220:
+            return True
+        if script_count >= 4 and text_len < 120 and ("<noscript" in low or "enable javascript" in low):
+            return True
+        return False
+
     def _get_browser_sem(self) -> asyncio.Semaphore:
         if self._browser_sem is None:
             self._browser_sem = asyncio.Semaphore(self.browser_concurrency)
@@ -590,6 +680,42 @@ class CompanyScraper:
         if self.http_session:
             return self.http_session.get(url, **kwargs)
         return requests.get(url, **kwargs)
+
+    @staticmethod
+    def _rewrite_to_www_preserve_path(original_url: str, final_url: str) -> str:
+        """
+        リダイレクトでパスが失われるサイト対策。
+        例: https://example.com/company/outline/ -> https://www.example.com/
+        のように root へ飛ばされた場合、www + 元パスで再試行する。
+        """
+        try:
+            o = urllib.parse.urlparse(original_url)
+            f = urllib.parse.urlparse(final_url)
+        except Exception:
+            return ""
+        if not o.scheme or not o.netloc:
+            return ""
+        if (o.path or "/") in {"", "/"}:
+            return ""
+        if (f.path or "/") not in {"", "/"}:
+            return ""
+        o_host = (o.netloc or "").split(":")[0]
+        f_host = (f.netloc or "").split(":")[0]
+        if not o_host or not f_host:
+            return ""
+        o_cmp = o_host.lower()
+        f_cmp = f_host.lower()
+        if o_cmp.startswith("www."):
+            return ""
+        if not f_cmp.startswith("www."):
+            return ""
+        if f_cmp[4:] != o_cmp:
+            return ""
+        rebuilt = o._replace(netloc=f_host, path=o.path, query=o.query, fragment="")
+        try:
+            return urllib.parse.urlunparse(rebuilt)
+        except Exception:
+            return ""
 
     @staticmethod
     def _detect_html_encoding(resp: requests.Response, raw: bytes) -> str:
@@ -1642,10 +1768,10 @@ class CompanyScraper:
             tag.decompose()
 
         for node in soup.find_all(True):
-            attrs = " ".join(
-                str(node.get(k) or "")
-                for k in ("id", "class", "role", "aria-label")
-            )
+            attrs_dict = getattr(node, "attrs", None)
+            if not isinstance(attrs_dict, dict):
+                continue
+            attrs = " ".join(str(attrs_dict.get(k) or "") for k in ("id", "class", "role", "aria-label"))
             if attrs and COOKIE_NODE_HINT_RE.search(attrs):
                 node.decompose()
 
@@ -1669,8 +1795,11 @@ class CompanyScraper:
                 label_keywords.update(kws)
             attr_texts: set[str] = set()
             for node in base.find_all(True):
+                attrs_dict = getattr(node, "attrs", None)
+                if not isinstance(attrs_dict, dict):
+                    continue
                 for key in attr_keys:
-                    val = node.get(key)
+                    val = attrs_dict.get(key)
                     if not isinstance(val, str):
                         continue
                     cleaned = unicodedata.normalize("NFKC", val).strip()
@@ -3170,13 +3299,35 @@ class CompanyScraper:
         eff_timeout_ms = self.http_timeout_ms if timeout_ms is None else max(500, int(timeout_ms))
         timeout_sec = max(2, eff_timeout_ms / 1000)
         started = time.monotonic()
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ja,en-US;q=0.9",
+        }
         try:
             resp = await asyncio.to_thread(
                 self._session_get,
                 url,
                 timeout=(timeout_sec, timeout_sec),
-                headers={"User-Agent": "Mozilla/5.0"},
+                headers=headers,
             )
+            # リダイレクトでパスが落ちた場合は www+元パスで再試行
+            try:
+                alt = self._rewrite_to_www_preserve_path(url, getattr(resp, "url", "") or "")
+            except Exception:
+                alt = ""
+            if alt:
+                try:
+                    resp2 = await asyncio.to_thread(
+                        self._session_get,
+                        alt,
+                        timeout=(timeout_sec, timeout_sec),
+                        headers=headers,
+                    )
+                    if getattr(resp2, "status_code", 0) and int(resp2.status_code) < 500:
+                        resp = resp2
+                except Exception:
+                    pass
             resp.raise_for_status()
             raw = resp.content or b""
             encoding = self._detect_html_encoding(resp, raw)
@@ -3184,13 +3335,23 @@ class CompanyScraper:
             html = decoded or ""
             text = self._clean_text_from_html(html, fallback_text=decoded or "")
             elapsed_ms = (time.monotonic() - started) * 1000
-            if self.slow_page_threshold_ms > 0 and elapsed_ms > self.slow_page_threshold_ms and host:
+            if (
+                not allow_slow
+                and self.slow_page_threshold_ms > 0
+                and elapsed_ms > self.slow_page_threshold_ms
+                and host
+            ):
                 self._add_slow_host(host)
                 log.info("[http] mark slow host (%.0f ms) %s", elapsed_ms, host)
             return {"url": url, "text": text, "html": html}
         except Exception:
             elapsed_ms = (time.monotonic() - started) * 1000
-            if self.slow_page_threshold_ms > 0 and elapsed_ms > self.slow_page_threshold_ms and host:
+            if (
+                not allow_slow
+                and self.slow_page_threshold_ms > 0
+                and elapsed_ms > self.slow_page_threshold_ms
+                and host
+            ):
                 self._add_slow_host(host)
                 log.warning("[http] timeout/slow (%.0f ms) -> skip host next time: %s", elapsed_ms, host or "")
             return {"url": url, "text": "", "html": ""}
@@ -3200,32 +3361,37 @@ class CompanyScraper:
         """
         対象URLの本文テキストとフルページスクショを取得（2回まで再試行）
         """
-        cached = self.page_cache.get(url)
+        cache_key = self._cache_key_url(url)
+        cached = self.page_cache.get(cache_key)
         cached_shot = bool(cached and cached.get("screenshot"))
         if cached and (cached_shot or not need_screenshot):
-            return cached
+            if cached.get("url") == url:
+                return cached
+            return {**cached, "url": url}
 
         http_fallback: Dict[str, Any] | None = None
         # まずHTTPで軽量取得を試す（スクショ不要の場合）
         if self.use_http_first and not need_screenshot:
             http_info = await self._fetch_http_info(url)
             text_len = len((http_info.get("text") or "").strip())
-            html_len = len(http_info.get("html") or "")
+            html_val = http_info.get("html") or ""
             http_fallback = {
                 "url": url,
                 "text": http_info.get("text", "") or "",
-                "html": http_info.get("html", "") or "",
+                "html": html_val,
                 "screenshot": b"",
             }
-            # 軽量取得で十分な本文/HTMLが取れた場合のみ即返す。薄い場合はブラウザで再取得。
-            if text_len >= 200 or html_len >= 1800:
-                self.page_cache[url] = {
+            # 軽量取得で十分な本文が取れた場合のみ即返す。
+            # JSレンダリング前提のテンプレ（Next.js/Nuxt/React等）は HTML が大きくても本文が薄いことがあるため、
+            # 本文が薄い場合はブラウザで再取得して取りこぼしを減らす。
+            if text_len >= 220 or (text_len >= 120 and not self._looks_js_heavy_template(html_val, http_fallback["text"])):
+                self.page_cache[cache_key] = {
                     "url": url,
-                    "text": http_info.get("text", "") or "",
-                    "html": http_info.get("html", "") or "",
+                    "text": http_fallback["text"],
+                    "html": http_fallback["html"],
                     "screenshot": b"",
                 }
-                return self.page_cache[url]
+                return self.page_cache[cache_key]
 
         if not self.context:
             if self.browser_disabled:
@@ -3250,6 +3416,15 @@ class CompanyScraper:
         if self.slow_page_threshold_ms > 0:
             eff_timeout = min(eff_timeout, self.slow_page_threshold_ms)
         total_deadline = time.monotonic() + max(2, eff_timeout) / 1000
+
+        def _remaining_ms() -> int:
+            return max(0, int((total_deadline - time.monotonic()) * 1000))
+
+        def _cap_timeout_ms(desired_ms: int) -> int:
+            remaining = _remaining_ms()
+            if remaining <= 0:
+                return 0
+            return max(1, min(int(desired_ms), remaining))
 
         try:
             parsed = urllib.parse.urlparse(url)
@@ -3283,40 +3458,70 @@ class CompanyScraper:
             marked_slow = False
             try:
                 async with browser_sem:
+                    # attempt の中でも操作ごとに残り時間を割り当て、合算でタイムアウトを超えないようにする
                     page = await self.context.new_page()
-                    page.set_default_timeout(attempt_timeout)
+                    page.set_default_timeout(_cap_timeout_ms(attempt_timeout))
                     goto_started = time.monotonic()
-                    await page.goto(url, timeout=attempt_timeout, wait_until="domcontentloaded")
+                    goto_timeout = _cap_timeout_ms(attempt_timeout)
+                    if goto_timeout <= 0:
+                        raise PlaywrightTimeoutError("deadline exceeded before goto")
+                    await page.goto(url, timeout=goto_timeout, wait_until="domcontentloaded")
+                    # リダイレクトでパスが落ちた場合は www+元パスで再試行（残り時間がある範囲で）
+                    try:
+                        alt = self._rewrite_to_www_preserve_path(url, page.url or "")
+                    except Exception:
+                        alt = ""
+                    if alt and _remaining_ms() > 1200:
+                        try:
+                            goto_timeout2 = _cap_timeout_ms(min(attempt_timeout, 6000))
+                            if goto_timeout2 > 0:
+                                await page.goto(alt, timeout=goto_timeout2, wait_until="domcontentloaded")
+                        except Exception:
+                            pass
                     goto_ms = (time.monotonic() - goto_started) * 1000
                     if self.network_idle_timeout_ms > 0:
                         net_started = time.monotonic()
                         try:
+                            net_timeout = _cap_timeout_ms(min(self.network_idle_timeout_ms, attempt_timeout))
+                            if net_timeout <= 0:
+                                raise PlaywrightTimeoutError("deadline exceeded before networkidle")
                             await page.wait_for_load_state(
                                 "networkidle",
-                                timeout=min(self.network_idle_timeout_ms, attempt_timeout),
+                                timeout=net_timeout,
                             )
                         except Exception:
                             pass
                         network_idle_ms = (time.monotonic() - net_started) * 1000
                     try:
-                        text = await page.inner_text("body", timeout=5000)
+                        inner_timeout = _cap_timeout_ms(min(5000, attempt_timeout))
+                        if inner_timeout <= 0:
+                            raise PlaywrightTimeoutError("deadline exceeded before inner_text")
+                        text = await page.inner_text("body", timeout=inner_timeout)
                     except Exception:
                         try:
+                            load_timeout = _cap_timeout_ms(min(self.load_wait_timeout_ms, attempt_timeout))
+                            if load_timeout <= 0:
+                                raise PlaywrightTimeoutError("deadline exceeded before load wait")
                             await page.wait_for_load_state(
                                 "load",
-                                timeout=min(self.load_wait_timeout_ms, attempt_timeout),
+                                timeout=load_timeout,
                             )
                         except Exception:
                             pass
                         text = await page.inner_text("body") if await page.locator("body").count() else ""
                     if text and len(text.strip()) < 40:
                         try:
-                            await page.wait_for_timeout(1200)
+                            wait_ms = _cap_timeout_ms(1200)
+                            if wait_ms > 0:
+                                await page.wait_for_timeout(wait_ms)
                             text = await page.inner_text("body")
                         except Exception:
                             pass
                     try:
-                        html = await page.content()
+                        html_timeout_ms = _cap_timeout_ms(min(2500, attempt_timeout))
+                        if html_timeout_ms <= 0:
+                            raise PlaywrightTimeoutError("deadline exceeded before content")
+                        html = await asyncio.wait_for(page.content(), timeout=html_timeout_ms / 1000.0)
                     except Exception:
                         html = ""
                     # JS生成で本文が薄い場合の最小フォールバック（待機のみ。追加fetchはしない）
@@ -3330,15 +3535,31 @@ class CompanyScraper:
                                 or ("nuxt" in html.lower())
                             )
                             if spa_hint:
-                                await page.wait_for_selector("table,dl,footer,address", timeout=min(1500, attempt_timeout))
-                                await page.wait_for_timeout(250)
+                                selector_timeout = _cap_timeout_ms(min(1500, attempt_timeout))
+                                if selector_timeout <= 0:
+                                    raise PlaywrightTimeoutError("deadline exceeded before spa wait")
+                                await page.wait_for_selector("table,dl,footer,address", timeout=selector_timeout)
+                                idle_ms = _cap_timeout_ms(250)
+                                if idle_ms > 0:
+                                    await page.wait_for_timeout(idle_ms)
                                 text = await page.inner_text("body")
-                                html = await page.content()
+                                html_timeout_ms2 = _cap_timeout_ms(min(2500, attempt_timeout))
+                                if html_timeout_ms2 <= 0:
+                                    raise PlaywrightTimeoutError("deadline exceeded before spa content")
+                                html = await asyncio.wait_for(page.content(), timeout=html_timeout_ms2 / 1000.0)
                         except Exception:
                             pass
                     screenshot: bytes = b""
                     if need_screenshot:
-                        screenshot = await page.screenshot(full_page=True)
+                        screenshot_timeout_ms = _cap_timeout_ms(min(4000, attempt_timeout))
+                        if screenshot_timeout_ms > 0:
+                            try:
+                                screenshot = await asyncio.wait_for(
+                                    page.screenshot(full_page=True),
+                                    timeout=screenshot_timeout_ms / 1000.0,
+                                )
+                            except Exception:
+                                screenshot = b""
                 cleaned_text = self._clean_text_from_html(html, fallback_text=text or "")
                 result = {"url": url, "text": cleaned_text, "html": html, "screenshot": screenshot}
                 if cached and not screenshot:
@@ -3360,7 +3581,11 @@ class CompanyScraper:
                         host,
                         url,
                     )
-                if self.slow_page_threshold_ms > 0 and effective_elapsed_ms > self.slow_page_threshold_ms:
+                if (
+                    not allow_slow
+                    and self.slow_page_threshold_ms > 0
+                    and effective_elapsed_ms > self.slow_page_threshold_ms
+                ):
                     if host:
                         self._add_slow_host(host)
                         marked_slow = True
@@ -3371,20 +3596,23 @@ class CompanyScraper:
                         network_idle_ms,
                         host or "",
                     )
-                self.page_cache[url] = result
+                self.page_cache[cache_key] = result
                 return result
 
             except PlaywrightTimeoutError:
                 # 軽く待ってリトライ
-                await asyncio.sleep(0.7 * (attempt + 1))
+                if time.monotonic() < total_deadline:
+                    await asyncio.sleep(0.7 * (attempt + 1))
             except Exception:
                 # 予期せぬ例外も1回だけ再試行
-                await asyncio.sleep(0.7 * (attempt + 1))
+                if time.monotonic() < total_deadline:
+                    await asyncio.sleep(0.7 * (attempt + 1))
             finally:
                 elapsed_ms = (time.monotonic() - started) * 1000
                 effective_elapsed_ms = max(0.0, elapsed_ms - network_idle_ms)
                 if (
-                    self.slow_page_threshold_ms > 0
+                    not allow_slow
+                    and self.slow_page_threshold_ms > 0
                     and effective_elapsed_ms > self.slow_page_threshold_ms
                     and not marked_slow
                 ):
@@ -3408,7 +3636,7 @@ class CompanyScraper:
         elif http_fallback is not None:
             fallback["text"] = http_fallback.get("text", "")
             fallback["html"] = http_fallback.get("html", "")
-        self.page_cache[url] = fallback
+        self.page_cache[cache_key] = fallback
         return fallback
 
     # ===== 同一ドメイン内を浅く探索 =====
@@ -4101,6 +4329,13 @@ class CompanyScraper:
             ):
                 return {"page_type": "COMPANY_PROFILE", "score": label_hits, "reason": "bases_list_with_rep_label"}
             return {"page_type": "BASES_LIST", "score": max(zip_count, pref_count, branch_hits), "reason": "bases_list_signals"}
+
+        # URL/見出しがプロフィールっぽくなくても、テーブルに「代表/住所/電話」等が揃っている場合はプロフィール扱いにする。
+        # （協会/組合サイト等の企業詳細ページで、電話が存在するのに OTHER 判定で落とす取りこぼしを防ぐ）
+        has_phone = bool(PHONE_RE.search(text_nfkc))
+        has_addr = bool("〒" in text_nfkc or ZIP_RE.search(text_nfkc) or ADDR_HINT.search(text_nfkc))
+        if has_table_or_dl and label_hits >= 3 and (rep_label_hit or has_hq_marker) and (has_phone or has_addr):
+            return {"page_type": "COMPANY_PROFILE", "score": label_hits, "reason": "table_labels"}
         if (is_profile_heading or is_profile_path) and has_table_or_dl and label_hits >= 4:
             return {"page_type": "COMPANY_PROFILE", "score": label_hits, "reason": "profile_heading+labels"}
         if is_profile_path and label_hits >= 4 and (has_hq_marker or rep_label_hit):
@@ -4109,8 +4344,12 @@ class CompanyScraper:
             return {"page_type": "COMPANY_PROFILE", "score": label_hits, "reason": "profile_heading"}
 
         is_contact_heading = any(kw in head_low for kw in (k.lower() for k in contact_kw))
-        if is_contact_heading or any(seg in url.lower() for seg in ("/contact", "/inquiry", "/access", "/toiawase")):
-            return {"page_type": "ACCESS_CONTACT", "score": label_hits, "reason": "contact_heading_or_path"}
+        is_contact_text = bool(has_phone or has_addr) and any(kw.lower() in text_low for kw in contact_kw)
+        if is_contact_heading or is_contact_text or any(seg in url.lower() for seg in ("/contact", "/inquiry", "/access", "/toiawase")):
+            reason = "contact_heading_or_path"
+            if is_contact_text and not is_contact_heading:
+                reason = "contact_text"
+            return {"page_type": "ACCESS_CONTACT", "score": label_hits, "reason": reason}
 
         return {"page_type": "OTHER", "score": label_hits, "reason": "default"}
 
@@ -4423,6 +4662,146 @@ class CompanyScraper:
                                 pair_values.insert(0, (label, value, True))
                             else:
                                 pair_values.append((label, value, True))
+
+                # <b>ラベル + <br> 区切りの「会社概要」形式（1つの <p> に複数ペアが混在）を抽出する。
+                # 例:
+                #   <b>所在地</b> 徳島県...<br><br><b>代表者</b> ...
+                try:
+                    for container in soup.find_all(["p", "div", "li"]):
+                        b_tags = container.find_all("b")
+                        if not b_tags:
+                            continue
+                        for b in b_tags:
+                            label = b.get_text(separator=" ", strip=True)
+                            if not label:
+                                continue
+                            if not _field_for_label(label):
+                                continue
+                            parts: list[str] = []
+                            for sib in b.next_siblings:
+                                try:
+                                    name = getattr(sib, "name", None)
+                                except Exception:
+                                    name = None
+                                if name == "b":
+                                    break
+                                if name == "br":
+                                    parts.append("\n")
+                                    continue
+                                if isinstance(sib, str):
+                                    parts.append(sib)
+                                    continue
+                                try:
+                                    txt = sib.get_text(separator=" ", strip=True)
+                                except Exception:
+                                    txt = ""
+                                if txt:
+                                    parts.append(txt)
+                            value = " ".join(parts)
+                            value = value.replace("\u3000", " ")
+                            value = re.sub(r"[\r\n]+", " ", value)
+                            value = re.sub(r"\s+", " ", value).strip()
+                            value = value.strip(" ：:・-‐―－ー〜~()（）[]{}<>")
+                            if not value:
+                                continue
+                            pair_values.append((label, value, False))
+                except Exception:
+                    pass
+
+                # CSSレイアウト（div/span）で「左=ラベル / 右=値」の会社概要を抽出する。
+                # 例: <div class=row><div>社名</div><div>F-LINE株式会社</div></div>
+                #      <div class=row><div>本社</div><div>〒104-... 東京都...</div></div>
+                try:
+                    def _node_text(node: Any) -> str:
+                        try:
+                            return node.get_text(separator=" ", strip=True)
+                        except Exception:
+                            return ""
+
+                    def _next_value_from_parent(node: Any, field: str) -> str:
+                        parent = getattr(node, "parent", None)
+                        if parent is None:
+                            return ""
+                        children = []
+                        try:
+                            children = [c for c in getattr(parent, "children", [])]
+                        except Exception:
+                            children = []
+                        if not children:
+                            return ""
+                        idx = -1
+                        for i, c in enumerate(children):
+                            if c is node:
+                                idx = i
+                                break
+                        if idx < 0:
+                            return ""
+                        for j in range(idx + 1, min(len(children), idx + 6)):
+                            c = children[j]
+                            if isinstance(c, str):
+                                txt = re.sub(r"\s+", " ", c).strip()
+                            else:
+                                name = getattr(c, "name", None)
+                                if name == "br":
+                                    continue
+                                txt = _node_text(c)
+                            if not txt:
+                                continue
+                            if _looks_like_label(txt)[0]:
+                                continue
+                            if _is_value_for_field(field, txt):
+                                return txt
+                            # 住所は複数行に分かれることがあるので、郵便番号+次要素を許容
+                            if field == "addresses" and ZIP_RE.search(txt):
+                                # 次の要素も足して試す
+                                nxt = ""
+                                for k in range(j + 1, min(len(children), j + 3)):
+                                    c2 = children[k]
+                                    if isinstance(c2, str):
+                                        nxt = re.sub(r"\s+", " ", c2).strip()
+                                    else:
+                                        name2 = getattr(c2, "name", None)
+                                        if name2 == "br":
+                                            continue
+                                        nxt = _node_text(c2)
+                                    if nxt and not _looks_like_label(nxt)[0]:
+                                        break
+                                combined = f"{txt} {nxt}".strip() if nxt else txt
+                                if _is_value_for_field(field, combined):
+                                    return combined
+                        return ""
+
+                    # 探索対象を絞る（短いテキスト=ラベル候補）
+                    for node in soup.find_all(["dt", "th", "div", "span", "p", "li"]):
+                        label = _node_text(node)
+                        if not label:
+                            continue
+                        # 既に b/table/dl で拾っている場合が多いので、短いラベルのみ対象にする
+                        if len(label) > 20:
+                            continue
+                        field = _field_for_label(label)
+                        if not field:
+                            continue
+                        # まず siblings を優先
+                        value = ""
+                        try:
+                            sib = node.find_next_sibling()
+                        except Exception:
+                            sib = None
+                        if sib is not None:
+                            v = _node_text(sib)
+                            if v and not _looks_like_label(v)[0] and _is_value_for_field(field, v):
+                                value = v
+                        if not value:
+                            value = _next_value_from_parent(node, field)
+                        if not value:
+                            continue
+                        value = value.replace("\u3000", " ")
+                        value = re.sub(r"\s+", " ", value).strip()
+                        if value and len(value) <= 160:
+                            pair_values.append((label, value, False))
+                except Exception:
+                    pass
 
                 try:
                     def _is_nav_like_node(node: Any) -> bool:

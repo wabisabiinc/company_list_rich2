@@ -73,6 +73,9 @@ COMPANIES_DB_PATH=data/companies_logistics.db python3 main.py
 - `AI_VERIFY_MIN_CONFIDENCE`（AI抽出の最低信頼度。低い場合は採用せず深掘りで再抽出。デフォルト `0.65`）
 - `AI_ADDRESS_ENABLED`（AIが返した住所を取り込むか。デフォルト `true`）
 - `USE_AI_DESCRIPTION`（description専用の追加AI呼び出しを行うか。デフォルト `false`。通常は `verify_info` で同時生成）
+- `AI_SCREENSHOT_POLICY=auto/always/never`（AIに渡すスクショ方針。`auto` は本文が十分ならスクショ無しで高速化）
+- `OFFICIAL_AI_SCREENSHOT_POLICY=always/never/auto`（公式判定AIのスクショ方針。デフォルト `always`）
+- `VERIFY_AI_SCREENSHOT_POLICY`（抽出AI（verify/最終選択）のスクショ方針。未指定時は `AI_SCREENSHOT_POLICY`）
 - `SEARCH_CANDIDATE_LIMIT`（検索候補の最大数）
 - `RELATED_BASE_PAGES`, `RELATED_MAX_HOPS_BASE`（深掘りのページ数/ホップ上限。内部でも最大3にクランプ）
 
