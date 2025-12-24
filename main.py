@@ -21,7 +21,7 @@ except ImportError:
 from bs4 import BeautifulSoup
 
 from src.database_manager import DatabaseManager
-from src.company_scraper import CompanyScraper, CITY_RE
+from src.company_scraper import CompanyScraper, CITY_RE, NAME_CHUNK_RE, KANA_NAME_RE
 from src.ai_verifier import (
     AIVerifier,
     DEFAULT_MODEL as AI_MODEL_NAME,
@@ -123,6 +123,7 @@ AI_VERIFY_MIN_CONFIDENCE = float(os.getenv("AI_VERIFY_MIN_CONFIDENCE", "0.65"))
 # url_flags に保存された「AI非公式」判定を、候補URL取得前に強制スキップするための閾値。
 # 低confidenceのAI判定は誤爆しやすいので、一定以上のみハードに扱う（それ未満は再評価対象）。
 AI_SKIP_NEGATIVE_FLAG_MIN_CONFIDENCE = float(os.getenv("AI_SKIP_NEGATIVE_FLAG_MIN_CONFIDENCE", "0.85"))
+AI_CLEAR_NEGATIVE_FLAGS = os.getenv("AI_CLEAR_NEGATIVE_FLAGS", "false").lower() == "true"
 
 # 暫定URL（provisional_*）を homepage として保存するかどうか。
 # - false の場合でも provisional_homepage/final_homepage には記録する。
@@ -233,6 +234,29 @@ def normalize_phone(s: str | None) -> str | None:
     m2 = re.search(r"^(0\d{1,4})-?(\d{2,4})-?(\d{3,4})$", s)
     return f"{m2.group(1)}-{m2.group(2)}-{m2.group(3)}" if m2 else None
 
+def clean_homepage_url(url: str | None) -> str:
+    if not url:
+        return ""
+    raw = re.sub(r"\s+", "", str(url))
+    if not raw:
+        return ""
+    lowered = raw.lower()
+    if lowered.startswith(("mailto:", "tel:", "javascript:")):
+        return ""
+    parsed = urlparse(raw)
+    if not parsed.scheme:
+        candidate = f"https://{raw}"
+        parsed = urlparse(candidate)
+        if parsed.scheme and parsed.netloc:
+            raw = candidate
+        else:
+            return ""
+    if parsed.scheme not in {"http", "https"}:
+        return ""
+    if not parsed.netloc:
+        return ""
+    return raw.split("#", 1)[0]
+
 def normalize_address(s: str | None) -> str | None:
     if not s:
         return None
@@ -325,6 +349,11 @@ def normalize_address(s: str | None) -> str | None:
     s = re.sub(r"(?:市区町村|自治体)コ[-ー]ド\s*[:：]\s*\d+", "", s)
     s = _strip_address_label(s)
     s = _cut_trailing_non_address(s)
+    # Cut at first illegal symbol for address
+    illegal_re = re.compile(r"[<>\uFF1C\uFF1E\{\}\uFF5B\uFF5D\[\]\uFF3B\uFF3D\(\)\uFF08\uFF09\u300C\u300D\u300E\u300F\u3010\u3011\u3014\u3015\u3008\u3009\u300A\u300B\"'=\uFF1D+\uFF0B*\uFF0A\^\uFF3E$\uFF04#\uFF03@\uFF20&\uFF06|\uFF5C\\\\\uFF3C~\uFF5E`!\uFF01?\uFF1F;\uFF1B:\uFF1A/\uFF0F\u203B\u2605\u2606\u25CF\u25A0\u25C6\u2022\u2026]")
+    m_illegal = illegal_re.search(s)
+    if m_illegal:
+        s = s[: m_illegal.start()]
     # 住所入力フォームのラベル/候補一覧が混入したケースを除外
     if ADDRESS_FORM_NOISE_RE.search(s):
         return None
@@ -738,6 +767,8 @@ def _rep_candidate_ok(
         or meta.get("role", False)
         or meta.get("jsonld", False)
     )
+    if low_role:
+        return False, "low_role"
     if page_type == "COMPANY_PROFILE":
         return True, ""
     if page_type == "ACCESS_CONTACT":
@@ -830,6 +861,21 @@ def is_over_deep_limit(total_elapsed: float, homepage: str | None, official_phas
 def pick_best_rep(names: list[str], source_url: str | None = None) -> str | None:
     role_keywords = ("代表", "取締役", "社長", "理事長", "会長", "院長", "学長", "園長", "代表社員", "CEO", "COO")
     blocked = ("スタッフ", "紹介", "求人", "採用", "ニュース", "退任", "就任", "人事", "異動", "お知らせ", "プレス", "取引")
+    rep_noise_words = (
+        "社是",
+        "社訓",
+        "スローガン",
+        "理念",
+        "方針",
+        "ビジョン",
+        "ミッション",
+        "バリュー",
+        "利用者",
+        "お客様",
+        "皆様",
+        "方々",
+        "の方",
+    )
     url_bonus = 3 if source_url and any(seg in source_url for seg in ("/company", "/about", "/corporate")) else 0
     best = None
     best_score = float("-inf")
@@ -844,6 +890,16 @@ def pick_best_rep(names: list[str], source_url: str | None = None) -> str | None
         low_role = "LOWROLE" in tag_set
         if not cleaned:
             continue
+        if low_role:
+            continue
+        has_hiragana = bool(re.search(r"[\u3041-\u3096]", cleaned))
+        has_kanji = bool(re.search(r"[\u4E00-\u9FFF]", cleaned))
+        if has_hiragana and has_kanji:
+            continue
+        if not (NAME_CHUNK_RE.search(cleaned) or KANA_NAME_RE.search(cleaned)):
+            continue
+        if any(w in cleaned for w in rep_noise_words):
+            continue
         if any(b in cleaned for b in blocked):
             continue
         score = len(cleaned) + url_bonus
@@ -853,7 +909,8 @@ def pick_best_rep(names: list[str], source_url: str | None = None) -> str | None
             score += 3
         if any(k in cleaned for k in role_keywords):
             score += 8
-        if low_role:
+        token_count = len([t for t in cleaned.split() if t])
+        if token_count >= 3:
             score -= 6
         if score > best_score:
             best_score = score
@@ -1288,13 +1345,32 @@ def build_official_ai_text(text: str, html: str, signals: dict[str, Any] | None 
                 "name_match_ratio",
                 "name_match_exact",
                 "name_match_partial_only",
+                "name_match_source",
                 "official_evidence_score",
+                "official_evidence",
+                "title_match",
+                "h1_match",
+                "og_site_name_match",
                 "directory_like",
             )
             sig_parts = []
             for key in keys:
-                if key in signals and signals[key] is not None:
-                    sig_parts.append(f"{key}={signals[key]}")
+                if key not in signals or signals[key] is None:
+                    continue
+                val = signals[key]
+                if isinstance(val, bool):
+                    val_str = "true" if val else "false"
+                elif isinstance(val, float):
+                    val_str = f"{val:.2f}"
+                elif isinstance(val, (list, tuple, set)):
+                    items = [str(x).strip() for x in val if str(x).strip()]
+                    if not items:
+                        continue
+                    val_str = ",".join(items[:12])
+                else:
+                    val_str = str(val)
+                if val_str:
+                    sig_parts.append(f"{key}={val_str}")
             if sig_parts:
                 parts.append(f"[SIGNALS] {' '.join(sig_parts)}")
         except Exception:
@@ -1371,6 +1447,7 @@ async def ensure_info_text(
     scraper: CompanyScraper,
     url: str,
     info: dict[str, Any] | None,
+    allow_slow: bool = False,
 ) -> dict[str, Any]:
     """
     テキスト/HTMLのみ不足している場合に軽量に再取得する（スクショは撮らない）。
@@ -1379,7 +1456,18 @@ async def ensure_info_text(
     if info.get("text") and info.get("html"):
         return info
     try:
-        refreshed = await scraper.get_page_info(url, need_screenshot=False)
+        host = ""
+        if allow_slow:
+            try:
+                host = urlparse(url).netloc.lower().split(":")[0]
+            except Exception:
+                host = ""
+        is_slow = bool(host and allow_slow and scraper._is_slow_host(host))  # type: ignore[attr-defined]
+        if is_slow:
+            timeout_ms = min(getattr(scraper, "http_timeout_ms", 6000), 2500)
+            refreshed = await scraper._fetch_http_info(url, timeout_ms=timeout_ms, allow_slow=True)
+        else:
+            refreshed = await scraper.get_page_info(url, need_screenshot=False, allow_slow=allow_slow)
         if refreshed:
             if refreshed.get("text"):
                 info["text"] = refreshed.get("text", "")
@@ -1483,6 +1571,9 @@ async def process():
 
     verifier = AIVerifier() if USE_AI else None
     manager = DatabaseManager(db_path=COMPANIES_DB_PATH, worker_id=WORKER_ID)
+    if AI_CLEAR_NEGATIVE_FLAGS:
+        cleared = manager.clear_ai_negative_url_flags()
+        log.info("Cleared %s AI negative url_flags before evaluation.", cleared)
 
     csv_file = None
     csv_writer = None
@@ -2216,10 +2307,20 @@ async def process():
                                         domain_score = scraper._domain_score(company_tokens, normalized_for_ai)  # type: ignore
                                         record["domain_score"] = domain_score
                                     info_payload = record.get("info") or {}
+                                    rule_for_ai = record.get("rule") or {}
+                                    allow_slow_ai = False
+                                    if remaining > (AI_MIN_REMAINING_SEC + 2.0):
+                                        evidence_score = int(rule_for_ai.get("official_evidence_score") or 0)
+                                        allow_slow_ai = bool(
+                                            rule_for_ai.get("is_official")
+                                            or evidence_score >= 9
+                                            or record.get("host_token_hit")
+                                        )
                                     info_payload = await ensure_info_text(
                                         scraper,
                                         record.get("url"),
                                         info_payload,
+                                        allow_slow=allow_slow_ai,
                                     )
                                     if OFFICIAL_AI_USE_SCREENSHOT:
                                         info_payload = await ensure_info_has_screenshot(
@@ -2248,7 +2349,18 @@ async def process():
                                         ).get("page_type") or "OTHER"
                                     except Exception:
                                         base_pt = "OTHER"
-                                    rule_for_ai = record.get("rule") or {}
+                                    evidence_list = rule_for_ai.get("official_evidence") or []
+                                    evidence_set = {str(x).strip() for x in evidence_list if str(x).strip()}
+                                    title_match = None
+                                    if "title" in evidence_set:
+                                        title_match = "strong"
+                                    elif "title_partial" in evidence_set:
+                                        title_match = "partial"
+                                    h1_match = None
+                                    if "h1" in evidence_set:
+                                        h1_match = "strong"
+                                    elif "h1_partial" in evidence_set:
+                                        h1_match = "partial"
                                     signals = {
                                         "page_type": base_pt,
                                         "domain_score": int(record.get("domain_score") or 0),
@@ -2256,7 +2368,12 @@ async def process():
                                         "name_match_ratio": rule_for_ai.get("name_match_ratio"),
                                         "name_match_exact": rule_for_ai.get("name_match_exact"),
                                         "name_match_partial_only": rule_for_ai.get("name_match_partial_only"),
+                                        "name_match_source": rule_for_ai.get("name_match_source"),
                                         "official_evidence_score": rule_for_ai.get("official_evidence_score"),
+                                        "official_evidence": evidence_list if evidence_set else None,
+                                        "title_match": title_match,
+                                        "h1_match": h1_match,
+                                        "og_site_name_match": True if "og:site_name" in evidence_set else None,
                                         "directory_like": rule_for_ai.get("directory_like"),
                                     }
                                     base_snippet_full = build_official_ai_text(base_text, base_html, signals=signals)
@@ -2826,6 +2943,8 @@ async def process():
                     provisional_name_present = False
                     provisional_address_ok = False
                     provisional_ai_hint = False
+                    provisional_profile_hit = False
+                    provisional_evidence_score = 0
                     best_record: dict[str, Any] | None = None
                     if not homepage and candidate_records:
                         best_score = float("-inf")
@@ -2932,6 +3051,18 @@ async def process():
                             provisional_cands = best_record.get("extracted") or {}
                             provisional_domain_score = domain_score
                             provisional_address_ok = address_ok
+                            provisional_evidence_score = int(rule_details.get("official_evidence_score") or 0)
+                            if provisional_info:
+                                try:
+                                    pt = scraper.classify_page_type(
+                                        normalized_url,
+                                        text=provisional_info.get("text", "") or "",
+                                        html=provisional_info.get("html", "") or "",
+                                    ).get("page_type") or "OTHER"
+                                    page_type_per_url[normalized_url] = str(pt)
+                                    provisional_profile_hit = (pt == "COMPANY_PROFILE")
+                                except Exception:
+                                    pass
                             # ログだけ出して深掘りターゲットとする
                             if provisional_ai_hint:
                                 company["provisional_reason"] = "ai_official_hint"
@@ -2954,6 +3085,8 @@ async def process():
                             and not provisional_name_present
                             and not provisional_address_ok
                             and not provisional_ai_hint
+                            and provisional_evidence_score < 6
+                            and not provisional_profile_hit
                         )
                         if weak_provisional:
                             # ルール上は弱いがAI公式（ただし除外）を見ている場合は、reviewで保持して深掘りは継続する
@@ -3335,6 +3468,13 @@ async def process():
                                     or need_fiscal
                                 )
                             )
+                            allow_slow_priority = bool(
+                                missing_contact > 0
+                                or need_rep
+                                or need_description
+                                or need_founded
+                                or need_listing
+                            )
                             try:
                                 early_priority_docs = await asyncio.wait_for(
                                     scraper.fetch_priority_documents(
@@ -3343,6 +3483,7 @@ async def process():
                                         max_links=3 if should_fetch_priority else 0,
                                         concurrency=FETCH_CONCURRENCY,
                                         target_types=["about", "contact", "finance"] if should_fetch_priority else None,
+                                        allow_slow=allow_slow_priority,
                                         exclude_urls=set(priority_docs.keys()) if priority_docs else None,
                                     ),
                                     timeout=clamp_timeout(PAGE_FETCH_TIMEOUT_SEC),
@@ -3462,8 +3603,8 @@ async def process():
                                 if missing_contact > 0:
                                     priority_limit = 3
                                     target_types.append("contact")
-                                    # provisional/非プロフィール起点だと contact だけでは会社概要に到達しにくいので about も許可する
                                     base_pt = page_type_per_url.get(info_url) or page_type_per_url.get(homepage) or "OTHER"
+                                    # provisional/非プロフィール起点だと contact だけでは会社概要に到達しにくいので about も許可する
                                     if base_pt != "COMPANY_PROFILE" and "about" not in target_types:
                                         priority_limit = max(priority_limit, 2)
                                         target_types.append("about")
@@ -3478,6 +3619,7 @@ async def process():
                             site_docs = {}
                             # 既取得URLは除外しつつ不足がある場合のみ追加巡回する
                             if priority_limit > 0 and not over_deep_phase_deadline():
+                                allow_slow_priority = bool("about" in target_types or "contact" in target_types)
                                 site_docs = await asyncio.wait_for(
                                     scraper.fetch_priority_documents(
                                         homepage,
@@ -3485,7 +3627,7 @@ async def process():
                                         max_links=priority_limit,
                                         concurrency=FETCH_CONCURRENCY,
                                         target_types=target_types or None,
-                                        allow_slow=missing_contact > 0,
+                                        allow_slow=allow_slow_priority,
                                         exclude_urls=set(priority_docs.keys()) if priority_docs else None,
                                     ),
                                     timeout=clamp_timeout(PAGE_FETCH_TIMEOUT_SEC),
@@ -3512,6 +3654,36 @@ async def process():
                                         info_url = adopted_url
                                         info_dict = adopted
                                         homepage = adopted_url
+                                        try:
+                                            provisional_profile_hit = True
+                                            if adopted_url:
+                                                ds = scraper._domain_score(company_tokens, adopted_url)  # type: ignore
+                                                provisional_domain_score = max(int(provisional_domain_score or 0), int(ds or 0))
+                                                provisional_host_token = provisional_host_token or scraper._host_token_hit(company_tokens, adopted_url)  # type: ignore
+                                            text_val = adopted.get("text", "") or ""
+                                            html_val = adopted.get("html", "") or ""
+                                            extracted = scraper.extract_candidates(text_val, html_val)
+                                            adopted_rule = scraper.is_likely_official_site(
+                                                name,
+                                                adopted_url,
+                                                {"url": adopted_url, "text": text_val, "html": html_val},
+                                                addr,
+                                                extracted,
+                                                return_details=True,
+                                            )
+                                            if isinstance(adopted_rule, dict):
+                                                provisional_name_present = provisional_name_present or bool(adopted_rule.get("name_present"))
+                                                provisional_address_ok = provisional_address_ok or bool(
+                                                    adopted_rule.get("address_match")
+                                                    or adopted_rule.get("prefecture_match")
+                                                    or adopted_rule.get("postal_code_match")
+                                                )
+                                                provisional_evidence_score = max(
+                                                    int(provisional_evidence_score or 0),
+                                                    int(adopted_rule.get("official_evidence_score") or 0),
+                                                )
+                                        except Exception:
+                                            pass
                                         # 保存用の暫定URL(起点)は保持しつつ、採用URLは切り替える
                                         force_review = True
                             missing_contact, missing_extra = refresh_need_flags()
@@ -3582,7 +3754,11 @@ async def process():
                             related_page_limit = RELATED_BASE_PAGES + (1 if missing_extra else 0)
                             if need_phone:
                                 related_page_limit += RELATED_EXTRA_PHONE
-                            related_cap = 6 if ai_official_selected else 3
+                            if need_rep:
+                                related_page_limit += 1
+                            if need_description:
+                                related_page_limit += 1
+                            related_cap = 6 if ai_official_selected else 4
                             related_page_limit = max(0, min(related_cap, related_page_limit))
 
                             deep_on_weak = os.getenv("DEEP_ON_WEAK_PROVISIONAL", "true").lower() == "true"
@@ -3594,6 +3770,8 @@ async def process():
                                 and not provisional_name_present
                                 and not provisional_address_ok
                                 and not provisional_ai_hint
+                                and provisional_evidence_score < 6
+                                and not provisional_profile_hit
                             )
                             if weak_provisional_target and not deep_on_weak:
                                 deep_skip_reason = "weak_provisional_target"
@@ -3607,8 +3785,9 @@ async def process():
                                 else:
                                     # 弱い暫定URLでも、未取得があるなら「軽量deep」で救済する
                                     if weak_provisional_target and deep_on_weak:
-                                        related_page_limit = min(1, related_page_limit)
-                                        max_hops = 1
+                                        weak_cap = 2 if (need_rep or need_description) else 1
+                                        related_page_limit = min(weak_cap, related_page_limit)
+                                        max_hops = 2 if (need_rep or need_description) else 1
                                     else:
                                         max_hops = RELATED_MAX_HOPS_PHONE if need_phone else RELATED_MAX_HOPS_BASE
                                         max_hops_cap = 4 if ai_official_selected else 3
@@ -3632,7 +3811,7 @@ async def process():
                                                 initial_info=info_dict if info_url == homepage else None,
                                                 expected_address=addr,
                                                 return_meta=True,
-                                                allow_slow=bool(need_addr) and bool(
+                                                allow_slow=bool(need_addr or need_rep or need_description) and bool(
                                                     (homepage_official_flag == 1)
                                                     or (chosen_domain_score >= 4)
                                                     or provisional_host_token
@@ -4188,6 +4367,18 @@ async def process():
                         profit_val = ai_normalize_amount(profit_val) or clean_amount_value(profit_val)
                         fiscal_val = clean_fiscal_month(fiscal_val)
                         founded_val = clean_founded_year(founded_val)
+                        homepage = clean_homepage_url(homepage)
+                        if not homepage:
+                            homepage_official_flag = 0
+                            homepage_official_source = ""
+                            homepage_official_score = 0.0
+                        normalized_phone = normalize_phone(phone)
+                        if normalized_phone:
+                            phone = normalized_phone
+                        else:
+                            phone = ""
+                            phone_source = "none"
+                            src_phone = ""
                         if drop_details_by_url:
                             try:
                                 drop_reasons["_by_url"] = {k: drop_details_by_url[k] for k in list(drop_details_by_url.keys())[:3]}
@@ -4287,6 +4478,9 @@ async def process():
                                 provisional_host_token=bool(provisional_host_token),
                                 provisional_name_present=bool(provisional_name_present),
                                 provisional_address_ok=bool(provisional_address_ok),
+                                provisional_ai_hint=bool(provisional_ai_hint),
+                                provisional_profile_hit=bool(provisional_profile_hit),
+                                provisional_evidence_score=int(provisional_evidence_score or 0),
                             )
                             if decision.dropped:
                                 log.info(

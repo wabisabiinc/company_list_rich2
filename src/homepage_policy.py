@@ -23,6 +23,9 @@ def apply_provisional_homepage_policy(
     provisional_host_token: bool,
     provisional_name_present: bool,
     provisional_address_ok: bool,
+    provisional_ai_hint: bool = False,
+    provisional_profile_hit: bool = False,
+    provisional_evidence_score: int = 0,
 ) -> HomepageDecision:
     """
     暫定URL（provisional_*）のうち「弱すぎるものだけ」を homepage から外すための判定。
@@ -61,6 +64,8 @@ def apply_provisional_homepage_policy(
         or (bool(provisional_name_present) and domain_score >= 3)
         or (bool(provisional_address_ok) and domain_score >= 4)
     )
+    if provisional_ai_hint or provisional_profile_hit or int(provisional_evidence_score or 0) >= 8:
+        strong_provisional = True
     if strong_provisional:
         return HomepageDecision(
             homepage=homepage,

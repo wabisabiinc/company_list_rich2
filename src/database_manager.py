@@ -541,6 +541,17 @@ class DatabaseManager:
         )
         self._commit_with_checkpoint()
 
+    def clear_ai_negative_url_flags(self) -> int:
+        try:
+            cur = self.conn.execute(
+                "DELETE FROM url_flags WHERE is_official=0 AND lower(judge_source) LIKE 'ai%'"
+            )
+            self._commit_with_checkpoint()
+            return int(cur.rowcount or 0)
+        except sqlite3.Error:
+            log.warning("clear_ai_negative_url_flags failed", exc_info=True)
+            return 0
+
     # ---------- 並列安全な1件確保 ----------
     def claim_next_company(self, worker_id: str) -> Optional[Dict[str, Any]]:
         """
