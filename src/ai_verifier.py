@@ -440,6 +440,8 @@ class AIVerifier:
             '  "phone_number": string|null,\n'
             '  "address": string|null,\n'
             '  "representative": string|null,\n'
+            '  "representative_valid": true|false|null,\n'
+            '  "representative_invalid_reason": string|null,\n'
             '  "company_facts": {"founded": string|null, "capital": string|null, "employees": string|null, "license": string|null},\n'
             '  "industry": string|null,\n'
             '  "business_tags": string[],\n'
@@ -453,6 +455,8 @@ class AIVerifier:
             "- description は80〜160字、日本語1〜2文、事業内容のみ。根拠が薄い/材料が無い場合は null。\n"
             "- description!=null の場合、description_evidence は必ず2件（URLと短い抜粋）。\n"
             "- evidence は住所/電話/代表者の根拠の短い抜粋（無ければ null）。\n"
+            "- representative_valid は代表者名の妥当性。候補の representative が人名として不自然なら false、判断材料が無ければ null。\n"
+            "- representative_invalid_reason は false のときだけ簡潔に（例: \"looks_like_label\" / \"slogan_fragment\" / \"company_name\" / \"contains_numbers\"）。\n"
             f"# CANDIDATES_JSON\n{snippet}\n"
         )
 
@@ -499,6 +503,19 @@ class AIVerifier:
         addr = _normalize_address(data.get("address"))
         rep = data.get("representative")
         rep = re.sub(r"\s+", " ", str(rep)).strip() if isinstance(rep, str) and rep.strip() else None
+        rep_valid_raw = data.get("representative_valid")
+        rep_valid: Optional[bool]
+        if isinstance(rep_valid_raw, bool):
+            rep_valid = rep_valid_raw
+        elif isinstance(rep_valid_raw, (int, float)):
+            rep_valid = bool(rep_valid_raw)
+        else:
+            rep_valid = None
+        rep_invalid_reason = data.get("representative_invalid_reason")
+        if isinstance(rep_invalid_reason, str):
+            rep_invalid_reason = re.sub(r"\s+", " ", rep_invalid_reason.strip())[:80] or None
+        else:
+            rep_invalid_reason = None
 
         facts_in = data.get("company_facts") if isinstance(data.get("company_facts"), dict) else {}
         def _as_str(v: Any, max_len: int = 80) -> Optional[str]:
@@ -565,6 +582,8 @@ class AIVerifier:
             "phone_number": phone,
             "address": addr,
             "representative": rep,
+            "representative_valid": rep_valid,
+            "representative_invalid_reason": rep_invalid_reason,
             "company_facts": company_facts,
             "industry": industry,
             "business_tags": tags,

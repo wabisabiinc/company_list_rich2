@@ -1354,6 +1354,16 @@ class CompanyScraper:
         text = text.strip()
         if not text:
             return None
+        # 「信頼を」「安心を」等のスローガン断片（助詞付き）を代表者名として誤採用しない
+        if re.search(r"[一-龥]", text) and re.search(r"[ぁ-ん]$", text):
+            if text[-1] in {"を", "へ", "に", "が", "の", "と", "や", "も"}:
+                return None
+        # 日本語名 + ローマ字表記が並記されるケースは、日本語側だけを残す
+        has_jp = bool(re.search(r"[ぁ-んァ-ン一-龥]", text))
+        has_ascii = bool(re.search(r"[A-Za-z]", text))
+        if has_jp and has_ascii:
+            text = re.sub(r"[A-Za-z][A-Za-z .'-]{0,40}", " ", text)
+            text = re.sub(r"\s+", " ", text).strip()
         if len(text) < 2 or len(text) > 40:
             return None
         compact = re.sub(r"[\s\u3000]+", "", text)
@@ -1379,6 +1389,8 @@ class CompanyScraper:
         if text in generic_words or compact in generic_words:
             return None
         if re.search(r"(氏名|お名前|名前|役職|役名|役割|担当|担当者|選任|代表者)", text) or re.search(r"(氏名|お名前|名前|役職|役名|役割|担当|担当者|選任|代表者)", compact):
+            return None
+        if re.search(r"(従業員|社員|職員|スタッフ)(?:数)?", text) or re.search(r"(従業員|社員|職員|スタッフ)(?:数)?", compact):
             return None
         if re.search(r"(概要|会社概要|事業概要|法人概要)", text) or re.search(r"(概要|会社概要|事業概要|法人概要)", compact):
             return None
@@ -4494,6 +4506,10 @@ class CompanyScraper:
             return False
 
         def _field_for_label(label_text: str) -> str | None:
+            # 「代表者あいさつ/代表挨拶」等は人物名のラベルではなく見出しなので除外
+            cleaned, _compact = _normalize_label_text(label_text)
+            if any(term in cleaned for term in ("挨拶", "あいさつ", "メッセージ", "トップメッセージ")):
+                return None
             for field, keywords in TABLE_LABEL_MAP.items():
                 if any(_label_matches(label_text, kw) for kw in keywords):
                     return field
@@ -4959,11 +4975,18 @@ class CompanyScraper:
                 r"(代表取締役社長|代表執行役社長|代表取締役会長|代表取締役|代表理事長|代表理事|代表社員|代表者|代表|社長|会長|CEO)",
                 flags=re.I,
             )
+            greeting_heading_re = re.compile(r"(代表者|代表|社長|会長).{0,8}(?:挨拶|あいさつ|メッセージ|トップメッセージ)", flags=re.I)
             added_roles = 0
             for line in sequential_texts:
                 if not role_kw.search(line):
                     continue
+                # 「代表者あいさつ」等の見出し/メニューは役職行ではないため除外（誤爆で「信頼」等を代表者名にしない）
+                if greeting_heading_re.search(line):
+                    continue
                 stripped = role_kw.sub(" ", line)
+                # 役職行に社名（株式会社〜）が混在する場合、NAME_CHUNK_RE が社名を人名として誤爆しやすいので除外する
+                if re.search(r"(株式会社|有限会社|合同会社|合名会社|合資会社|㈱|（株）|\\(株\\))", stripped):
+                    continue
                 name_match = NAME_CHUNK_RE.search(stripped) or KANA_NAME_RE.search(stripped)
                 if not name_match:
                     continue
@@ -4982,6 +5005,18 @@ class CompanyScraper:
                 return False, ""
             if len(cleaned) > 20 and (not compact or len(compact) > 20):
                 return False, ""
+            # extract_candidates が扱うフィールド以外の「よくあるラベル」も、
+            # ラベル→値の対応付けで値として誤採用しないためにラベル扱いする。
+            # （例: 代表者ラベルの次の行が「従業員数」だった場合に「従業員数」を代表者値として拾わない）
+            extra_label_keywords = (
+                "従業員数",
+                "社員数",
+                "職員数",
+                "人数",
+                "従業員",
+            )
+            if any(_label_matches(cleaned, kw) for kw in extra_label_keywords):
+                return True, cleaned
             for keywords in TABLE_LABEL_MAP.values():
                 if any(_label_matches(cleaned, kw) for kw in keywords):
                     return True, cleaned
@@ -5107,11 +5142,20 @@ class CompanyScraper:
                                 "代表社員": 50,
                                 "代表者": 45,
                                 "代表": 40,
+                                # 役職列挙の区切り（停止用、代表者としては弱い）
+                                "取締役": 20,
                             }
+                            role_tokens = (
+                                "代表取締役社長|代表執行役社長|代表取締役会長|代表取締役|"
+                                "代表理事長|代表理事|代表社員|代表者|代表|社長|会長|CEO|取締役"
+                            )
+                            # 「代表取締役 蓮保 市朗 取締役 小木 康裕」のような列挙で、
+                            # name 側が後続の役職語まで飲み込むのを防ぐ（次の役職語で打ち切る）。
                             role_name_re = re.compile(
-                                r"(代表取締役社長|代表執行役社長|代表取締役会長|代表取締役|代表理事長|代表理事|代表社員|代表者|代表|社長|会長|CEO)"
+                                rf"({role_tokens})"
                                 r"[\s\u3000:：・]{0,4}"
-                                r"([一-龥]{1,3}(?:[・･ \u3000]{0,1}[一-龥]{1,3})+)"
+                                r"([一-龥ぁ-んァ-ン][一-龥ぁ-んァ-ン・･\s\u3000]{0,24}?)"
+                                rf"(?=\s*(?:{role_tokens})|$)"
                             )
                             best: tuple[int, str] | None = None
                             for m in role_name_re.finditer(val):

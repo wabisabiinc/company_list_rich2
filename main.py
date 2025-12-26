@@ -989,7 +989,25 @@ def is_over_deep_limit(total_elapsed: float, homepage: str | None, official_phas
 
 def pick_best_rep(names: list[str], source_url: str | None = None) -> str | None:
     role_keywords = ("代表", "取締役", "社長", "理事長", "会長", "院長", "学長", "園長", "代表社員", "CEO", "COO")
-    blocked = ("スタッフ", "紹介", "求人", "採用", "ニュース", "退任", "就任", "人事", "異動", "お知らせ", "プレス", "取引")
+    blocked = (
+        "スタッフ",
+        "紹介",
+        "求人",
+        "採用",
+        "ニュース",
+        "退任",
+        "就任",
+        "人事",
+        "異動",
+        "お知らせ",
+        "プレス",
+        "取引",
+        # 代表者名として誤爆しやすいラベル類
+        "従業員",
+        "社員数",
+        "職員数",
+        "人数",
+    )
     cta_words = ("こちら", "詳しく", "クリック", "タップ", "link")
     era_words = ("昭和", "平成", "令和", "西暦")
     rep_noise_words = (
@@ -1020,6 +1038,13 @@ def pick_best_rep(names: list[str], source_url: str | None = None) -> str | None
         is_label = "LABEL" in tag_set
         low_role = "LOWROLE" in tag_set
         if not cleaned:
+            continue
+        # 会社名/法人名の混入（例: 2文字程度の漢字や社名語尾）を弾く
+        if re.search(r"(従業員|社員|職員|スタッフ).{0,2}数$", cleaned):
+            continue
+        if cleaned in {"従業員", "従業員数", "社員数", "職員数", "人数"}:
+            continue
+        if re.search(r"(株式会社|有限会社|合同会社|合名会社|合資会社|グループ|ホールディングス)", cleaned):
             continue
         if low_role:
             continue
@@ -4218,18 +4243,59 @@ async def process():
                             except Exception:
                                 pass
 
+                            deep_items: list[dict[str, Any]] = []
                             for url, data in related.items():
                                     text = data.get("text", "") or ""
                                     html_content = data.get("html", "") or ""
                                     try:
-                                        pt = scraper.classify_page_type(url, text=text, html=html_content).get("page_type") or "OTHER"
+                                        pt_info = scraper.classify_page_type(url, text=text, html=html_content) or {}
+                                        pt = pt_info.get("page_type") or "OTHER"
+                                        pt_score = int(pt_info.get("score") or 0)
                                     except Exception:
                                         pt = "OTHER"
+                                        pt_score = 0
                                     page_type_per_url[url] = str(pt)
                                     cc = scraper.extract_candidates(text, html_content, page_type_hint=str(pt))
                                     deep_phone_candidates += len(cc.get("phone_numbers") or [])
                                     deep_address_candidates += len(cc.get("addresses") or [])
                                     deep_rep_candidates += len(cc.get("rep_names") or [])
+                                    present_fields = 0
+                                    present_fields += int(bool(cc.get("addresses")))
+                                    present_fields += int(bool(cc.get("phone_numbers")))
+                                    present_fields += int(bool(cc.get("rep_names")))
+                                    present_fields += int(bool(cc.get("capitals")))
+                                    present_fields += int(bool(cc.get("revenues")))
+                                    present_fields += int(bool(cc.get("profits")))
+                                    present_fields += int(bool(cc.get("fiscal_months")))
+                                    present_fields += int(bool(cc.get("founded_years")))
+                                    deep_items.append(
+                                        {
+                                            "url": url,
+                                            "pt": str(pt),
+                                            "pt_score": pt_score,
+                                            "cc": cc,
+                                            "present_fields": present_fields,
+                                        }
+                                    )
+                            page_type_rank = {
+                                "COMPANY_PROFILE": 0,
+                                "ACCESS_CONTACT": 1,
+                                "BASES_LIST": 2,
+                                "OTHER": 3,
+                                "DIRECTORY_DB": 4,
+                            }
+                            deep_items.sort(
+                                key=lambda item: (
+                                    page_type_rank.get(str(item.get("pt") or "OTHER"), 9),
+                                    -int(item.get("present_fields") or 0),
+                                    -int(item.get("pt_score") or 0),
+                                    0 if _is_profile_like_url(str(item.get("url") or "")) else 1,
+                                )
+                            )
+                            for item in deep_items:
+                                    url = str(item.get("url") or "")
+                                    pt = str(item.get("pt") or "OTHER")
+                                    cc = item.get("cc") or {}
                                     if need_phone and cc.get("phone_numbers"):
                                             cand = pick_best_phone(cc["phone_numbers"])
                                             if cand:
@@ -4535,6 +4601,10 @@ async def process():
                                                 address_ai_evidence = ev.strip()[:200]
                                     if not rep_name_val and isinstance(ai_result.get("representative"), str) and ai_result.get("representative"):
                                         rep_candidate = scraper.clean_rep_name(ai_result.get("representative"))
+                                        if rep_candidate:
+                                            rep_valid = ai_result.get("representative_valid")
+                                            if rep_valid is False:
+                                                rep_candidate = None
                                         if rep_candidate:
                                             src0, raw0, pt0 = _find_src_item(ai_payload.get("candidates", {}).get("representatives") or [], "rep", rep_candidate)
                                             # 代表者は「役職語とのペア」由来（TABLE/LABEL/ROLE/JSONLD）からのみ採用する
