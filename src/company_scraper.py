@@ -5341,7 +5341,8 @@ class CompanyScraper:
                 for rm in REP_RE.finditer(text or ""):
                     cleaned = self.clean_rep_name(rm.group(1))
                     if cleaned and self._looks_like_person_name(cleaned):
-                        reps.append(f"[TEXT]{cleaned}")
+                        # REP_RE は役職語+氏名のペア抽出なので [ROLE] として扱う
+                        reps.append(f"[ROLE]{cleaned}")
                         break
             except Exception:
                 pass

@@ -840,9 +840,10 @@ def _rep_candidate_ok(
     if greeting_like:
         if low_role:
             return False, "low_role_greeting"
-        if strong_source or profile_like:
+        # ただし「役職語とのペア」由来（TABLE/LABEL/ROLE/JSONLD）のみ採用する
+        if strong_source:
             return True, ""
-        return True, ""
+        return False, "greeting_not_paired"
     if page_type == "COMPANY_PROFILE":
         return True, ""
     if page_type == "ACCESS_CONTACT":
@@ -4463,26 +4464,27 @@ async def process():
                                                 break
                                             out = out[m.end():].lstrip()
                                         return out
-                                    def _find_src(cands: list[dict[str, Any]], kind: str, chosen: str) -> str:
+                                    def _find_src_item(cands: list[dict[str, Any]], kind: str, chosen: str) -> tuple[str, str, str]:
                                         if not chosen:
-                                            return ""
+                                            return ("", "", "")
                                         for it in cands or []:
                                             if not isinstance(it, dict):
                                                 continue
                                             raw = it.get("value")
                                             url0 = it.get("url")
+                                            pt0 = it.get("page_type")
                                             if not (isinstance(raw, str) and isinstance(url0, str) and url0):
                                                 continue
                                             raw_val = _strip_tags_for_ai(raw)
                                             if kind == "phone" and (normalize_phone(raw_val) or "") == chosen:
-                                                return url0
+                                                return (url0, raw, str(pt0 or ""))
                                             if kind == "address" and (normalize_address(raw_val) or "") == chosen:
-                                                return url0
+                                                return (url0, raw, str(pt0 or ""))
                                             if kind == "rep":
                                                 cleaned = scraper.clean_rep_name(raw_val) or ""
                                                 if cleaned and cleaned == chosen:
-                                                    return url0
-                                        return ""
+                                                    return (url0, raw, str(pt0 or ""))
+                                        return ("", "", "")
                                     if not description_val and isinstance(ai_result.get("description"), str) and ai_result.get("description"):
                                         description_val = ai_result["description"]
                                         try:
@@ -4493,21 +4495,26 @@ async def process():
                                         phone = normalize_phone(ai_result.get("phone_number")) or ""
                                         if phone:
                                             phone_source = "ai"
-                                            src_phone = _find_src(ai_payload.get("candidates", {}).get("phone_numbers") or [], "phone", phone)
+                                            src_phone, _, _ = _find_src_item(ai_payload.get("candidates", {}).get("phone_numbers") or [], "phone", phone)
                                     if not found_address and isinstance(ai_result.get("address"), str) and ai_result.get("address"):
                                         addr_ai = normalize_address(ai_result.get("address"))
                                         if addr_ai:
                                             found_address = addr_ai
                                             address_source = "ai"
-                                            src_addr = _find_src(ai_payload.get("candidates", {}).get("addresses") or [], "address", found_address)
+                                            src_addr, _, _ = _find_src_item(ai_payload.get("candidates", {}).get("addresses") or [], "address", found_address)
                                             ev = ai_result.get("evidence")
                                             if isinstance(ev, str) and ev.strip():
                                                 address_ai_evidence = ev.strip()[:200]
                                     if not rep_name_val and isinstance(ai_result.get("representative"), str) and ai_result.get("representative"):
                                         rep_candidate = scraper.clean_rep_name(ai_result.get("representative"))
                                         if rep_candidate:
-                                            rep_name_val = rep_candidate
-                                            src_rep = _find_src(ai_payload.get("candidates", {}).get("representatives") or [], "rep", rep_name_val)
+                                            src0, raw0, pt0 = _find_src_item(ai_payload.get("candidates", {}).get("representatives") or [], "rep", rep_candidate)
+                                            # 代表者は「役職語とのペア」由来（TABLE/LABEL/ROLE/JSONLD）からのみ採用する
+                                            paired = bool(isinstance(raw0, str) and re.match(r"^(?:\\[[A-Z_]+\\])+", raw0) and any(tag in raw0 for tag in ("[TABLE]", "[LABEL]", "[ROLE]", "[JSONLD]")))
+                                            url_ok = bool(src0 and (not _is_contact_like_url(src0)) and (_is_profile_like_url(src0) or _is_greeting_like_url(src0) or str(pt0) == "COMPANY_PROFILE"))
+                                            if paired and url_ok:
+                                                rep_name_val = rep_candidate
+                                                src_rep = src0
                                     facts = ai_result.get("company_facts") if isinstance(ai_result.get("company_facts"), dict) else {}
                                     if not founded_val and isinstance(facts.get("founded"), str) and facts.get("founded"):
                                         founded_val = clean_founded_year(facts.get("founded"))
