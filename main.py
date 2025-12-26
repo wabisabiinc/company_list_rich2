@@ -294,12 +294,14 @@ def normalize_address(s: str | None) -> str | None:
             r"\s*(?:"
             r"従業員(?:数)?|社員(?:数)?|職員(?:数)?|スタッフ(?:数)?|人数|"
             r"営業時間|受付時間|定休日|"
-            r"代表者|代表取締役|取締役|社長|会長|理事長|"
+            r"代表者|代表取締役|取締役|社長|会長|理事長|rep(?:\s|$)|rep\s*[:=]?|"
             r"資本金|設立|創業|沿革|"
             r"(?:一般|特定)?(?:貨物|運送|建設|産廃|産業廃棄物|古物)?(?:業)?(?:許可|免許|登録|届出)|"
+            r"ホーム|home|トップ|top|最新情報|お知らせ|ニュース|news|ブログ|blog|"
+            r"会社概要|会社情報|企業情報|会社案内|"
             r"事業内容|サービス|"
             r"お問い合わせ|お問合せ|問い合わせ|採用|求人"
-            r")\b",
+            r")",
             re.IGNORECASE,
         )
         m_tail = tail_re.search(out)
@@ -2925,39 +2927,65 @@ async def process():
                                 or rule_details.get("strong_domain")
                             )
                             if ai_is_official_effective is True:
-                                candidate_url = normalized_url
-                                candidate_source = "ai_fast" if fast_domain_ok else "ai_review"
-                                candidate_score = float(rule_details.get("score") or 0.0)
-                                info = record.get("info")
-                                primary_cands = extracted
-                                homepage = candidate_url
-                                homepage_official_flag = 1
-                                homepage_official_source = candidate_source
-                                homepage_official_score = candidate_score
-                                ai_official_description = ai_judge.get("description") if isinstance(ai_judge, dict) else None
-                                chosen_domain_score = domain_score
-                                selected_candidate_record = record
-                                if not fast_domain_ok or (addr and not address_ok):
+                                # AIの"official"は誤爆もあるため、弱い根拠だけで早期確定しない。
+                                # （総処理時間の上限は変えず、候補の追加fetchも増やさずに、採用条件のみ厳格化する）
+                                ai_strong_accept = bool(
+                                    fast_domain_ok
+                                    and (
+                                        name_hit
+                                        or address_ok
+                                        or evidence_score >= 10
+                                        or ("jsonld:org_name" in official_evidence)
+                                    )
+                                )
+                                if not ai_strong_accept:
                                     force_review = True
-                                manager.upsert_url_flag(
-                                    candidate_url,
-                                    is_official=True,
-                                    source=homepage_official_source,
-                                    reason=ai_judge.get("reason", "") if isinstance(ai_judge, dict) else "",
-                                    confidence=ai_judge.get("confidence") if isinstance(ai_judge, dict) else None,
-                                )
-                                log.info(
-                                    "[%s] AI official selected: %s (source=%s domain=%s host=%s addr=%s phone=%s review=%s)",
-                                    cid,
-                                    candidate_url,
-                                    homepage_official_source,
-                                    domain_score,
-                                    host_token_hit,
-                                    fast_address_ok,
-                                    fast_phone_hit,
-                                    force_review,
-                                )
-                                break
+                                    log.info(
+                                        "[%s] AI official (weak) -> review-only: %s (domain=%s host=%s name=%s addr=%s evidence=%s conf=%.2f)",
+                                        cid,
+                                        normalized_url,
+                                        domain_score,
+                                        host_token_hit,
+                                        name_hit,
+                                        fast_address_ok,
+                                        evidence_score,
+                                        ai_conf_f,
+                                    )
+                                    # ルール評価に回して、より強い候補があればそちらを優先する
+                                else:
+                                    candidate_url = normalized_url
+                                    candidate_source = "ai_fast" if fast_domain_ok else "ai_review"
+                                    candidate_score = float(rule_details.get("score") or 0.0)
+                                    info = record.get("info")
+                                    primary_cands = extracted
+                                    homepage = candidate_url
+                                    homepage_official_flag = 1
+                                    homepage_official_source = candidate_source
+                                    homepage_official_score = candidate_score
+                                    ai_official_description = ai_judge.get("description") if isinstance(ai_judge, dict) else None
+                                    chosen_domain_score = domain_score
+                                    selected_candidate_record = record
+                                    if not fast_domain_ok or (addr and not address_ok):
+                                        force_review = True
+                                    manager.upsert_url_flag(
+                                        candidate_url,
+                                        is_official=True,
+                                        source=homepage_official_source,
+                                        reason=ai_judge.get("reason", "") if isinstance(ai_judge, dict) else "",
+                                        confidence=ai_judge.get("confidence") if isinstance(ai_judge, dict) else None,
+                                    )
+                                    log.info(
+                                        "[%s] AI official selected: %s (source=%s domain=%s host=%s addr=%s phone=%s review=%s)",
+                                        cid,
+                                        candidate_url,
+                                        homepage_official_source,
+                                        domain_score,
+                                        host_token_hit,
+                                        fast_address_ok,
+                                        fast_phone_hit,
+                                        force_review,
+                                    )
+                                    break
 
                             brand_allowed = (allowed_tld or whitelist_host) and not host_token_hit
                             if (

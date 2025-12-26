@@ -537,6 +537,9 @@ class CompanyScraper:
         re.compile(r"/company/\d+(?:/|$)", re.IGNORECASE),
         re.compile(r"/corporations/\d+(?:/|$)", re.IGNORECASE),
         re.compile(r"/detail/\d+(?:/|$)", re.IGNORECASE),
+        # 一部の自治体/CSR系ディレクトリで見られる詳細ページ構造（例: /instance/official-1, /instance/detail.php?id=123）
+        re.compile(r"/instance/(?:detail|company|corporate|official)(?:\\.php)?(?:/|$)", re.IGNORECASE),
+        re.compile(r"/instance/(?:detail|company|corporate|official)[-_]?\d+(?:/|$)", re.IGNORECASE),
         re.compile(r"/(?:directory|listing|db)(?:/|$)", re.IGNORECASE),
         re.compile(r"/search(?:/|$)", re.IGNORECASE),
     )
@@ -544,6 +547,7 @@ class CompanyScraper:
     DIRECTORY_URL_PATTERNS_STRONG = (
         re.compile(r"/(?:companies|company|corp|corporation|detail)/\d+(?:/|$)", re.IGNORECASE),
         re.compile(r"/(?:companies|company|corp|corporation|detail)/\d{13}(?:/|$)", re.IGNORECASE),
+        re.compile(r"/instance/(?:detail|company|corporate|official)[-_]?\d+(?:/|$)", re.IGNORECASE),
         re.compile(r"/corporations/\d+(?:/|$)", re.IGNORECASE),
         re.compile(r"/\d{13}(?:/|$)", re.IGNORECASE),
     )
@@ -1143,12 +1147,14 @@ class CompanyScraper:
             r"\s*(?:"
             r"従業員(?:数)?|社員(?:数)?|職員(?:数)?|スタッフ(?:数)?|人数|"
             r"営業時間|受付時間|定休日|"
-            r"代表者|代表取締役|取締役|社長|会長|理事長|"
+            r"代表者|代表取締役|取締役|社長|会長|理事長|rep(?:\s|$)|rep\s*[:=]?|"
             r"資本金|設立|創業|沿革|"
             r"(?:一般|特定)?(?:貨物|運送|建設|産廃|産業廃棄物|古物)?(?:業)?(?:許可|免許|登録|届出)|"
+            r"ホーム|home|トップ|top|最新情報|お知らせ|ニュース|news|ブログ|blog|"
+            r"会社概要|会社情報|企業情報|会社案内|"
             r"事業内容|サービス|"
             r"お問い合わせ|お問合せ|問い合わせ|採用|求人"
-            r")\b",
+            r")",
             re.IGNORECASE,
         )
         m_tail = tail_re.search(val)
