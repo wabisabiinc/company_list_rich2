@@ -16,14 +16,16 @@ source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 python -m playwright install chromium
-
-## デバッグ（あるのに取れない原因調査）
-必要なら `EXTRACT_DEBUG_JSONL_PATH` を設定すると、各社の抽出/採用/除外理由をJSONLで出力できます。
-- 例: `.env` に `EXTRACT_DEBUG_JSONL_PATH=logs/extract_debug.jsonl`
 ```
 
 この状態で `python main.py` を実行すれば `ModuleNotFoundError: dotenv` のようなエラーは発生しません。
 `playwright install` を省略すると `Executable doesn't exist ... Please run: playwright install` のエラーになります。
+
+## デバッグ（あるのに取れない原因調査）
+
+- `EXTRACT_DEBUG_JSONL_PATH` を設定すると、各社の抽出/採用/除外理由をJSONLで出力できます（例: `.env` に `EXTRACT_DEBUG_JSONL_PATH=logs/extract_debug.jsonl`）
+- `VERIFY_DOCS_REQUIRED`（デフォルト `true`）は、AI公式採用時に「会社概要/連絡先」ページを最小限だけ事前取得して `verify=docs` の精度と速度を上げます
+- `REP_STRICT_SOURCES`（デフォルト `true`）は、代表者名を構造化ソース（table/dl/label/JSON-LD等）中心に制限して誤抽出を減らします
 
 ## 3. VS Code と連携して毎回自動で有効化
 

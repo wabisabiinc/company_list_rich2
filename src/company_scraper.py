@@ -343,6 +343,8 @@ class CompanyScraper:
         "tsukulink.net",
         "korps.jp",
         "korps.co.jp",
+        "24u.jp",
+        "www.24u.jp",
         # プレスリリース/求人系（公式でないことが多い）
         "prtimes.jp", "valuepress.jp", "dreamnews.jp",
         "wantedly.com", "openwork.jp", "en-gage.jp",
@@ -401,6 +403,8 @@ class CompanyScraper:
         "tsukulink.net",
         "korps.jp",
         "korps.co.jp",
+        "24u.jp",
+        "www.24u.jp",
         "houjin.jp",
         "houjin.me",
         "tokubai.co.jp",
@@ -531,6 +535,7 @@ class CompanyScraper:
     DIRECTORY_URL_PATTERNS = (
         re.compile(r"/companies/\d+(?:/|$)", re.IGNORECASE),
         re.compile(r"/company/\d+(?:/|$)", re.IGNORECASE),
+        re.compile(r"/corporations/\d+(?:/|$)", re.IGNORECASE),
         re.compile(r"/detail/\d+(?:/|$)", re.IGNORECASE),
         re.compile(r"/(?:directory|listing|db)(?:/|$)", re.IGNORECASE),
         re.compile(r"/search(?:/|$)", re.IGNORECASE),
@@ -539,6 +544,7 @@ class CompanyScraper:
     DIRECTORY_URL_PATTERNS_STRONG = (
         re.compile(r"/(?:companies|company|corp|corporation|detail)/\d+(?:/|$)", re.IGNORECASE),
         re.compile(r"/(?:companies|company|corp|corporation|detail)/\d{13}(?:/|$)", re.IGNORECASE),
+        re.compile(r"/corporations/\d+(?:/|$)", re.IGNORECASE),
         re.compile(r"/\d{13}(?:/|$)", re.IGNORECASE),
     )
     DIRECTORY_QUERY_ID_KEYS = ("company_id", "companyid", "cid", "id", "detail_id", "detailid")
@@ -1257,7 +1263,7 @@ class CompanyScraper:
     def clean_rep_name(raw: Optional[str]) -> Optional[str]:
         if not raw:
             return None
-        text = str(raw).replace("\u200b", "").strip()
+        text = unicodedata.normalize("NFKC", str(raw).replace("\u200b", "")).strip()
         if not text:
             return None
         cta_words = (
@@ -1269,6 +1275,7 @@ class CompanyScraper:
             "Link",
             "LINK",
         )
+        era_words = ("昭和", "平成", "令和", "西暦")
         news_words = ("退任", "就任", "人事", "異動", "お知らせ", "ニュース", "プレスリリース")
         if any(w in text for w in news_words):
             return None
@@ -1326,6 +1333,13 @@ class CompanyScraper:
             text = text.strip(" 　")
             if text == before:
                 break
+        # 代表者名に数字/年月日表記が混入する誤爆を抑制（例:「昭和34年10月」等）
+        if any(w in text for w in era_words):
+            return None
+        if re.search(r"\d", text) and re.search(r"(年|月|日)", text):
+            return None
+        if re.search(r"\d", text):
+            return None
         if text.endswith(("氏", "様")):
             text = text[:-1]
         text = re.sub(r"(と申します|といたします|になります|させていただきます|いたします|いたしました)$", "", text)
@@ -1399,6 +1413,8 @@ class CompanyScraper:
         lower_text = text.lower()
         compact = re.sub(r"[\s\u3000]+", "", text)
         lower_compact = compact.lower()
+        if "message" in lower_text or "message" in lower_compact:
+            return None
         if (
             text in REP_NAME_EXACT_BLOCKLIST
             or lower_text in REP_NAME_EXACT_BLOCKLIST_LOWER
@@ -3871,6 +3887,10 @@ class CompanyScraper:
                 score += 30
             if "address" in focus and any(seg in path_lower for seg in ("/access", "/map", "/location", "/head-office", "/headquarters")):
                 score += 30
+            if "rep" in focus and any(seg in path_lower for seg in ("/message", "/greeting", "/president", "/ceo", "/executive", "/leadership", "/management")):
+                score += 30
+            if "rep" in focus and any(w in anchor_text for w in ("メッセージ", "代表挨拶", "ごあいさつ", "ご挨拶", "トップメッセージ")):
+                score += 30
 
             if score > 0:
                 path_depth = max(parsed.path.count("/"), 1)
@@ -4628,18 +4648,22 @@ class CompanyScraper:
                 # フッター/隅の情報に住所だけが載っているケース対策:
                 # table/dl のラベル抽出に乗らない住所を <footer>/<address> 等から拾う
                 try:
-                    extra_blobs: list[str] = []
+                    extra_blobs: list[tuple[str, str]] = []
                     # header/footer は本文ノイズになりやすいので text には落とさないが、
                     # 代表電話や所在地がここにしか出ないサイトが多いため、候補抽出では参照する
                     for node in soup.find_all(["address", "footer", "header"]):
                         txt = node.get_text(separator=" ", strip=True)
                         if txt:
-                            extra_blobs.append(txt)
+                            try:
+                                tag = (node.name or "").strip().upper() or "FOOTER"
+                            except Exception:
+                                tag = "FOOTER"
+                            extra_blobs.append((tag, txt))
                     for role in ("contentinfo", "banner"):
                         for node in soup.find_all(attrs={"role": role}):
                             txt = node.get_text(separator=" ", strip=True)
                             if txt:
-                                extra_blobs.append(txt)
+                                extra_blobs.append(("FOOTER" if role == "contentinfo" else "HEADER", txt))
                     # microdata (itemprop) のPostalAddress断片も拾う
                     parts: list[str] = []
                     for prop in ("postalCode", "addressRegion", "addressLocality", "streetAddress"):
@@ -4648,7 +4672,7 @@ class CompanyScraper:
                             if txt:
                                 parts.append(txt)
                     if parts:
-                        extra_blobs.append(" ".join(parts))
+                        extra_blobs.append(("MICRODATA", " ".join(parts)))
 
                     # tel: リンクは本文から落ちやすいので、href からも拾う
                     try:
@@ -4674,11 +4698,11 @@ class CompanyScraper:
                                 for p in PHONE_RE.finditer(val):
                                     cand = _normalize_phone_strict(p.group(0))
                                     if cand:
-                                        phones.append(cand)
+                                        phones.append(f"[ATTR]{cand}")
                     except Exception:
                         pass
 
-                    for blob in extra_blobs:
+                    for blob_tag, blob in extra_blobs:
                         for p in PHONE_RE.finditer(blob or ""):
                             cand = _normalize_phone_strict(p.group(0))
                             if not cand:
@@ -4687,9 +4711,9 @@ class CompanyScraper:
                             fax_hint = bool(re.search(r"(FAX|Fax|fax|ファックス|ﾌｧｯｸｽ|ＦＡＸ)", ctx))
                             tel_hint = bool(re.search(r"(TEL|Tel|tel|電話)", ctx))
                             if fax_hint and not tel_hint:
-                                phones.append(f"[FAX]{cand}")
+                                phones.append(f"[{blob_tag}][FAX]{cand}")
                             else:
-                                phones.append(cand)
+                                phones.append(f"[{blob_tag}]{cand}")
                         for zm in ZIP_RE.finditer(blob or ""):
                             zip_code = f"〒{zm.group(1).replace('〒', '').strip()}-{zm.group(2)}"
                             cursor = zm.end()
@@ -4707,11 +4731,11 @@ class CompanyScraper:
                                 if seg:
                                     norm_addr = self._normalize_address_candidate(f"{zip_code} {seg}")
                                     if norm_addr and self._looks_like_full_address(norm_addr):
-                                        addrs.append(f"[FOOTER]{norm_addr}")
+                                        addrs.append(f"[{blob_tag}]{norm_addr}")
                         for cand in ADDR_FALLBACK_RE.findall(blob or ""):
                             norm = self._normalize_address_candidate(cand)
                             if norm and self._looks_like_full_address(norm):
-                                addrs.append(f"[FOOTER]{norm}")
+                                addrs.append(f"[{blob_tag}]{norm}")
                 except Exception:
                     pass
                 for table in soup.find_all("table"):

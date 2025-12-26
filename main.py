@@ -578,7 +578,7 @@ def pick_best_address(expected_addr: str | None, candidates: list[str]) -> str |
                 break
             tags.append(m.group(1))
             rest = rest[m.end():].lstrip()
-        source = next((t for t in tags if t in {"JSONLD", "TABLE", "LABEL", "FOOTER", "TEXT"}), "OTHER")
+        source = next((t for t in tags if t in {"JSONLD", "MICRODATA", "TABLE", "LABEL", "HEADER", "FOOTER", "TEXT"}), "OTHER")
         is_hq = "HQ" in tags or "HEADQUARTERS" in tags
         # remove any remaining bracket tags that might slip through
         rest = re.sub(r"^\[[A-Z_]+\]\s*", "", rest)
@@ -586,9 +586,11 @@ def pick_best_address(expected_addr: str | None, candidates: list[str]) -> str |
 
     source_bonus = {
         "JSONLD": 6.0,
+        "MICRODATA": 6.0,
         "TABLE": 5.0,
         "LABEL": 4.0,
-        "FOOTER": 3.0,
+        "FOOTER": 2.0,
+        "HEADER": 1.0,
         "TEXT": 0.0,
         "OTHER": 0.0,
     }
@@ -601,6 +603,14 @@ def pick_best_address(expected_addr: str | None, candidates: list[str]) -> str |
             normalized_candidates.append((norm, source, is_hq))
     if not normalized_candidates:
         return None
+
+    # TABLE/LABEL/JSONLD 等がある場合は HEADER/FOOTER 由来のノイズを避ける（値の誤格納を減らす）
+    has_structured = any(src in {"JSONLD", "MICRODATA", "TABLE", "LABEL"} for _, src, _ in normalized_candidates)
+    if has_structured:
+        structured_only = [(n, s, hq) for (n, s, hq) in normalized_candidates if s not in {"HEADER", "FOOTER"}]
+        if structured_only:
+            normalized_candidates = structured_only
+
     # dedupe while keeping the best source bonus for the same normalized address
     best_by_norm: dict[str, tuple[str, bool]] = {}
     for norm, src, is_hq in normalized_candidates:
@@ -785,6 +795,24 @@ def _is_profile_like_url(url: str | None) -> bool:
         return False
     return any(seg in path for seg in ("/company", "/about", "/corporate", "/profile", "/overview", "/summary", "/gaiyo", "/gaiyou"))
 
+def _is_contact_like_url(url: str | None) -> bool:
+    if not url:
+        return False
+    try:
+        path = urlparse(url).path.lower()
+    except Exception:
+        return False
+    return any(seg in path for seg in ("/contact", "/contactus", "/inquiry", "/toiawase", "/otoiawase", "/support", "/form"))
+
+def _is_greeting_like_url(url: str | None) -> bool:
+    if not url:
+        return False
+    try:
+        path = urlparse(url).path.lower()
+    except Exception:
+        return False
+    return any(seg in path for seg in ("/message", "/greeting", "/aisatsu", "/goaisatsu", "/president", "/topmessage", "/ceo"))
+
 def _rep_candidate_ok(
     chosen: str | None,
     candidates: list[str],
@@ -793,9 +821,13 @@ def _rep_candidate_ok(
 ) -> tuple[bool, str]:
     if not chosen:
         return False, "no_rep"
+    # 代表者名は contact 系ページからは採用しない（誤取得/誤格納を避ける）
+    if _is_contact_like_url(source_url):
+        return False, "contact_like_url"
     meta = _rep_candidate_meta(candidates, chosen)
     low_role = meta.get("low_role", False)
     profile_like = _is_profile_like_url(source_url)
+    greeting_like = _is_greeting_like_url(source_url)
     strong_source = (
         meta.get("table", False)
         or meta.get("label", False)
@@ -804,14 +836,17 @@ def _rep_candidate_ok(
     )
     if low_role:
         return False, "low_role"
+    # 挨拶/メッセージ系ページは page_type が OTHER でも採用を許可する
+    if greeting_like:
+        if low_role:
+            return False, "low_role_greeting"
+        if strong_source or profile_like:
+            return True, ""
+        return True, ""
     if page_type == "COMPANY_PROFILE":
         return True, ""
     if page_type == "ACCESS_CONTACT":
-        if low_role:
-            return False, "low_role_contact"
-        if profile_like or strong_source:
-            return True, ""
-        return False, "contact_not_profile"
+        return False, "contact_forbidden"
     if page_type == "BASES_LIST":
         if low_role:
             return False, "low_role_bases"
@@ -845,9 +880,30 @@ def pick_best_phone(candidates: list[str]) -> str | None:
         "JSONLD": 5.0,
         "LABEL": 4.0,
         "TEL": 3.5,
-        "FOOTER": 2.0,
+        "FOOTER": 1.5,
+        "HEADER": 1.0,
+        "ATTR": 0.5,
         "TEXT": 0.0,
     }
+
+    # TABLE/LABEL/JSONLD/TELHREF がある場合は HEADER/FOOTER/ATTR 由来を避ける
+    try:
+        tag_sets = []
+        for cand in candidates or []:
+            tags, _ = _split_tags(str(cand))
+            tag_sets.append(tags)
+        has_structured = any(bool(t & {"TELHREF", "TABLE", "JSONLD", "LABEL"}) for t in tag_sets)
+        if has_structured:
+            filtered: list[str] = []
+            for cand in candidates or []:
+                tags, _ = _split_tags(str(cand))
+                if tags & {"FOOTER", "HEADER", "ATTR"}:
+                    continue
+                filtered.append(str(cand))
+            if filtered:
+                candidates = filtered
+    except Exception:
+        pass
 
     best: str | None = None
     best_score = float("-inf")
@@ -932,6 +988,7 @@ def pick_best_rep(names: list[str], source_url: str | None = None) -> str | None
     role_keywords = ("代表", "取締役", "社長", "理事長", "会長", "院長", "学長", "園長", "代表社員", "CEO", "COO")
     blocked = ("スタッフ", "紹介", "求人", "採用", "ニュース", "退任", "就任", "人事", "異動", "お知らせ", "プレス", "取引")
     cta_words = ("こちら", "詳しく", "クリック", "タップ", "link")
+    era_words = ("昭和", "平成", "令和", "西暦")
     rep_noise_words = (
         "社是",
         "社訓",
@@ -965,6 +1022,12 @@ def pick_best_rep(names: list[str], source_url: str | None = None) -> str | None
             continue
         lower_cleaned = cleaned.lower()
         if any(w in cleaned for w in cta_words) or any(w in lower_cleaned for w in cta_words):
+            continue
+        if any(w in cleaned for w in era_words):
+            continue
+        if re.search(r"\\d", cleaned) and re.search(r"(年|月|日)", cleaned):
+            continue
+        if re.search(r"\\d", cleaned):
             continue
         has_hiragana = bool(re.search(r"[\u3041-\u3096]", cleaned))
         has_kanji = bool(re.search(r"[\u4E00-\u9FFF]", cleaned))
