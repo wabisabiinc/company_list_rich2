@@ -783,7 +783,7 @@ def _is_profile_like_url(url: str | None) -> bool:
         path = urlparse(url).path.lower()
     except Exception:
         return False
-    return any(seg in path for seg in ("/company", "/about", "/corporate", "/profile", "/overview", "/gaiyo", "/gaiyou"))
+    return any(seg in path for seg in ("/company", "/about", "/corporate", "/profile", "/overview", "/summary", "/gaiyo", "/gaiyou"))
 
 def _rep_candidate_ok(
     chosen: str | None,
@@ -931,6 +931,7 @@ def is_over_deep_limit(total_elapsed: float, homepage: str | None, official_phas
 def pick_best_rep(names: list[str], source_url: str | None = None) -> str | None:
     role_keywords = ("代表", "取締役", "社長", "理事長", "会長", "院長", "学長", "園長", "代表社員", "CEO", "COO")
     blocked = ("スタッフ", "紹介", "求人", "採用", "ニュース", "退任", "就任", "人事", "異動", "お知らせ", "プレス", "取引")
+    cta_words = ("こちら", "詳しく", "クリック", "タップ", "link")
     rep_noise_words = (
         "社是",
         "社訓",
@@ -961,6 +962,9 @@ def pick_best_rep(names: list[str], source_url: str | None = None) -> str | None
         if not cleaned:
             continue
         if low_role:
+            continue
+        lower_cleaned = cleaned.lower()
+        if any(w in cleaned for w in cta_words) or any(w in lower_cleaned for w in cta_words):
             continue
         has_hiragana = bool(re.search(r"[\u3041-\u3096]", cleaned))
         has_kanji = bool(re.search(r"[\u4E00-\u9FFF]", cleaned))
@@ -1867,11 +1871,12 @@ async def process():
                         company["deep_skip_reason"] = f"{reason or 'timeout'}:{timeout_stage}".strip(":")
                     # 正規化（軽量）だけ実施して保存する
                     normalized_found_address = normalize_address(found_address) if found_address else ""
+                    cleaned_rep = scraper.clean_rep_name(rep_name_val) or ""
                     company.update({
                         "homepage": homepage or "",
                         "phone": phone or "",
                         "found_address": normalized_found_address,
-                        "rep_name": rep_name_val or "",
+                        "rep_name": cleaned_rep,
                         "description": description_val or "",
                         "listing": listing_val or "",
                         "revenue": revenue_val or "",
@@ -1950,6 +1955,7 @@ async def process():
                         },
                     )
                     normalized_found_address = normalize_address(found_address) if found_address else ""
+                    cleaned_rep = scraper.clean_rep_name(rep_name_val) or ""
                     try:
                         _exclude = exclude_reasons  # type: ignore[name-defined]
                     except Exception:
@@ -1963,7 +1969,7 @@ async def process():
                             "homepage": "",
                             "phone": phone or "",
                             "found_address": normalized_found_address,
-                            "rep_name": rep_name_val or "",
+                            "rep_name": cleaned_rep,
                             "description": description_val or "",
                             "listing": listing_val or "",
                             "revenue": revenue_val or "",
@@ -2033,7 +2039,7 @@ async def process():
                             "homepage": "",
                             "phone": "",
                             "found_address": "",
-                            "rep_name": company.get("rep_name", "") or "",
+                            "rep_name": scraper.clean_rep_name(company.get("rep_name")) or "",
                             "description": company.get("description", "") or "",
                             "listing": company.get("listing", "") or "",
                             "revenue": company.get("revenue", "") or "",
@@ -2360,7 +2366,7 @@ async def process():
                             "homepage": "",
                             "phone": "",
                             "found_address": "",
-                            "rep_name": company.get("rep_name", "") or "",
+                            "rep_name": scraper.clean_rep_name(company.get("rep_name")) or "",
                             "description": company.get("description", "") or "",
                             "listing": company.get("listing", "") or "",
                             "revenue": company.get("revenue", "") or "",
@@ -3425,6 +3431,7 @@ async def process():
                     page_type_per_url: dict[str, str] = {}
                     drop_reasons: dict[str, str] = {}
                     drop_details_by_url: dict[str, dict[str, str]] = {}
+                    candidates_brief_by_url: dict[str, dict[str, Any]] = {}
                     ai_official_selected = bool(
                         homepage
                         and homepage_official_flag == 1
@@ -3454,6 +3461,15 @@ async def process():
                         page_type_per_url[url] = str(pt)
 
                         cc = scraper.extract_candidates(text_val, html_val, page_type_hint=str(pt))
+                        try:
+                            candidates_brief_by_url[url] = {
+                                "page_type": str(pt),
+                                "phone_numbers": list(cc.get("phone_numbers") or [])[:3],
+                                "addresses": list(cc.get("addresses") or [])[:3],
+                                "rep_names": list(cc.get("rep_names") or [])[:3],
+                            }
+                        except Exception:
+                            pass
                         if cc.get("phone_numbers"):
                             cand = pick_best_phone(cc["phone_numbers"])
                             if cand and not rule_phone:
@@ -3653,6 +3669,10 @@ async def process():
                                     or need_fiscal
                                 )
                             )
+                            # verify=docs は、同一サイト内の「会社概要/連絡先」ページを優先取得できると精度と速度が上がる。
+                            # 既に priority_docs がある場合は追加fetchしない。
+                            verify_docs_required = (os.getenv("VERIFY_DOCS_REQUIRED", "true") or "true").strip().lower() == "true"
+                            want_docs_for_verify = bool(deep_allowed and verify_docs_required and not should_fetch_priority and not priority_docs)
                             allow_slow_priority = bool(
                                 missing_contact > 0
                                 or need_rep
@@ -3665,14 +3685,18 @@ async def process():
                                     scraper.fetch_priority_documents(
                                         homepage,
                                         info_dict.get("html", ""),
-                                        max_links=3 if should_fetch_priority else 0,
-                                        concurrency=FETCH_CONCURRENCY,
-                                        target_types=["about", "contact", "finance"] if should_fetch_priority else None,
-                                        allow_slow=allow_slow_priority,
+                                        max_links=(3 if should_fetch_priority else (2 if want_docs_for_verify else 0)),
+                                        concurrency=(FETCH_CONCURRENCY if should_fetch_priority else 2),
+                                        target_types=(["about", "contact", "finance"] if should_fetch_priority else (["about", "contact"] if want_docs_for_verify else None)),
+                                        allow_slow=(allow_slow_priority if should_fetch_priority else False),
                                         exclude_urls=set(priority_docs.keys()) if priority_docs else None,
                                     ),
-                                    timeout=bulk_timeout(PAGE_FETCH_TIMEOUT_SEC, 3, slow=allow_slow_priority),
-                                ) if should_fetch_priority else {}
+                                    timeout=bulk_timeout(
+                                        PAGE_FETCH_TIMEOUT_SEC,
+                                        3 if should_fetch_priority else 2,
+                                        slow=(allow_slow_priority if should_fetch_priority else False),
+                                    ),
+                                ) if (should_fetch_priority or want_docs_for_verify) else {}
                             except Exception:
                                 early_priority_docs = {}
                             for url, pdata in early_priority_docs.items():
@@ -3954,6 +3978,37 @@ async def process():
                                         profile_urls.append(u)
                             except Exception:
                                 pass
+                            # プロフィールページが未到達でも、トップ/公式ページ内に導線がある場合があるため、
+                            # 「会社概要系リンク」を最小限だけ追加fetchして起点を見つける（時間/誤取得リスクを抑える）。
+                            if not profile_urls and info_url and (not timed_out):
+                                try:
+                                    if over_time_limit() or over_deep_limit() or over_hard_deadline() or over_deep_phase_deadline():
+                                        timed_out = True
+                                    else:
+                                        base_html = (info_dict or {}).get("html", "") if isinstance(info_dict, dict) else ""
+                                        exclude_urls = set((page_type_per_url or {}).keys())
+                                        discovered = await asyncio.wait_for(
+                                            scraper.fetch_priority_documents(
+                                                info_url,
+                                                base_html=base_html,
+                                                max_links=2,
+                                                concurrency=2,
+                                                target_types=["about"],
+                                                allow_slow=False,
+                                                exclude_urls=exclude_urls,
+                                            ),
+                                            timeout=bulk_timeout(6.0, count=2),
+                                        )
+                                        for u, pdata in (discovered or {}).items():
+                                            absorb_doc_data(u, pdata)
+                                        profile_urls = [
+                                            u for u, pt in (page_type_per_url or {}).items() if str(pt) == "COMPANY_PROFILE"
+                                        ]
+                                except asyncio.TimeoutError:
+                                    pass
+                                except Exception:
+                                    log.debug("[%s] profile discovery skipped", cid, exc_info=True)
+
                             if not profile_urls:
                                 deep_skip_reason = "no_profile_page"
                                 related = {}
@@ -3961,7 +4016,7 @@ async def process():
                             else:
                                 profile_urls.sort(
                                     key=lambda u: (
-                                        0 if any(seg in (u or "").lower() for seg in ("/company", "/about", "/corporate", "/profile", "/overview", "/outline")) else 1,
+                                        0 if any(seg in (u or "").lower() for seg in ("/company", "/about", "/corporate", "/profile", "/overview", "/summary", "/outline")) else 1,
                                         len(u or ""),
                                         u,
                                     )
@@ -4517,7 +4572,7 @@ async def process():
                             log.info("[%s] 公式サイト候補を判別できず -> 未保存", cid)
                         else:
                             log.info("[%s] 有効なホームページ候補なし。", cid)
-                        company["rep_name"] = company.get("rep_name", "") or ""
+                        company["rep_name"] = scraper.clean_rep_name(company.get("rep_name")) or ""
                         company["description"] = company.get("description", "") or ""
                         confidence = 0.4
 
@@ -4914,6 +4969,7 @@ async def process():
                                     "rep_name": rep_name_val,
                                     "source_url_rep": src_rep,
                                     "page_type_per_url": page_type_per_url,
+                                    "candidates_brief_by_url": {k: candidates_brief_by_url[k] for k in list(candidates_brief_by_url.keys())[:8]},
                                     "deep": {
                                         "pages_visited": int(deep_pages_visited or 0),
                                         "fetch_count": int(deep_fetch_count or 0),

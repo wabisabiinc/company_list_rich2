@@ -35,6 +35,7 @@ PROFILE_PRIORITY_PATHS: list[str] = [
     "/corporate",
     "/profile",
     "/overview",
+    "/summary",
     "/outline",
     "/会社概要",
     "/企業情報",
@@ -96,7 +97,7 @@ PRIORITY_SECTION_KEYWORDS = (
     "contact", "contacts", "inquiry", "support", "contact-us",
     "会社概要", "会社案内", "法人案内", "法人概要", "企業情報", "企業概要",
     "団体概要", "施設案内", "園紹介", "学校案内", "沿革", "会社情報",
-    "corporate", "about", "profile", "overview", "information", "access",
+    "corporate", "about", "profile", "overview", "summary", "information", "access",
     "お問い合わせ", "連絡先", "アクセス", "窓口", "役員",
     "代表", "代表者", "代表取締役", "社長", "CEO", "ceo", "代表挨拶", "トップメッセージ", "メッセージ", "役員紹介",
 )
@@ -151,7 +152,10 @@ REP_NAME_SUBSTR_BLOCKLIST = (
 )
 REP_NAME_EXACT_BLOCKLIST_LOWER = {s.lower() for s in REP_NAME_EXACT_BLOCKLIST}
 NAME_CHUNK_RE = re.compile(r"[\u4E00-\u9FFF]{1,3}(?:[??\s]{0,1}[\u4E00-\u9FFF]{1,3})+")
-KANA_NAME_RE = re.compile(r"[\u3041-\u3096\u30A1-\u30FA\u30FC]{2,}(?:[\u3041-\u3096\u30A1-\u30FA\u30FC\s][\u3041-\u3096\u30A1-\u30FA\u30FC]{2,})+")
+KANA_NAME_RE = re.compile(
+    r"[\u3041-\u3096\u30A1-\u30FA\u30FC\u30FB]{2,}"
+    r"(?:[\u3041-\u3096\u30A1-\u30FA\u30FC\u30FB\s][\u3041-\u3096\u30A1-\u30FA\u30FC\u30FB]{2,})+"
+)
 REP_BUSINESS_TERMS = (
     "事業",
     "経営",
@@ -336,6 +340,9 @@ class CompanyScraper:
         "nikkei.com",
         "kaisharesearch.com",
         "kensetsumap.com",
+        "tsukulink.net",
+        "korps.jp",
+        "korps.co.jp",
         # プレスリリース/求人系（公式でないことが多い）
         "prtimes.jp", "valuepress.jp", "dreamnews.jp",
         "wantedly.com", "openwork.jp", "en-gage.jp",
@@ -391,6 +398,9 @@ class CompanyScraper:
         "ja.wikipedia.org",
         "kensetumap.com",
         "kaisharesearch.com",
+        "tsukulink.net",
+        "korps.jp",
+        "korps.co.jp",
         "houjin.jp",
         "houjin.me",
         "tokubai.co.jp",
@@ -1205,7 +1215,10 @@ class CompanyScraper:
             return False
         if re.search(r"[0-9@]", name):
             return False
-        return bool(NAME_CHUNK_RE.search(name) or KANA_NAME_RE.search(name))
+        cleaned = CompanyScraper.clean_rep_name(name)
+        if not cleaned:
+            return False
+        return bool(NAME_CHUNK_RE.search(cleaned) or KANA_NAME_RE.search(cleaned))
 
     @staticmethod
     def _looks_like_full_address(text: str) -> bool:
@@ -1247,6 +1260,15 @@ class CompanyScraper:
         text = str(raw).replace("\u200b", "").strip()
         if not text:
             return None
+        cta_words = (
+            "こちら",
+            "詳しく",
+            "クリック",
+            "タップ",
+            "link",
+            "Link",
+            "LINK",
+        )
         news_words = ("退任", "就任", "人事", "異動", "お知らせ", "ニュース", "プレスリリース")
         if any(w in text for w in news_words):
             return None
@@ -1312,14 +1334,9 @@ class CompanyScraper:
         text = text.strip()
         if not text:
             return None
-        compact = re.sub(r"[\s\u3000]+", "", text)
-        kana_only = bool(re.fullmatch(r"[ぁ-んァ-ンー・･\s]+", text))
-        if kana_only and KANA_NAME_RE.search(text):
-            text = re.sub(r"\s+", " ", text).strip()
-            if 2 <= len(text) <= 40:
-                return text
         if len(text) < 2 or len(text) > 40:
             return None
+        compact = re.sub(r"[\s\u3000]+", "", text)
         generic_words = {
             "氏名",
             "お名前",
@@ -1346,6 +1363,10 @@ class CompanyScraper:
         if re.search(r"(概要|会社概要|事業概要|法人概要)", text) or re.search(r"(概要|会社概要|事業概要|法人概要)", compact):
             return None
         if any(word in text for word in ("株式会社", "有限会社", "合名会社", "合資会社", "合同会社")) or any(word in compact for word in ("株式会社", "有限会社", "合名会社", "合資会社", "合同会社")):
+            return None
+        if any(w in text for w in cta_words) or any(w in compact for w in cta_words):
+            return None
+        if re.search(r"(?:こちら|詳しく).{0,8}(?:へ|を|から)$", text) or re.search(r"(?:こちら|詳しく).{0,8}(?:へ|を|から)$", compact):
             return None
         for stop in (
             "創業", "創立", "創設", "メッセージ", "ご挨拶", "からの", "決裁",
@@ -3730,10 +3751,10 @@ class CompanyScraper:
         "address": {
             "anchor": (
                 "所在地", "本社", "本店", "アクセス", "地図", "map",
-                "会社概要", "会社案内", "会社情報", "企業情報", "法人概要", "corporate", "about", "profile", "overview",
+                "会社概要", "会社案内", "会社情報", "企業情報", "法人概要", "corporate", "about", "profile", "overview", "summary",
             ),
             "path": (
-                "/access", "/map", "/company", "/about", "/corporate", "/profile", "/overview", "/gaiyo", "/gaiyou",
+                "/access", "/map", "/company", "/about", "/corporate", "/profile", "/overview", "/summary", "/gaiyo", "/gaiyou",
             ),
         },
         "rep": {
@@ -3743,7 +3764,7 @@ class CompanyScraper:
                 "会社概要", "会社案内", "会社情報", "企業情報", "法人概要", "profile", "corporate",
             ),
             "path": (
-                "/company", "/about", "/profile", "/corporate", "/overview",
+                "/company", "/about", "/profile", "/corporate", "/overview", "/summary",
                 "/message", "/greeting", "/president", "/ceo", "/executive", "/leadership", "/management",
             ),
         },
@@ -3759,10 +3780,10 @@ class CompanyScraper:
         "profile": {
             "anchor": (
                 "会社概要", "会社案内", "企業情報", "法人概要", "事業紹介", "about", "profile", "corporate", "沿革",
-                "組織図", "会社案内", "overview", "company"
+                "組織図", "会社案内", "overview", "summary", "company"
             ),
             "path": (
-                "/company", "/about", "/profile", "/corporate", "/overview", "/gaiyo", "/gaiyou"
+                "/company", "/about", "/profile", "/corporate", "/overview", "/summary", "/gaiyo", "/gaiyou"
             ),
         },
     }
@@ -3902,7 +3923,7 @@ class CompanyScraper:
             # 会社概要導線は deep の最優先（URL文字列に頼らず、リンクテキスト/タイトルも重視）
             profile_text_keywords = (
                 "会社概要", "会社情報", "企業情報", "企業概要", "会社案内", "法人概要", "概要",
-                "profile", "outline", "overview", "company profile", "corporate profile",
+                "profile", "outline", "overview", "summary", "company profile", "corporate profile",
             )
             token_low = token.lower()
             profile_hit = any(kw.lower() in token_low for kw in profile_text_keywords)
@@ -3953,7 +3974,7 @@ class CompanyScraper:
         except Exception:
             return False
         allow_segments = (
-            "/company", "/about", "/profile", "/overview", "/outline", "/corporate",
+            "/company", "/about", "/profile", "/overview", "/summary", "/outline", "/corporate",
             "/contact", "/contactus", "/inquiry", "/toiawase", "/access", "/form",
             "/companyinfo", "/info",
         )
@@ -3981,11 +4002,13 @@ class CompanyScraper:
                 "/about",
                 "/profile",
                 "/overview",
+                "/summary",
                 "/outline",
                 "/corporate",
                 "/company/outline",
                 "/company/profile",
                 "/company/overview",
+                "/company/summary",
                 "/company.html",
                 "/about.html",
                 "/company.php",
