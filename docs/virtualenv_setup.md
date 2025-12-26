@@ -16,6 +16,10 @@ source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
 python -m playwright install chromium
+
+## デバッグ（あるのに取れない原因調査）
+必要なら `EXTRACT_DEBUG_JSONL_PATH` を設定すると、各社の抽出/採用/除外理由をJSONLで出力できます。
+- 例: `.env` に `EXTRACT_DEBUG_JSONL_PATH=logs/extract_debug.jsonl`
 ```
 
 この状態で `python main.py` を実行すれば `ModuleNotFoundError: dotenv` のようなエラーは発生しません。

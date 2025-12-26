@@ -149,6 +149,7 @@ CSV_FIELDNAMES = [
 ]
 PHASE_METRICS_PATH = os.getenv("PHASE_METRICS_PATH", "logs/phase_metrics.csv")
 NO_OFFICIAL_LOG_PATH = os.getenv("NO_OFFICIAL_LOG_PATH", "logs/no_official.jsonl")
+EXTRACT_DEBUG_JSONL_PATH = os.getenv("EXTRACT_DEBUG_JSONL_PATH", "")
 
 REFERENCE_CHECKER: ReferenceChecker | None = None
 if REFERENCE_CSVS:
@@ -236,11 +237,15 @@ def normalize_phone(s: str | None) -> str | None:
     # 国内番号は0始まりで10〜11桁のみ許容
     if not digits.startswith("0") or len(digits) not in (10, 11):
         return None
-    m = re.search(r"^(0\d{1,4})(\d{2,4})(\d{3,4})$", digits)
-    if m:
-        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
-    m2 = re.search(r"^(0\d{1,4})-?(\d{2,4})-?(\d{3,4})$", s)
-    return f"{m2.group(1)}-{m2.group(2)}-{m2.group(3)}" if m2 else None
+    # digits-only は可変長の市外局番のせいで誤分割しやすいので、代表的な形を優先する
+    if len(digits) == 10:
+        if digits.startswith(("03", "06")):
+            return f"{digits[:2]}-{digits[2:6]}-{digits[6:]}"
+        if digits.startswith(("0120", "0570")):
+            return f"{digits[:4]}-{digits[4:7]}-{digits[7:]}"
+        return f"{digits[:3]}-{digits[3:6]}-{digits[6:]}"
+    # 11桁（携帯/050等）は 3-4-4 を基本にする
+    return f"{digits[:3]}-{digits[3:7]}-{digits[7:]}"
 
 def clean_homepage_url(url: str | None) -> str:
     if not url:
@@ -269,6 +274,10 @@ def normalize_address(s: str | None) -> str | None:
     if not s:
         return None
     if looks_mojibake(s):
+        return None
+    # Wix等の埋め込みJSON断片（postalCode等）を住所として誤採用しない
+    s_str = str(s)
+    if re.search(r"\"[A-Za-z0-9_]{2,}\"\s*:", s_str) and (s_str.count('":') >= 2 or "{" in s_str or "}" in s_str):
         return None
     def _strip_address_label(text: str) -> str:
         out = text.strip()
@@ -695,6 +704,21 @@ def _has_hq_tag_for_address(candidates: list[str], target_norm: str) -> bool:
                 return True
     return False
 
+def _has_strong_tag_for_address(candidates: list[str], target_norm: str) -> bool:
+    """
+    住所候補に [TABLE]/[LABEL]/[JSONLD] など強い構造タグが付いているか。
+    """
+    for raw in candidates:
+        if not isinstance(raw, str):
+            continue
+        tag_ok = any(tag in raw for tag in ("[TABLE]", "[LABEL]", "[JSONLD]"))
+        if not tag_ok:
+            continue
+        norm = normalize_address(_strip_leading_tags(raw))
+        if norm and norm == target_norm:
+            return True
+    return False
+
 def _address_candidate_ok(
     candidate_norm: str,
     candidates: list[str],
@@ -708,6 +732,9 @@ def _address_candidate_ok(
         return True, ""
     has_hq_tag = _has_hq_tag_for_address(candidates, candidate_norm)
     if has_hq_tag:
+        return True, ""
+    has_strong_tag = _has_strong_tag_for_address(candidates, candidate_norm)
+    if has_strong_tag:
         return True, ""
     addr_match = bool(input_addr) and addr_compatible(input_addr, candidate_norm)
     has_zip = bool(ZIP_CODE_RE.search(candidate_norm))
@@ -800,45 +827,80 @@ def _rep_candidate_ok(
     return False, f"not_profile:{page_type}"
 
 def pick_best_phone(candidates: list[str]) -> str | None:
+    def _split_tags(raw: str) -> tuple[set[str], str]:
+        rest = str(raw or "").strip()
+        tags: list[str] = []
+        while True:
+            m = re.match(r"^\[([A-Z_]+)\]", rest)
+            if not m:
+                break
+            tags.append(m.group(1))
+            rest = rest[m.end():].lstrip()
+        rest = re.sub(r"^\[[A-Z_]+\]\s*", "", rest)
+        return set(tags), rest.strip()
+
+    source_bonus = {
+        "TELHREF": 6.0,
+        "TABLE": 5.0,
+        "JSONLD": 5.0,
+        "LABEL": 4.0,
+        "TEL": 3.5,
+        "FOOTER": 2.0,
+        "TEXT": 0.0,
+    }
+
     best: str | None = None
-    best_is_table = False
+    best_score = float("-inf")
     for cand in candidates:
         if not cand:
             continue
         raw = str(cand)
-        is_table = "[TABLE]" in raw
-        is_fax = "[FAX]" in raw
-        is_tel = "[TEL]" in raw
+        tags, raw_value = _split_tags(raw)
+        is_fax = "FAX" in tags
+        is_tel = "TEL" in tags or "TELHREF" in tags
         if is_fax and not is_tel:
             continue
-        raw_for_norm = re.sub(r"\[(?:TABLE|FAX|TEL|TEXT)\]", "", raw)
-        norm = normalize_phone(raw_for_norm)
+        norm = normalize_phone(raw_value)
         if not norm:
             continue
         norm_val = norm
-        # prefer non-navi numbers over 0120/0570
-        if best is None:
+
+        score = 0.0
+        for t in tags:
+            score += source_bonus.get(t, 0.0)
+        if re.match(r"^(0120|0570)", norm_val):
+            score -= 4.0
+        score -= abs(len(norm_val) - 12) * 0.2
+
+        if best is None or score > best_score:
             best = norm_val
-            best_is_table = is_table
+            best_score = score
             continue
+        if score < best_score:
+            continue
+
+        # tie-breakers
         if re.match(r"^(0120|0570)", norm_val) and not re.match(r"^(0120|0570)", best):
             continue
         if re.match(r"^(0120|0570)", best) and not re.match(r"^(0120|0570)", norm_val):
             best = norm_val
-            best_is_table = is_table
             continue
-        # prefer table-derived
-        if is_table and not best_is_table:
-            best = norm_val
-            best_is_table = True
-            continue
-        # prefer standard 12-13 chars (including hyphens)
         if len(norm_val) == len(best):
             continue
         if abs(len(norm_val) - 12) < abs(len(best) - 12):
             best = norm_val
-            best_is_table = is_table
     return best
+
+def _has_strong_phone_source(candidates: list[str]) -> bool:
+    """
+    page_type が誤分類でも採用できる程度に強い電話ソースか。
+    """
+    for raw in candidates or []:
+        if not isinstance(raw, str):
+            continue
+        if raw.startswith(("[TELHREF]", "[TABLE]", "[LABEL]", "[JSONLD]")):
+            return True
+    return False
 
 
 def ai_official_hint_from_judge(ai_judge: dict[str, Any] | None, min_conf: float) -> bool:
@@ -2491,6 +2553,15 @@ async def process():
                                     pages_for_ai = [p for p in pages_for_ai if p.get("snippet")] or pages_for_ai
                                     if len(pages_for_ai) > 3:
                                         pages_for_ai = pages_for_ai[:3]
+                                    # deep起点/ページタイプ補正に使うため、AIに渡したページ情報（軽量）を保存
+                                    try:
+                                        record["_ai_pages_meta"] = [
+                                            {"url": p.get("url"), "page_type": p.get("page_type")}
+                                            for p in (pages_for_ai or [])
+                                            if p.get("url")
+                                        ]
+                                    except Exception:
+                                        record["_ai_pages_meta"] = []
                                     ai_started = time.monotonic()
                                     try:
                                         if remaining_time_budget() <= AI_MIN_REMAINING_SEC:
@@ -3382,11 +3453,11 @@ async def process():
                             pt = "OTHER"
                         page_type_per_url[url] = str(pt)
 
-                        cc = scraper.extract_candidates(text_val, html_val)
+                        cc = scraper.extract_candidates(text_val, html_val, page_type_hint=str(pt))
                         if cc.get("phone_numbers"):
                             cand = pick_best_phone(cc["phone_numbers"])
                             if cand and not rule_phone:
-                                if pt in {"COMPANY_PROFILE", "ACCESS_CONTACT"}:
+                                if pt in {"COMPANY_PROFILE", "ACCESS_CONTACT"} or _has_strong_phone_source(cc.get("phone_numbers") or []):
                                     rule_phone = cand
                                     src_phone = url
                                 else:
@@ -3625,7 +3696,7 @@ async def process():
 
                         # primary_cands は page_type が不明なことがあるため、基本は absorb_doc_data の結果を優先する
                         pt_info = page_type_per_url.get(info_url) or "OTHER"
-                        if phones and not rule_phone and pt_info in {"COMPANY_PROFILE", "ACCESS_CONTACT"}:
+                        if phones and not rule_phone and (pt_info in {"COMPANY_PROFILE", "ACCESS_CONTACT"} or _has_strong_phone_source(phones)):
                             rule_phone = pick_best_phone(phones)
                         if addrs and not rule_address:
                             cand_addr = pick_best_address(None if ai_official_selected else addr, addrs)
@@ -3776,7 +3847,7 @@ async def process():
                                                 provisional_host_token = provisional_host_token or scraper._host_token_hit(company_tokens, adopted_url)  # type: ignore
                                             text_val = adopted.get("text", "") or ""
                                             html_val = adopted.get("html", "") or ""
-                                            extracted = scraper.extract_candidates(text_val, html_val)
+                                            extracted = scraper.extract_candidates(text_val, html_val, page_type_hint=str(page_type_per_url.get(adopted_url) or "OTHER"))
                                             adopted_rule = scraper.is_likely_official_site(
                                                 name,
                                                 adopted_url,
@@ -3870,6 +3941,19 @@ async def process():
                             profile_urls: list[str] = [
                                 u for u, pt in (page_type_per_url or {}).items() if str(pt) == "COMPANY_PROFILE"
                             ]
+                            # AI公式判定で参照した pages の page_type も起点候補に含める（分類ミス/未吸収の補完）
+                            try:
+                                meta_pages = (selected_candidate_record or {}).get("_ai_pages_meta") or []
+                                for p in meta_pages:
+                                    if not isinstance(p, dict):
+                                        continue
+                                    u = p.get("url")
+                                    if not u or u in profile_urls:
+                                        continue
+                                    if str(p.get("page_type") or "") == "COMPANY_PROFILE":
+                                        profile_urls.append(u)
+                            except Exception:
+                                pass
                             if not profile_urls:
                                 deep_skip_reason = "no_profile_page"
                                 related = {}
@@ -3995,14 +4079,14 @@ async def process():
                                     except Exception:
                                         pt = "OTHER"
                                     page_type_per_url[url] = str(pt)
-                                    cc = scraper.extract_candidates(text, html_content)
+                                    cc = scraper.extract_candidates(text, html_content, page_type_hint=str(pt))
                                     deep_phone_candidates += len(cc.get("phone_numbers") or [])
                                     deep_address_candidates += len(cc.get("addresses") or [])
                                     deep_rep_candidates += len(cc.get("rep_names") or [])
                                     if need_phone and cc.get("phone_numbers"):
                                             cand = pick_best_phone(cc["phone_numbers"])
                                             if cand:
-                                                if pt in {"COMPANY_PROFILE", "ACCESS_CONTACT"}:
+                                                if pt in {"COMPANY_PROFILE", "ACCESS_CONTACT"} or _has_strong_phone_source(cc.get("phone_numbers") or []):
                                                     phone = cand
                                                     phone_source = "rule"
                                                     src_phone = url
@@ -4208,7 +4292,7 @@ async def process():
                                             h = d.get("html", "") or ""
                                             pt = page_type_per_url.get(u) or "OTHER"
                                             out["urls"].append({"url": u, "page_type": pt})
-                                            cc = scraper.extract_candidates(t, h)
+                                            cc = scraper.extract_candidates(t, h, page_type_hint=str(pt))
                                             for p in (cc.get("phone_numbers") or [])[:10]:
                                                 out["candidates"]["phone_numbers"].append({"value": p, "url": u, "page_type": pt})
                                             for a in (cc.get("addresses") or [])[:10]:
@@ -4808,6 +4892,42 @@ async def process():
                             log_phase_metric(cid, "total", total_elapsed, status, homepage, company.get("error_code", ""))
                         except Exception:
                             log.debug("phase metrics skipped", exc_info=True)
+
+                        if EXTRACT_DEBUG_JSONL_PATH:
+                            try:
+                                os.makedirs(os.path.dirname(EXTRACT_DEBUG_JSONL_PATH) or ".", exist_ok=True)
+                                debug_payload = {
+                                    "id": cid,
+                                    "name": name,
+                                    "status": status,
+                                    "homepage": homepage,
+                                    "homepage_official_flag": int(homepage_official_flag or 0),
+                                    "homepage_official_source": homepage_official_source,
+                                    "homepage_official_score": float(homepage_official_score or 0.0),
+                                    "chosen_domain_score": int(chosen_domain_score or 0),
+                                    "phone": phone,
+                                    "phone_source": phone_source,
+                                    "source_url_phone": src_phone,
+                                    "address": found_address,
+                                    "address_source": address_source,
+                                    "source_url_address": src_addr,
+                                    "rep_name": rep_name_val,
+                                    "source_url_rep": src_rep,
+                                    "page_type_per_url": page_type_per_url,
+                                    "deep": {
+                                        "pages_visited": int(deep_pages_visited or 0),
+                                        "fetch_count": int(deep_fetch_count or 0),
+                                        "fetch_failures": int(deep_fetch_failures or 0),
+                                        "skip_reason": deep_skip_reason or "",
+                                        "stop_reason": deep_stop_reason or "",
+                                        "urls_visited": list(deep_urls_visited or [])[:8],
+                                    },
+                                    "drop_reasons": drop_reasons,
+                                }
+                                with open(EXTRACT_DEBUG_JSONL_PATH, "a", encoding="utf-8") as f:
+                                    f.write(json.dumps(debug_payload, ensure_ascii=False) + "\n")
+                            except Exception:
+                                log.debug("extract debug log skipped", exc_info=True)
 
                         manager.save_company_data(company, status=status)
                         log.info("[%s] 保存完了: status=%s elapsed=%.1fs (worker=%s)", cid, status, elapsed(), WORKER_ID)

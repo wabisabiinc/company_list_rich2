@@ -28,15 +28,53 @@ except Exception:
 
 log = logging.getLogger(__name__)
 
+# 会社概要/企業情報系（deep最優先）
+PROFILE_PRIORITY_PATHS: list[str] = [
+    "/company",
+    "/about",
+    "/corporate",
+    "/profile",
+    "/overview",
+    "/outline",
+    "/会社概要",
+    "/企業情報",
+    "/企業概要",
+    "/会社情報",
+    "/会社案内",
+    "/法人案内",
+    "/法人概要",
+    "/法人情報",
+    "/団体概要",
+    # よくあるローマ字揺れ
+    "/gaiyou",
+    "/gaiyo",
+    "/gaiyou.html",
+    "/kaisya",
+]
+
+# 連絡先/所在地系（必要時のみ）
+CONTACT_PRIORITY_PATHS: list[str] = [
+    "/contact",
+    "/contactus",
+    "/inquiry",
+    "/toiawase",
+    "/otoiawase",
+    "/access",
+    "/map",
+    "/location",
+    "/head-office",
+    "/headquarters",
+    "/form",
+    "/お問い合わせ",
+    "/アクセス",
+]
+
 # 深掘り時に優先して辿るパス（日本語含む）
 PRIORITY_PATHS = [
     # 概要系（最優先）
-    "/company", "/about", "/corporate", "/会社概要", "/企業情報", "/企業概要",
-    "/会社情報", "/会社案内", "/法人案内", "/法人概要",
+    *PROFILE_PRIORITY_PATHS,
     # 連絡先系
-    "/contact", "/access", "/location", "/head-office", "/headquarters", "/お問い合わせ", "/アクセス",
-    # IR/決算系
-    "/ir", "/investor", "/investor-relations", "/financial", "/disclosure", "/決算",
+    *CONTACT_PRIORITY_PATHS,
 ]
 PRIO_WORDS = [
     # 概要系（最優先）
@@ -44,8 +82,6 @@ PRIO_WORDS = [
     # 連絡先系
     "お問い合わせ", "アクセス", "連絡先", "所在地", "本社", "本店", "窓口", "役員",
     "代表", "代表者", "代表取締役", "社長", "CEO", "ceo", "代表挨拶", "トップメッセージ", "メッセージ", "役員紹介",
-    # IR/決算系
-    "IR", "ir", "investor", "financial", "ディスクロージャー", "決算",
 ]
 ANCHOR_PRIORITY_WORDS = [
     # 概要系
@@ -53,8 +89,6 @@ ANCHOR_PRIORITY_WORDS = [
     # 連絡先系
     "お問い合わせ", "連絡先", "アクセス", "所在地", "本社", "本店", "窓口", "役員",
     "代表", "代表者", "代表取締役", "社長", "CEO", "ceo", "代表挨拶", "トップメッセージ", "メッセージ", "役員紹介",
-    # IR/決算系
-    "IR", "ir", "investor", "financial", "ディスクロージャー", "決算",
     # 英語系
     "about", "corporate",
 ]
@@ -65,10 +99,9 @@ PRIORITY_SECTION_KEYWORDS = (
     "corporate", "about", "profile", "overview", "information", "access",
     "お問い合わせ", "連絡先", "アクセス", "窓口", "役員",
     "代表", "代表者", "代表取締役", "社長", "CEO", "ceo", "代表挨拶", "トップメッセージ", "メッセージ", "役員紹介",
-    "決算", "ir", "investor", "ディスクロージャー", "financial"
 )
 PRIORITY_CONTACT_KEYWORDS = (
-    "contact", "お問い合わせ", "連絡先", "tel", "電話", "アクセス", "窓口", "ir", "investor"
+    "contact", "お問い合わせ", "連絡先", "tel", "電話", "アクセス", "窓口"
 )
 PREFECTURE_NAMES = [
     "北海道", "青森県", "岩手県", "宮城県", "秋田県", "山形県", "福島県",
@@ -156,6 +189,22 @@ NAV_LIKE_LINE_RE = re.compile(
 
 COOKIE_NODE_HINT_RE = re.compile(r"(cookie|consent|gdpr|privacy|banner|modal|popup)", re.IGNORECASE)
 
+# SPA/Wix等の埋め込みJSON（設定/トラッキング）を住所抽出が誤爆しないようにするための検知。
+JSON_KV_NOISE_RE = re.compile(r"\"[A-Za-z0-9_]{2,}\"\s*:\s*\"?[A-Za-z0-9_.-]{0,}\"?")
+
+def _looks_like_embedded_json_noise(text: str) -> bool:
+    if not text:
+        return False
+    s = unicodedata.normalize("NFKC", str(text))
+    # JSON-LDは別経路でパースして拾うため、住所候補としては扱わない
+    if "\"@context\"" in s or "\"@type\"" in s:
+        return True
+    if s.count("\":") >= 2:
+        return True
+    if JSON_KV_NOISE_RE.search(s) and (s.count("{") >= 1 or s.count("}") >= 1 or s.count(",") >= 2):
+        return True
+    return False
+
 def _normalize_phone_strict(raw: str) -> Optional[str]:
     if not raw:
         return None
@@ -172,10 +221,13 @@ def _normalize_phone_strict(raw: str) -> Optional[str]:
         return None
     if not digits.startswith("0") or len(digits) not in (10, 11):
         return None
-    m = re.search(r"^(0\d{1,4})(\d{2,4})(\d{3,4})$", digits)
-    if not m:
-        return None
-    return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    if len(digits) == 10:
+        if digits.startswith(("03", "06")):
+            return f"{digits[:2]}-{digits[2:6]}-{digits[6:]}"
+        if digits.startswith(("0120", "0570")):
+            return f"{digits[:4]}-{digits[4:7]}-{digits[7:]}"
+        return f"{digits[:3]}-{digits[3:6]}-{digits[6:]}"
+    return f"{digits[:3]}-{digits[3:7]}-{digits[7:]}"
 ZIP_RE = re.compile(r"(〒?\s*\d{3})[-‐―－ー]?(\d{4})")
 ADDR_HINT = re.compile(r"(都|道|府|県).+?(市|区|郡|町|村)")
 ADDR_FALLBACK_RE = re.compile(
@@ -322,12 +374,15 @@ class CompanyScraper:
     ]
 
     PRIORITY_PATHS = [
-        "/company", "/about", "/profile", "/corporate", "/overview",
-        "/contact", "/inquiry", "/access", "/info", "/information",
-        "/gaiyou", "/gaiyo", "/gaiyou.html",
-        "/会社概要", "/企業情報", "/企業概要", "/会社情報", "/会社案内", "/法人案内", "/法人概要",
-        "/団体概要", "/施設案内", "/施設情報", "/法人情報", "/事業案内", "/事業紹介",
-        "/窓口案内", "/お問い合わせ", "/アクセス", "/沿革", "/組織図",
+        *PROFILE_PRIORITY_PATHS,
+        *CONTACT_PRIORITY_PATHS,
+        "/info",
+        "/information",
+        "/窓口案内",
+        "/施設案内",
+        "/施設情報",
+        "/沿革",
+        "/組織図",
     ]
 
     HARD_EXCLUDE_HOSTS = {
@@ -1033,6 +1088,8 @@ class CompanyScraper:
             return ""
         if CompanyScraper._looks_mojibake(str(val)):
             return ""
+        if _looks_like_embedded_json_noise(str(val)):
+            return ""
         val = unicodedata.normalize("NFKC", val)
         # HTML断片を除去
         val = re.sub(r"(?is)<style.*?>.*?</style>", " ", val)
@@ -1087,6 +1144,8 @@ class CompanyScraper:
         if m_map:
             val = val[: m_map.start()].strip()
         if not val:
+            return ""
+        if _looks_like_embedded_json_noise(val):
             return ""
         if CompanyScraper._is_address_form_noise(val):
             return ""
@@ -1167,7 +1226,16 @@ class CompanyScraper:
             # 郵便番号以外の本体が十分あるか確認
             body = s[m.end():].strip()
             if len(body) >= 1:
-                return True
+                # 〒だけ拾って埋め込みJSON断片等を誤爆しないようにする
+                if _looks_like_embedded_json_noise(body):
+                    return False
+                if PREFECTURE_NAME_RE.search(body) or CITY_RE.search(body):
+                    return True
+                if re.search(r"(丁目|番地|号)", body) and re.search(r"\d", body):
+                    return True
+                if re.search(r"\d{1,4}-\d{1,4}", body):
+                    return True
+                return False
         pref = CompanyScraper._extract_prefecture(s)
         city = CompanyScraper._extract_city(s)
         return bool(pref and city)
@@ -1516,7 +1584,7 @@ class CompanyScraper:
                 score += 3
                 break
         # 採用/ブログ等なら減点
-        for marker in ("/recruit", "/careers", "/job", "/jobs", "/blog", "/news", "/ir/"):
+        for marker in ("/recruit", "/careers", "/job", "/jobs", "/blog", "/news"):
             if marker in path_lower:
                 score -= 2
                 break
@@ -3003,7 +3071,7 @@ class CompanyScraper:
         def score(u: str) -> int:
             s = 0
             low = u.lower()
-            if any(k in low for k in ("recruit", "採用", "ir", "faq", "support", "news")):
+            if any(k in low for k in ("recruit", "採用", "faq", "support", "news")):
                 s -= 3
             for k in self.CANDIDATE_PRIORITIES:
                 if k.lower() in low:
@@ -3121,12 +3189,14 @@ class CompanyScraper:
 
         base_root = f"{parsed.scheme}://{parsed.netloc}"
         candidates: List[str] = [base_url]
-        verify_priority_paths = [
-            "/company", "/about", "/profile", "/corporate", "/overview",
-            "/gaiyou", "/gaiyo", "/kaisya", "/info", "/information",
-            "/contact", "/inquiry", "/access",
-            "/会社案内",
-        ]
+        # verify は「会社概要/連絡先」周辺だけを軽く当てる（deepの優先パスと整合させる）
+        verify_priority_paths = list(
+            dict.fromkeys(
+                PROFILE_PRIORITY_PATHS
+                + CONTACT_PRIORITY_PATHS
+                + ["/info", "/information"]
+            )
+        )
         for path in verify_priority_paths + list(self.PRIORITY_PATHS):
             try:
                 candidate = urllib.parse.urljoin(base_root, path)
@@ -3538,7 +3608,14 @@ class CompanyScraper:
                                 selector_timeout = _cap_timeout_ms(min(1500, attempt_timeout))
                                 if selector_timeout <= 0:
                                     raise PlaywrightTimeoutError("deadline exceeded before spa wait")
-                                await page.wait_for_selector("table,dl,footer,address", timeout=selector_timeout)
+                                # SPA/遅延描画で本文が後から埋まるケース対策:
+                                # 会社概要の構造（table/dl）だけでなく、main/articleやtelリンク、JSON-LD等も待機対象にする。
+                                await page.wait_for_selector(
+                                    "table,dl,address,footer,main,article,section,"
+                                    "[itemtype*='Organization'],[itemtype*='LocalBusiness'],"
+                                    "a[href^='tel:'],[href^='tel:'],script[type*='ld+json']",
+                                    timeout=selector_timeout,
+                                )
                                 idle_ms = _cap_timeout_ms(250)
                                 if idle_ms > 0:
                                     await page.wait_for_timeout(idle_ms)
@@ -3679,15 +3756,6 @@ class CompanyScraper:
                 "/contact", "/inquiry", "/access", "/support", "/contact-us"
             ),
         },
-        "finance": {
-            "anchor": (
-                "IR", "ir", "investor", "投資家", "財務", "決算", "disclosure", "financial", "決算短信",
-                "開示", "事業報告", "annual report"
-            ),
-            "path": (
-                "/ir", "/investor", "/financial", "/disclosure", "/ir-library", ".pdf"
-            ),
-        },
         "profile": {
             "anchor": (
                 "会社概要", "会社案内", "企業情報", "法人概要", "事業紹介", "about", "profile", "corporate", "沿革",
@@ -3695,16 +3763,6 @@ class CompanyScraper:
             ),
             "path": (
                 "/company", "/about", "/profile", "/corporate", "/overview", "/gaiyo", "/gaiyou"
-            ),
-        },
-        "overview": {
-            "anchor": (
-                "公式サイト", "公式", "企業理念", "事業内容", "事業目的", "企業概要", "会社紹介",
-                "business", "services", "solutions", "official"
-            ),
-            "path": (
-                "/official", "/official-site", "/company-profile", "/company-overview", "/business",
-                "/services", "/about-us", "/corporate-profile", "/gaiyou", "/company"
             ),
         },
     }
@@ -3787,6 +3845,12 @@ class CompanyScraper:
                         score += 4
                         break
 
+            # focusが指定された場合は、目的に直結する導線（contact/access等）を強く優先する
+            if "phone" in focus and any(seg in path_lower for seg in ("/contact", "/inquiry", "/toiawase", "/otoiawase", "/contact-us")):
+                score += 30
+            if "address" in focus and any(seg in path_lower for seg in ("/access", "/map", "/location", "/head-office", "/headquarters")):
+                score += 30
+
             if score > 0:
                 path_depth = max(parsed.path.count("/"), 1)
                 text_len = max(len(anchor_text), 1)
@@ -3840,22 +3904,15 @@ class CompanyScraper:
                 "会社概要", "会社情報", "企業情報", "企業概要", "会社案内", "法人概要", "概要",
                 "profile", "outline", "overview", "company profile", "corporate profile",
             )
-            business_text_keywords = (
-                "事業内容", "事業紹介", "サービス", "Business", "Service", "Products", "Solutions",
-            )
             token_low = token.lower()
             profile_hit = any(kw.lower() in token_low for kw in profile_text_keywords)
-            business_hit = (not profile_hit) and any(kw.lower() in token_low for kw in business_text_keywords)
 
             # 欠損フィールドに応じて対象カテゴリを限定（Noneなら全部）
             include_contact = (not target_types) or ("contact" in target_types)
             include_about = (not target_types) or ("about" in target_types)
-            include_finance = (not target_types) or ("finance" in target_types)
 
             if profile_hit:
                 score += 20
-            elif business_hit:
-                score += 8
             if include_about:
                 for kw in PRIORITY_SECTION_KEYWORDS:
                     if kw in token:
@@ -3864,9 +3921,6 @@ class CompanyScraper:
                 for kw in PRIORITY_CONTACT_KEYWORDS:
                     if kw in token:
                         score += 4
-            if include_finance:
-                if any(kw in token for kw in ("ir", "investor", "financial", "決算", "ディスクロージャー")):
-                    score += 5
             if not score:
                 continue
             for path_kw in PRIORITY_PATHS:
@@ -3945,13 +3999,6 @@ class CompanyScraper:
                 "/contact.php",
                 "/inquiry.html",
                 "/form",
-            ],
-            "finance": [
-                "/ir",
-                "/ir/financial",
-                "/ir/finance",
-                "/ir/library",
-                "/ir.html",
             ],
         }
         ordered: list[str] = []
@@ -4304,6 +4351,7 @@ class CompanyScraper:
         is_profile_heading = any(kw in head_low for kw in (k.lower() for k in profile_kw))
         is_profile_path = any(seg in (url.lower()) for seg in ("/company", "/about", "/corporate", "/profile", "/overview", "/outline"))
         has_hq_marker = ("本社所在地" in text_nfkc) or ("本店所在地" in text_nfkc) or ("本社" in text_nfkc) or ("本店" in text_nfkc)
+        is_profile_text = any(kw.lower() in text_low for kw in (k.lower() for k in profile_kw))
 
         # BASES_LIST: 住所/拠点が多数並ぶページ（電話番号由来の誤検知を除外）
         phone_spans = [(m.start(), m.end()) for m in PHONE_RE.finditer(text_nfkc)]
@@ -4336,6 +4384,9 @@ class CompanyScraper:
         has_addr = bool("〒" in text_nfkc or ZIP_RE.search(text_nfkc) or ADDR_HINT.search(text_nfkc))
         if has_table_or_dl and label_hits >= 3 and (rep_label_hit or has_hq_marker) and (has_phone or has_addr):
             return {"page_type": "COMPANY_PROFILE", "score": label_hits, "reason": "table_labels"}
+        # テーブルが無くても「代表/住所/電話」等が揃い、かつプロフィール系キーワードが本文に出る場合はプロフィール扱いにする。
+        if (not has_table_or_dl) and rep_label_hit and (has_phone or has_addr) and (has_hq_marker or is_profile_text):
+            return {"page_type": "COMPANY_PROFILE", "score": label_hits, "reason": "rep+contact_signals"}
         if (is_profile_heading or is_profile_path) and has_table_or_dl and label_hits >= 4:
             return {"page_type": "COMPANY_PROFILE", "score": label_hits, "reason": "profile_heading+labels"}
         if is_profile_path and label_hits >= 4 and (has_hq_marker or rep_label_hit):
@@ -4344,7 +4395,16 @@ class CompanyScraper:
             return {"page_type": "COMPANY_PROFILE", "score": label_hits, "reason": "profile_heading"}
 
         is_contact_heading = any(kw in head_low for kw in (k.lower() for k in contact_kw))
-        is_contact_text = bool(has_phone or has_addr) and any(kw.lower() in text_low for kw in contact_kw)
+        # 「お問い合わせ」等の語は会社概要ページにも混ざることがあるので、
+        # 代表者/会社概要キーワードがある場合は contact 扱いに落とさない。
+        is_contact_text = (
+            bool(has_phone or has_addr)
+            and any(kw.lower() in text_low for kw in contact_kw)
+            and (not rep_label_hit)
+            and (not is_profile_heading)
+            and (not is_profile_path)
+            and (not is_profile_text)
+        )
         if is_contact_heading or is_contact_text or any(seg in url.lower() for seg in ("/contact", "/inquiry", "/access", "/toiawase")):
             reason = "contact_heading_or_path"
             if is_contact_text and not is_contact_heading:
@@ -4354,7 +4414,7 @@ class CompanyScraper:
         return {"page_type": "OTHER", "score": label_hits, "reason": "default"}
 
     # ===== 抽出 =====
-    def extract_candidates(self, text: str, html: Optional[str] = None) -> Dict[str, List[str]]:
+    def extract_candidates(self, text: str, html: Optional[str] = None, page_type_hint: Optional[str] = None) -> Dict[str, List[str]]:
         phones: List[str] = []
         addrs: List[str] = []
         reps: List[str] = []
@@ -4575,9 +4635,9 @@ class CompanyScraper:
                                 continue
                             if not href.lower().startswith("tel:"):
                                 continue
-                            cand = _normalize_phone_strict(href)
+                            cand = _normalize_phone_strict(href.replace("tel:", "", 1))
                             if cand:
-                                phones.append(f"[TEL]{cand}")
+                                phones.append(f"[TELHREF]{cand}")
                     except Exception:
                         pass
 
@@ -5122,7 +5182,7 @@ class CompanyScraper:
                             for p in PHONE_RE.finditer(tel):
                                 cand = _normalize_phone_strict(f"{p.group(1)}-{p.group(2)}-{p.group(3)}")
                                 if cand:
-                                    phones.append(cand)
+                                    phones.append(f"[JSONLD]{cand}")
                         contact_points = entity.get("contactPoint") or entity.get("contactPoints") or []
                         if isinstance(contact_points, dict):
                             contact_points = [contact_points]
@@ -5135,7 +5195,7 @@ class CompanyScraper:
                                     for p in PHONE_RE.finditer(cp_tel):
                                         cand = _normalize_phone_strict(f"{p.group(1)}-{p.group(2)}-{p.group(3)}")
                                         if cand:
-                                            phones.append(cand)
+                                            phones.append(f"[JSONLD]{cand}")
                         addr = entity.get("address")
                         if isinstance(addr, dict):
                             parts = [addr.get(k, "") for k in ("postalCode", "addressRegion", "addressLocality", "streetAddress")]
@@ -5197,6 +5257,47 @@ class CompanyScraper:
             )
             if not has_strong:
                 _extract_addrs_from_text()
+
+        # 郵便番号なしでも「都道府県+市区町村+番地/号」などが揃っている住所を最後の手段で拾う。
+        # ただし誤爆を避けるため、会社概要/連絡先系ページと推定できる場合（hint）に限定する。
+        hint = (page_type_hint or "").strip().upper()
+        allow_zipless = hint in {"COMPANY_PROFILE", "ACCESS_CONTACT"}
+        if allow_zipless:
+            strong_addr = any(
+                isinstance(a, str) and (a.startswith("[JSONLD]") or a.startswith("[TABLE]") or a.startswith("[LABEL]") or a.startswith("[FOOTER]"))
+                for a in addrs
+            )
+            if not strong_addr:
+                try:
+                    candidates: list[str] = []
+                    merged = unicodedata.normalize("NFKC", text or "")
+                    merged = re.sub(r"\s+", " ", merged)
+                    # 都道府県+市区町村+番地など
+                    zipless_re = re.compile(
+                        r"([一-龥]{2,3}[都道府県]\s*[^。\\n]{0,80}?(?:市|区|町|村|郡)[^。\\n]{0,80}?(?:丁目|番地|号|\\d{1,4}-\\d{1,4}|\\d{1,4}))"
+                    )
+                    for m in zipless_re.finditer(merged):
+                        frag = m.group(1).strip()
+                        if frag:
+                            candidates.append(frag)
+                    for frag in candidates[:4]:
+                        norm = self._normalize_address_candidate(frag)
+                        if norm and self._looks_like_full_address(norm):
+                            addrs.append(f"[TEXT]{norm}")
+                except Exception:
+                    pass
+
+        # 代表者は strict モードでも、会社概要ページに限り最後の手段としてテキスト抽出を許可する。
+        # （誤爆を避けるため、役職キーワードが同一行にある場合のみ）
+        if self.rep_strict_sources and (page_type_hint or "").strip().upper() == "COMPANY_PROFILE" and not reps:
+            try:
+                for rm in REP_RE.finditer(text or ""):
+                    cleaned = self.clean_rep_name(rm.group(1))
+                    if cleaned and self._looks_like_person_name(cleaned):
+                        reps.append(f"[TEXT]{cleaned}")
+                        break
+            except Exception:
+                pass
 
         for lm in LISTING_RE.finditer(text or ""):
             val = lm.group(1).strip()
