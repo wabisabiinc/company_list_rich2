@@ -2885,17 +2885,27 @@ async def process():
                                 )
                             )
                             name_hit = strong_name_hit
+                            evidence_score = int(rule_details.get("official_evidence_score") or 0)
+                            directory_like = bool(rule_details.get("directory_like"))
+                            directory_score = int(rule_details.get("directory_score") or 0)
+                            host_name, _, allowed_tld, whitelist_host, _ = CompanyScraper._allowed_official_host(normalized_url or "")
+                            addr_weak = bool((not addr) or input_addr_pref_only)
                             pref_only_ok = bool(
                                 input_addr_pref_only
                                 and pref_hit
                                 and (name_hit or strong_domain_host or host_token_hit or domain_score >= 4)
                             )
                             address_ok = bool(addr) and (addr_hit or zip_hit or pref_only_ok)
-                            evidence_score = int(rule_details.get("official_evidence_score") or 0)
-                            directory_like = bool(rule_details.get("directory_like"))
-                            directory_score = int(rule_details.get("directory_score") or 0)
-                            host_name, _, allowed_tld, whitelist_host, _ = CompanyScraper._allowed_official_host(normalized_url or "")
-                            content_strong = name_hit and (address_ok or evidence_score >= 9)
+                            # 住所入力が弱い/空のケースは address_ok に寄らず、サイト側シグナル（title/h1/jsonld等）を強く評価する。
+                            # 追加fetch/追加AIは増やさず、採用条件のみを緩和する（誤採用防止のため directory_like は除外）。
+                            weak_addr_signal_ok = bool(
+                                addr_weak
+                                and (strong_name_hit or name_present)
+                                and evidence_score >= 10
+                                and (strong_domain_host or host_token_hit or domain_score >= 4 or allowed_tld or whitelist_host)
+                                and not directory_like
+                            )
+                            content_strong = name_hit and (address_ok or weak_addr_signal_ok or evidence_score >= 9)
                             ai_judge = record.get("ai_judge")
                             flag_info = record.get("flag_info")
 
@@ -3098,6 +3108,7 @@ async def process():
                                     and (
                                         evidence_score >= 10
                                         or (address_ok and not input_addr_pref_only)
+                                        or weak_addr_signal_ok
                                         or ("jsonld:org_name" in official_evidence)
                                         or ("title" in official_evidence)
                                         or ("h1" in official_evidence)
@@ -3152,7 +3163,7 @@ async def process():
                                 continue
                             # キャッシュ公式は採用しない（参考のみ）
                             if rule_details.get("is_official"):
-                                if input_addr_pref_only and not (host_token_hit or name_hit or strong_domain_host or domain_score >= 4):
+                                if input_addr_pref_only and not (host_token_hit or name_hit or strong_domain_host or domain_score >= 4 or weak_addr_signal_ok):
                                     manager.upsert_url_flag(
                                         normalized_url,
                                         is_official=False,
@@ -3166,7 +3177,7 @@ async def process():
                                     # 住所根拠なしなら review 送りでURLは維持
                                     force_review = True
                                     log.info("[%s] 公式判定だが入力住所と一致せず -> review: %s", cid, record.get("url"))
-                                if not host_token_hit and not address_ok:
+                                if not host_token_hit and not (address_ok or weak_addr_signal_ok):
                                     manager.upsert_url_flag(
                                         normalized_url,
                                         is_official=False,
@@ -3192,7 +3203,7 @@ async def process():
                                     or rule_details.get("strong_domain")
                                     or domain_score >= 5
                                 )
-                                if not (name_or_domain_ok or address_ok):
+                                if not (name_or_domain_ok or address_ok or weak_addr_signal_ok):
                                     manager.upsert_url_flag(
                                         normalized_url,
                                         is_official=False,
@@ -3203,7 +3214,7 @@ async def process():
                                     log.info("[%s] 名称/ドメイン一致弱のため公式判定を除外: %s", cid, record.get("url"))
                                     continue
                                 # 低ドメイン一致は name/address/host が強い場合のみ採用
-                                if domain_score < 3 and not strong_domain_host and not rule_details.get("strong_domain") and not address_ok and not name_hit and not host_token_hit:
+                                if domain_score < 3 and not strong_domain_host and not rule_details.get("strong_domain") and not (address_ok or weak_addr_signal_ok) and not name_hit and not host_token_hit:
                                     manager.upsert_url_flag(
                                         normalized_url,
                                         is_official=False,
@@ -3623,7 +3634,9 @@ async def process():
                         and isinstance(homepage_official_source, str)
                         and homepage_official_source.startswith("ai")
                     )
-                    # deep は「AIで公式採用したときのみ」実行する（誤って非公式を巡回しないため）
+                    # 優先docs（会社概要/連絡先）取得は「公式とみなせるホームページ」なら許可する。
+                    # deep crawl は「AIで公式採用したときのみ」実行する（誤って非公式を巡回しないため）。
+                    docs_allowed = bool(homepage and int(homepage_official_flag or 0) == 1)
                     deep_allowed = bool(ai_official_selected)
 
                     def absorb_doc_data(url: str, pdata: dict[str, Any]) -> None:
@@ -3804,7 +3817,8 @@ async def process():
                     # ---- AI description ----
                     # 1) AI公式判定で同時生成されたdescription
                     applied_ai_desc = False
-                    if isinstance(ai_official_description, str) and ai_official_description.strip():
+                    # 既存descriptionがある場合は、AI_DESCRIPTION_ALWAYS / REGENERATE_DESCRIPTION のときだけ上書きする。
+                    if (AI_DESCRIPTION_ALWAYS or REGENERATE_DESCRIPTION or (not description_val)) and isinstance(ai_official_description, str) and ai_official_description.strip():
                         applied_ai_desc = apply_ai_description(ai_official_description)
 
                     # 2) 公式選定がAI以外でも、selected_candidate_record がAI審査済みならそのdescriptionを使う
@@ -3812,7 +3826,7 @@ async def process():
                         aj = selected_candidate_record.get("ai_judge")
                         if isinstance(aj, dict):
                             cand = aj.get("description")
-                            if isinstance(cand, str) and cand.strip():
+                            if (AI_DESCRIPTION_ALWAYS or REGENERATE_DESCRIPTION or (not description_val)) and isinstance(cand, str) and cand.strip():
                                 applied_ai_desc = apply_ai_description(cand)
 
                     # 3) それでもAI由来が無い場合、追加AI呼び出しでdescriptionだけ生成（保証モード）
@@ -3889,7 +3903,7 @@ async def process():
                             priority_docs = {}
                         else:
                             should_fetch_priority = (
-                                deep_allowed
+                                docs_allowed
                                 and (
                                     missing_contact > 0
                                     or need_description

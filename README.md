@@ -73,7 +73,7 @@ COMPANIES_DB_PATH=data/companies_logistics.db python3 main.py
 - `USE_AI=true/false`（AI補助のON/OFF）
 - `AI_VERIFY_MIN_CONFIDENCE`（AI抽出の最低信頼度。低い場合は採用せず深掘りで再抽出。デフォルト `0.65`）
 - `AI_ADDRESS_ENABLED`（AIが返した住所を取り込むか。デフォルト `true`）
-- `USE_AI_DESCRIPTION`（description専用の追加AI呼び出しを行うか。デフォルト `false`。通常は `verify_info` で同時生成）
+- `USE_AI_DESCRIPTION`（現在未使用。description専用の追加AI呼び出しは `AI_DESCRIPTION_FALLBACK_CALL` で制御）
 - `REGENERATE_DESCRIPTION`（retry/requeue時に既存descriptionを破棄して再生成する。既定 `false`）
 - `AI_DESCRIPTION_ALWAYS`（description を毎回AI由来で埋める。既定 `true`）
 - `AI_DESCRIPTION_FALLBACK_CALL`（AI由来descriptionが取れない場合に、追加AI呼び出しでdescriptionだけ生成する。既定 `true`）
