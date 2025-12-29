@@ -4549,7 +4549,8 @@ async def process():
                                     ai_used = 1
                                     ai_model = AI_MODEL_NAME
                                     company["ai_confidence"] = ai_result.get("confidence")
-                                    company["ai_reason"] = "final_selection"
+                                    stage = str(ai_result.get("selection_stage") or "single")
+                                    company["ai_reason"] = f"final_selection:{stage}"[:120]
                                     def _strip_tags_for_ai(raw: str) -> str:
                                         out = raw or ""
                                         while True:
@@ -4579,6 +4580,25 @@ async def process():
                                                 if cleaned and cleaned == chosen:
                                                     return (url0, raw, str(pt0 or ""))
                                         return ("", "", "")
+                                    def _ai_stage_to_source(stage: str) -> str:
+                                        s = (stage or "").strip().lower()
+                                        if s in {"relaxed", "mixed"}:
+                                            return "ai_relaxed"
+                                        if s in {"strict"}:
+                                            return "ai"
+                                        return "ai"
+                                    def _evidence_contains_phone(ev: str, phone_norm: str) -> bool:
+                                        if not ev or not phone_norm:
+                                            return False
+                                        ev_phone = normalize_phone(ev)
+                                        return bool(ev_phone and ev_phone == phone_norm)
+                                    def _evidence_contains_addr(ev: str, addr_norm: str) -> bool:
+                                        if not ev or not addr_norm:
+                                            return False
+                                        # 雑に部分一致（正規化済みが前提）
+                                        a = re.sub(r"\\s+", "", addr_norm)
+                                        e = re.sub(r"\\s+", "", ev)
+                                        return bool(a and e and (a in e or e in a))
                                     if not description_val and isinstance(ai_result.get("description"), str) and ai_result.get("description"):
                                         description_val = ai_result["description"]
                                         try:
@@ -4586,19 +4606,32 @@ async def process():
                                         except Exception:
                                             company["description_evidence"] = ""
                                     if not phone and isinstance(ai_result.get("phone_number"), str) and ai_result.get("phone_number"):
-                                        phone = normalize_phone(ai_result.get("phone_number")) or ""
-                                        if phone:
-                                            phone_source = "ai"
-                                            src_phone, _, _ = _find_src_item(ai_payload.get("candidates", {}).get("phone_numbers") or [], "phone", phone)
+                                        phone_candidate = normalize_phone(ai_result.get("phone_number")) or ""
+                                        if phone_candidate:
+                                            # docs に根拠があるものだけ採用（無根拠で online verify を増やさない）
+                                            ok = quick_verify_from_docs(phone_candidate, None).get("phone_ok")
+                                            ev = ai_result.get("evidence")
+                                            ev_ok = isinstance(ev, str) and _evidence_contains_phone(ev, phone_candidate)
+                                            if ok or ev_ok:
+                                                phone = phone_candidate
+                                                phone_source = _ai_stage_to_source(stage)
+                                                if ev_ok and not ok:
+                                                    phone_source = "ai_evidence"
+                                                src_phone, _, _ = _find_src_item(ai_payload.get("candidates", {}).get("phone_numbers") or [], "phone", phone)
                                     if not found_address and isinstance(ai_result.get("address"), str) and ai_result.get("address"):
                                         addr_ai = normalize_address(ai_result.get("address"))
                                         if addr_ai:
-                                            found_address = addr_ai
-                                            address_source = "ai"
-                                            src_addr, _, _ = _find_src_item(ai_payload.get("candidates", {}).get("addresses") or [], "address", found_address)
+                                            ok = quick_verify_from_docs(None, addr_ai).get("address_ok")
                                             ev = ai_result.get("evidence")
-                                            if isinstance(ev, str) and ev.strip():
-                                                address_ai_evidence = ev.strip()[:200]
+                                            ev_ok = isinstance(ev, str) and _evidence_contains_addr(ev, addr_ai)
+                                            if ok or ev_ok:
+                                                found_address = addr_ai
+                                                address_source = _ai_stage_to_source(stage)
+                                                if ev_ok and not ok:
+                                                    address_source = "ai_evidence"
+                                                src_addr, _, _ = _find_src_item(ai_payload.get("candidates", {}).get("addresses") or [], "address", found_address)
+                                                if isinstance(ev, str) and ev.strip():
+                                                    address_ai_evidence = ev.strip()[:200]
                                     if not rep_name_val and isinstance(ai_result.get("representative"), str) and ai_result.get("representative"):
                                         rep_candidate = scraper.clean_rep_name(ai_result.get("representative"))
                                         if rep_candidate:
@@ -4639,6 +4672,11 @@ async def process():
                             verify_result_source = "docs" if any(verify_result.values()) else "skip"
                             require_phone = bool(expected_phone)
                             require_addr = bool(verifiable_addr)
+                            # AI由来の値で docs 根拠が無い場合、online verify を強制しない（遅延と誤爆を抑える）
+                            if phone_source.startswith("ai") and expected_phone and not bool(quick_verify_result.get("phone_ok")):
+                                require_phone = False
+                            if address_source.startswith("ai") and verifiable_addr and not bool(quick_verify_result.get("address_ok")):
+                                require_addr = False
                             if verify_result_source == "skip":
                                 log.info(
                                     "[%s] verify skip: expected_phone=%s expected_addr=%s verifiable_addr=%s",

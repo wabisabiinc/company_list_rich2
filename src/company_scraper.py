@@ -3430,11 +3430,16 @@ class CompanyScraper:
             "Accept-Language": "ja,en-US;q=0.9",
         }
         try:
-            resp = await asyncio.to_thread(
-                self._session_get,
-                url,
-                timeout=(timeout_sec, timeout_sec),
-                headers=headers,
+            # requests の timeout は DNS 解決などを完全にはカバーしないことがあるため、
+            # asyncio 側でも wait_for で上限を掛け、全体の停滞を防ぐ。
+            resp = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._session_get,
+                    url,
+                    timeout=(timeout_sec, timeout_sec),
+                    headers=headers,
+                ),
+                timeout=timeout_sec + 0.5,
             )
             # リダイレクトでパスが落ちた場合は www+元パスで再試行
             try:
@@ -3443,11 +3448,14 @@ class CompanyScraper:
                 alt = ""
             if alt:
                 try:
-                    resp2 = await asyncio.to_thread(
-                        self._session_get,
-                        alt,
-                        timeout=(timeout_sec, timeout_sec),
-                        headers=headers,
+                    resp2 = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            self._session_get,
+                            alt,
+                            timeout=(timeout_sec, timeout_sec),
+                            headers=headers,
+                        ),
+                        timeout=timeout_sec + 0.5,
                     )
                     if getattr(resp2, "status_code", 0) and int(resp2.status_code) < 500:
                         resp = resp2
@@ -3494,10 +3502,16 @@ class CompanyScraper:
                 return cached
             return {**cached, "url": url}
 
+        eff_timeout = timeout or self.page_timeout_ms
+        if self.slow_page_threshold_ms > 0:
+            eff_timeout = min(eff_timeout, self.slow_page_threshold_ms)
+
         http_fallback: Dict[str, Any] | None = None
         # まずHTTPで軽量取得を試す（スクショ不要の場合）
         if self.use_http_first and not need_screenshot:
-            http_info = await self._fetch_http_info(url)
+            # ブラウザ側のタイムアウトを超えてHTTPだけが長く居座らないように上限を合わせる
+            http_timeout_ms = min(self.http_timeout_ms, eff_timeout) if eff_timeout > 0 else self.http_timeout_ms
+            http_info = await self._fetch_http_info(url, timeout_ms=http_timeout_ms, allow_slow=allow_slow)
             text_len = len((http_info.get("text") or "").strip())
             html_val = http_info.get("html") or ""
             http_fallback = {
@@ -3537,9 +3551,6 @@ class CompanyScraper:
                     return cached
                 return {"url": url, "text": "", "html": "", "screenshot": b""}
 
-        eff_timeout = timeout or self.page_timeout_ms
-        if self.slow_page_threshold_ms > 0:
-            eff_timeout = min(eff_timeout, self.slow_page_threshold_ms)
         total_deadline = time.monotonic() + max(2, eff_timeout) / 1000
 
         def _remaining_ms() -> int:

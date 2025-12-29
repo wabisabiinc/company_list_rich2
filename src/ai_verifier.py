@@ -434,8 +434,15 @@ class AIVerifier:
             "以下の JSON は、同一ドメイン内の最大2〜3ページからルール抽出した候補群です。\n"
             "推測は禁止。候補に無い値は返さないでください。迷ったら null。\n"
             "出力は JSON のみ。\n"
+            "可能なら strict / relaxed の2段階で出力してください（strictで取れない場合のみrelaxedを埋める）。\n"
             f"対象企業: {company_name or '不明'} / csv_address: {csv_address or '不明'}\n"
-            "OUTPUT SCHEMA:\n"
+            "OUTPUT SCHEMA (A:推奨 / B:互換):\n"
+            "A)\n"
+            "{\n"
+            '  "strict": { ...Bと同じスキーマ... },\n'
+            '  "relaxed": { ...Bと同じスキーマ... }\n'
+            "}\n"
+            "B)\n"
             "{\n"
             '  "phone_number": string|null,\n'
             '  "address": string|null,\n'
@@ -460,45 +467,7 @@ class AIVerifier:
             f"# CANDIDATES_JSON\n{snippet}\n"
         )
 
-    async def select_company_fields(
-        self,
-        payload: Dict[str, Any],
-        screenshot: bytes | None,
-        company_name: str,
-        csv_address: str,
-    ) -> Optional[Dict[str, Any]]:
-        if not self.model:
-            return None
-        try:
-            payload_json = json.dumps(payload, ensure_ascii=False)
-        except Exception:
-            payload_json = str(payload)
-        prompt = self._build_rich_prompt(payload_json, company_name=company_name, csv_address=csv_address)
-
-        def _build_content(use_image: bool) -> list[Any]:
-            out: list[Any] = []
-            if self.system_prompt:
-                out.append(self.system_prompt)
-            out.append(prompt)
-            if use_image and screenshot:
-                try:
-                    b64 = base64.b64encode(screenshot).decode("utf-8")
-                    out.append({"inline_data": {"mime_type": "image/png", "data": b64}})
-                except Exception:
-                    pass
-            return out
-
-        resp = await self._generate_with_timeout(_build_content(bool(screenshot)))
-        if resp is None and screenshot:
-            resp = await self._generate_with_timeout(_build_content(False))
-        if resp is None:
-            return None
-
-        raw = _resp_text(resp)
-        data = _extract_first_json(raw)
-        if not isinstance(data, dict):
-            return None
-
+    def _normalize_company_fields_result(self, data: Dict[str, Any]) -> Dict[str, Any]:
         phone = _normalize_phone(data.get("phone_number"))
         addr = _normalize_address(data.get("address"))
         rep = data.get("representative")
@@ -592,6 +561,100 @@ class AIVerifier:
             "evidence": evidence,
             "description_evidence": description_evidence,
         }
+
+    async def select_company_fields(
+        self,
+        payload: Dict[str, Any],
+        screenshot: bytes | None,
+        company_name: str,
+        csv_address: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not self.model:
+            return None
+        try:
+            payload_json = json.dumps(payload, ensure_ascii=False)
+        except Exception:
+            payload_json = str(payload)
+        prompt = self._build_rich_prompt(payload_json, company_name=company_name, csv_address=csv_address)
+
+        def _build_content(use_image: bool) -> list[Any]:
+            out: list[Any] = []
+            if self.system_prompt:
+                out.append(self.system_prompt)
+            out.append(prompt)
+            if use_image and screenshot:
+                try:
+                    b64 = base64.b64encode(screenshot).decode("utf-8")
+                    out.append({"inline_data": {"mime_type": "image/png", "data": b64}})
+                except Exception:
+                    pass
+            return out
+
+        resp = await self._generate_with_timeout(_build_content(bool(screenshot)))
+        if resp is None and screenshot:
+            resp = await self._generate_with_timeout(_build_content(False))
+        if resp is None:
+            return None
+
+        raw = _resp_text(resp)
+        data = _extract_first_json(raw)
+        if not isinstance(data, dict):
+            return None
+
+        strict_raw = data.get("strict")
+        relaxed_raw = data.get("relaxed")
+        selection_stage = "single"
+        if isinstance(strict_raw, dict) or isinstance(relaxed_raw, dict):
+            strict_norm = self._normalize_company_fields_result(strict_raw if isinstance(strict_raw, dict) else {})
+            relaxed_norm = self._normalize_company_fields_result(relaxed_raw if isinstance(relaxed_raw, dict) else {})
+            merged = dict(strict_norm)
+            used_relaxed = False
+            for key in ("phone_number", "address", "representative", "description", "industry", "evidence"):
+                if (not merged.get(key)) and relaxed_norm.get(key):
+                    merged[key] = relaxed_norm.get(key)
+                    used_relaxed = True
+            # facts はフィールドごとにマージ
+            sf = strict_norm.get("company_facts") or {}
+            rf = relaxed_norm.get("company_facts") or {}
+            facts = dict(sf) if isinstance(sf, dict) else {}
+            if isinstance(rf, dict):
+                for fkey in ("founded", "capital", "employees", "license"):
+                    if (not facts.get(fkey)) and rf.get(fkey):
+                        facts[fkey] = rf.get(fkey)
+                        used_relaxed = True
+            merged["company_facts"] = facts
+            if (not merged.get("business_tags")) and relaxed_norm.get("business_tags"):
+                merged["business_tags"] = relaxed_norm.get("business_tags")
+                used_relaxed = True
+            if merged.get("description") and not merged.get("description_evidence"):
+                # description_evidence も段階に合わせる
+                if strict_norm.get("description") and strict_norm.get("description_evidence"):
+                    merged["description_evidence"] = strict_norm.get("description_evidence")
+                elif relaxed_norm.get("description") and relaxed_norm.get("description_evidence"):
+                    merged["description_evidence"] = relaxed_norm.get("description_evidence")
+            # representative_valid/reason は strict を優先し、無ければ relaxed
+            for key in ("representative_valid", "representative_invalid_reason"):
+                if merged.get(key) is None and relaxed_norm.get(key) is not None:
+                    merged[key] = relaxed_norm.get(key)
+                    used_relaxed = True
+            # confidence は利用段階の値を優先（混在の場合は控えめに）
+            sconf = float(strict_norm.get("confidence") or 0.0)
+            rconf = float(relaxed_norm.get("confidence") or 0.0)
+            if used_relaxed and sconf <= 0.001 and rconf > 0:
+                merged["confidence"] = rconf
+                selection_stage = "relaxed"
+            elif used_relaxed:
+                merged["confidence"] = max(sconf, rconf * 0.95)
+                selection_stage = "mixed"
+            else:
+                merged["confidence"] = sconf
+                selection_stage = "strict"
+            merged["selection_stage"] = selection_stage
+            return merged
+
+        single = self._normalize_company_fields_result(data)
+        single["selection_stage"] = selection_stage
+        return single
 
     async def verify_info(self, text: str, screenshot: bytes, company_name: str, address: str) -> Optional[Dict[str, Any]]:
         if not self.model:
