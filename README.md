@@ -57,6 +57,7 @@ SELECT id, company_name, homepage, phone, source_csv
 - `homepage/phone/address/rep_name/description/listing…` など既存の列は**空欄のみ**を埋め、値が入っている場合は触りません。
 - 公式スクレイプの進捗を壊さないため、既存の `done/review/error` は維持し、新規行のみ `pending` で挿入します。
 - 取り込みスクリプトは `hubspot_id/corporate_number` などの追加カラムを使って名寄せし、同一企業を重複登録しないようにしています。
+- DB保存時に各テキスト列（`description/listing/revenue/...`）はクレンジングされ、列に不適切なノイズ（URL/連絡先/定型文など）が混入した場合は空欄化されます。
 
 ## スクレイプ実行
 
@@ -73,11 +74,22 @@ COMPANIES_DB_PATH=data/companies_logistics.db python3 main.py
 - `AI_VERIFY_MIN_CONFIDENCE`（AI抽出の最低信頼度。低い場合は採用せず深掘りで再抽出。デフォルト `0.65`）
 - `AI_ADDRESS_ENABLED`（AIが返した住所を取り込むか。デフォルト `true`）
 - `USE_AI_DESCRIPTION`（description専用の追加AI呼び出しを行うか。デフォルト `false`。通常は `verify_info` で同時生成）
+- `REGENERATE_DESCRIPTION`（retry/requeue時に既存descriptionを破棄して再生成する。既定 `false`）
+- `AI_DESCRIPTION_ALWAYS`（description を毎回AI由来で埋める。既定 `true`）
+- `AI_DESCRIPTION_FALLBACK_CALL`（AI由来descriptionが取れない場合に、追加AI呼び出しでdescriptionだけ生成する。既定 `true`）
+- `AI_FINAL_ALWAYS`（USE_AI_OFFICIAL=true でも最終AI(select_company_fields)を許可する。既定 `false` / 追加コスト）
+- `AI_DESCRIPTION_VERIFY_MIN_LEN` / `AI_DESCRIPTION_VERIFY_MAX_LEN`（AIが返すdescriptionの受理条件を調整）
 - `AI_SCREENSHOT_POLICY=auto/always/never`（AIに渡すスクショ方針。`auto` は本文が十分ならスクショ無しで高速化）
 - `OFFICIAL_AI_SCREENSHOT_POLICY=always/never/auto`（公式判定AIのスクショ方針。デフォルト `always`）
 - `VERIFY_AI_SCREENSHOT_POLICY`（抽出AI（verify/最終選択）のスクショ方針。未指定時は `AI_SCREENSHOT_POLICY`）
 - `SEARCH_CANDIDATE_LIMIT`（検索候補の最大数）
 - `RELATED_BASE_PAGES`, `RELATED_MAX_HOPS_BASE`（深掘りのページ数/ホップ上限。内部でも最大3にクランプ）
+
+既存DBのノイズを一括除去したい場合:
+```bash
+python3 scripts/cleanup_text_fields.py --db data/companies.db --dry-run
+python3 scripts/cleanup_text_fields.py --db data/companies.db
+```
 
 ## テスト
 

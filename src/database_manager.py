@@ -1,11 +1,13 @@
 # src/database_manager.py
 import csv
+import html as html_mod
 import os
 import sqlite3
 import time
 import urllib.parse
 import re
 import logging
+import unicodedata
 from typing import Iterable, Optional, Dict, Any
 
 log = logging.getLogger(__name__)
@@ -736,6 +738,134 @@ class DatabaseManager:
                 return ""
             return s.strip(" 　\t,，;；。．|｜/／・-‐―－ー:：")
 
+        DESCRIPTION_MAX_LEN = max(10, int(os.getenv("DESCRIPTION_MAX_LEN", "200")))
+        DESCRIPTION_MIN_LEN = max(4, int(os.getenv("DESCRIPTION_MIN_LEN", "10")))
+        _DESCRIPTION_BIZ_HINTS = (
+            "事業", "製造", "開発", "販売", "提供", "サービス", "運営", "支援", "施工", "設計", "製作",
+            "物流", "運送", "建設", "工事", "コンサル", "consulting", "solution", "ソリューション",
+            "製品", "プロダクト", "システム", "加工", "レンタル", "IT", "デジタル", "クラウド", "SaaS", "DX", "AI",
+            "データ分析", "セキュリティ", "インフラ", "研究", "技術",
+            "人材", "教育", "医療", "ヘルスケア", "介護", "福祉", "食品", "エネルギー", "不動産", "金融", "EC", "通販",
+        )
+
+        def _truncate_description(text: str) -> str:
+            if len(text) <= DESCRIPTION_MAX_LEN:
+                return text
+            truncated = text[:DESCRIPTION_MAX_LEN]
+            truncated = re.sub(r"[、。．,;]+$", "", truncated)
+            trimmed = re.sub(r"\s+\S*$", "", truncated).strip()
+            return trimmed if len(trimmed) >= DESCRIPTION_MIN_LEN else truncated.rstrip()
+
+        def _clean_description(raw: Any) -> str:
+            if raw is None:
+                return ""
+            text = unicodedata.normalize("NFKC", str(raw))
+            text = html_mod.unescape(text)
+            text = re.sub(r"<[^>]+>", " ", text)
+            text = re.sub(r"[\x00-\x1f\x7f]", " ", text)
+            text = re.sub(r"\s+", " ", text).strip()
+            if not text:
+                return ""
+            if _looks_mojibake(text):
+                return ""
+            # URL/メール/連絡先/所在地などは混入扱い
+            if re.search(r"https?://|mailto:|@|＠|tel[:：]|電話|ＴＥＬ|TEL|ＦＡＸ|FAX|住所|所在地", text, flags=re.I):
+                return ""
+            if any(term in text for term in ("お問い合わせ", "お問合せ", "お問合わせ", "アクセス", "採用", "求人", "予約", "営業時間", "受付時間")):
+                return ""
+            # 企業DB/まとめサイト/掲載定型文を除外
+            if ("サイト" in text or "ページ" in text) and any(
+                w in text for w in ("データベース", "登録企業", "掲載", "企業詳細", "会社情報を掲載", "企業情報を掲載", "口コミ", "評判", "ランキング")
+            ):
+                return ""
+            # 方針/理念/ご挨拶系は事業内容ではないことが多いので除外（最小限）
+            if any(w in text for w in ("理念", "ビジョン", "ご挨拶", "メッセージ", "ポリシー", "方針", "コンプライアンス", "情報セキュリティ")):
+                return ""
+
+            # 複数文は「使える1文」を拾う（後段のノイズ混入対策）
+            candidates = [text]
+            if "。" in text or "．" in text:
+                parts = [p.strip() for p in re.split(r"[。．]", text) if p.strip()]
+                if parts:
+                    candidates = parts
+            for cand in candidates:
+                if len(cand) < DESCRIPTION_MIN_LEN:
+                    continue
+                # 事業を示すヒントが全く無いものは弾く（ただし強すぎると落ちるので緩め）
+                if not any(h in cand for h in _DESCRIPTION_BIZ_HINTS):
+                    continue
+                return _truncate_description(cand)
+            return ""
+
+        _LISTING_ALLOWED_KEYWORDS = (
+            "上場", "未上場", "非上場", "東証", "名証", "札証", "福証", "JASDAQ",
+            "TOKYO PRO", "マザーズ", "グロース", "スタンダード", "プライム",
+            "Nasdaq", "NYSE",
+        )
+
+        def _clean_listing(raw: Any) -> str:
+            text = unicodedata.normalize("NFKC", str(raw or "")).strip().replace("　", " ")
+            if not text:
+                return ""
+            if re.search(r"[。！？!?\n]", text):
+                return ""
+            text = re.sub(r"\s+", "", text)
+            if len(text) > 15:
+                return ""
+            low = text.lower()
+            if any(k.lower() in low for k in _LISTING_ALLOWED_KEYWORDS):
+                return text
+            if re.fullmatch(r"(?:上場|未上場|非上場)", text):
+                return text
+            if re.fullmatch(r"[0-9]{4}", text):
+                return text
+            return ""
+
+        _AMOUNT_ALLOWED_UNITS = ("億円", "万円", "千円", "円")
+
+        def _clean_amount(raw: Any) -> str:
+            text = unicodedata.normalize("NFKC", str(raw or "")).strip()
+            if not text:
+                return ""
+            if re.search(r"(従業員|社員|職員|スタッフ)\s*[0-9]+", text):
+                return ""
+            if re.search(r"[0-9]+\s*(名|人)\b", text):
+                return ""
+            # 年度など括弧内の付帯情報は先に落とす
+            text = re.sub(r"[（(][^）)]*[）)]", "", text)
+            m = re.search(r"([0-9,\.]+(?:兆円|億円|万円|千円|円))", text)
+            if m:
+                text = m.group(1)
+            if not re.search(r"[0-9]", text):
+                return ""
+            if not any(u in text for u in _AMOUNT_ALLOWED_UNITS):
+                return ""
+            text = re.sub(r"\s+", "", text)
+            return text[:40]
+
+        def _clean_fiscal_month(raw: Any) -> str:
+            text = unicodedata.normalize("NFKC", str(raw or "")).strip().replace("　", " ")
+            if not text:
+                return ""
+            text = text.replace("期", "月").replace("末", "月")
+            if re.fullmatch(r"[Qq][1-4]", text):
+                qmap = {"Q1": "3月", "Q2": "6月", "Q3": "9月", "Q4": "12月"}
+                return qmap.get(text.upper(), "")
+            m = re.search(r"(1[0-2]|0?[1-9])\s*月", text)
+            if m:
+                return f"{int(m.group(1))}月"
+            m = re.search(r"(1[0-2]|0?[1-9])", text)
+            if m:
+                return f"{int(m.group(1))}月"
+            return ""
+
+        def _clean_founded_year(raw: Any) -> str:
+            text = unicodedata.normalize("NFKC", str(raw or "")).strip()
+            if not text:
+                return ""
+            m = re.search(r"(18|19|20)\d{2}", text)
+            return m.group(0) if m else ""
+
         def set_value(column: str, value: Any) -> None:
             if column in cols:
                 updates.append(f"{column} = ?")
@@ -891,7 +1021,7 @@ class DatabaseManager:
         set_value("address_conflict_level", conflict_level)
         set_value("address_review_reason", review_reason)
         set_value("rep_name", company.get("rep_name", "") or "")
-        set_value("description", company.get("description", "") or "")
+        set_value("description", _clean_description(company.get("description")))
         set_value("ai_used", int(company.get("ai_used", 0) or 0))
         set_value("ai_model", company.get("ai_model", "") or "")
         set_value("ai_confidence", company.get("ai_confidence"))
@@ -903,12 +1033,12 @@ class DatabaseManager:
         set_value("source_url_address", company.get("source_url_address", "") or "")
         set_value("source_url_rep", company.get("source_url_rep", "") or "")
         set_value("error_code", company.get("error_code", "") or "")
-        set_value("listing", company.get("listing", "") or "")
-        set_value("revenue", company.get("revenue", "") or "")
-        set_value("profit", company.get("profit", "") or "")
-        set_value("capital", company.get("capital", "") or "")
-        set_value("fiscal_month", company.get("fiscal_month", "") or "")
-        set_value("founded_year", company.get("founded_year", "") or "")
+        set_value("listing", _clean_listing(company.get("listing")))
+        set_value("revenue", _clean_amount(company.get("revenue")))
+        set_value("profit", _clean_amount(company.get("profit")))
+        set_value("capital", _clean_amount(company.get("capital")))
+        set_value("fiscal_month", _clean_fiscal_month(company.get("fiscal_month")))
+        set_value("founded_year", _clean_founded_year(company.get("founded_year")))
         set_value("reference_homepage", company.get("reference_homepage", "") or "")
         set_value("reference_phone", company.get("reference_phone", "") or "")
         set_value("reference_address", company.get("reference_address", "") or "")

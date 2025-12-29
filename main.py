@@ -75,7 +75,15 @@ AI_OFFICIAL_CANDIDATE_LIMIT = int(os.getenv("AI_OFFICIAL_CANDIDATE_LIMIT", "3"))
 AI_OFFICIAL_CONCURRENCY = max(1, int(os.getenv("AI_OFFICIAL_CONCURRENCY", "3")))
 # description はAIで常時生成（verify_infoで同時生成）。追加の説明専用AI呼び出しを有効にしたい場合のみ true。
 USE_AI_DESCRIPTION = os.getenv("USE_AI_DESCRIPTION", "false").lower() == "true"
+# description を「毎回AIで作る」方針（既定: true）。false の場合は既存値を保持し、必要時のみ作る。
+AI_DESCRIPTION_ALWAYS = os.getenv("AI_DESCRIPTION_ALWAYS", "true").lower() == "true"
+# AI_DESCRIPTION_ALWAYS=true でも、AI由来descriptionが取れなかったときに追加のAI呼び出しで補うか（既定: true）
+AI_DESCRIPTION_FALLBACK_CALL = os.getenv("AI_DESCRIPTION_FALLBACK_CALL", "true").lower() == "true"
+# requeue/retry時に既存descriptionを破棄して再生成したい場合のみ true（AI_DESCRIPTION_ALWAYS が優先）
+REGENERATE_DESCRIPTION = os.getenv("REGENERATE_DESCRIPTION", "false").lower() == "true"
 AI_FINAL_WITH_OFFICIAL = os.getenv("AI_FINAL_WITH_OFFICIAL", "false").lower() == "true"
+# USE_AI_OFFICIAL=true の場合でも、最終AI(select_company_fields)を毎回許可する（既定: false / 追加コスト）
+AI_FINAL_ALWAYS = os.getenv("AI_FINAL_ALWAYS", "false").lower() == "true"
 WORKER_ID = os.getenv("WORKER_ID", "w1")  # 並列識別子
 COMPANIES_DB_PATH = os.getenv("COMPANIES_DB_PATH", "data/companies.db")
 
@@ -3528,8 +3536,11 @@ async def process():
                     phone = ""
                     found_address = ""
                     rep_name_val = scraper.clean_rep_name(company.get("rep_name")) or ""
-                    # description は常に AI に生成させるため、既存値は参照しない
-                    description_val = ""
+                    if AI_DESCRIPTION_ALWAYS or REGENERATE_DESCRIPTION:
+                        # 毎回AIで作る/再生成したい場合は既存を参照しない（後段でAI候補を優先採用）
+                        description_val = ""
+                    else:
+                        description_val = clean_description_value(company.get("description") or "")
                     listing_val = clean_listing_value(company.get("listing") or "")
                     revenue_val = clean_amount_value(company.get("revenue") or "")
                     profit_val = clean_amount_value(company.get("profit") or "")
@@ -3737,20 +3748,67 @@ async def process():
                             return False
                         if len(cleaned) < 10:
                             return False
-                        if len(cleaned) > 120:
-                            cleaned = cleaned[:120].rstrip()
+                        # AI最終選択の仕様（80〜160）も受けられるよう上限は160にしておく
+                        if len(cleaned) > 160:
+                            cleaned = cleaned[:160].rstrip()
                         if cleaned == description_val:
                             return False
                         description_val = cleaned
                         need_description = False
                         return True
 
-                    # AI公式採用のときは、同じAI呼び出し(judge_official_homepage)で生成された description を優先採用する
-                    if homepage_official_flag == 1 and homepage_official_source.startswith("ai") and isinstance(ai_official_description, str) and ai_official_description.strip():
+                    def apply_ai_description(candidate: str | None) -> bool:
+                        nonlocal description_val
+                        if not (isinstance(candidate, str) and candidate.strip()):
+                            return False
                         prev_desc = description_val
                         description_val = ""
-                        if not update_description_candidate(ai_official_description):
+                        ok = update_description_candidate(candidate)
+                        if not ok:
                             description_val = prev_desc
+                        return ok
+
+                    # ---- AI description ----
+                    # 1) AI公式判定で同時生成されたdescription
+                    applied_ai_desc = False
+                    if isinstance(ai_official_description, str) and ai_official_description.strip():
+                        applied_ai_desc = apply_ai_description(ai_official_description)
+
+                    # 2) 公式選定がAI以外でも、selected_candidate_record がAI審査済みならそのdescriptionを使う
+                    if not applied_ai_desc and isinstance(selected_candidate_record, dict):
+                        aj = selected_candidate_record.get("ai_judge")
+                        if isinstance(aj, dict):
+                            cand = aj.get("description")
+                            if isinstance(cand, str) and cand.strip():
+                                applied_ai_desc = apply_ai_description(cand)
+
+                    # 3) それでもAI由来が無い場合、追加AI呼び出しでdescriptionだけ生成（保証モード）
+                    if (
+                        AI_DESCRIPTION_ALWAYS
+                        and not description_val
+                        and AI_DESCRIPTION_FALLBACK_CALL
+                        and USE_AI
+                        and verifier is not None
+                        and homepage
+                        and (not timed_out)
+                        and has_time_for_ai()
+                    ):
+                        try:
+                            blocks: list[str] = []
+                            if info_dict and (info_dict.get("text") or info_dict.get("html")):
+                                blocks.append(info_dict.get("text", "") or "")
+                            # 既取得の優先docsがあれば少し足す（追加fetchはしない）
+                            for pdata in list(priority_docs.values())[:2]:
+                                blocks.append(pdata.get("text", "") or "")
+                            desc_text = build_ai_text_payload(*blocks)
+                            shot = info_dict.get("screenshot") if isinstance(info_dict.get("screenshot"), (bytes, bytearray)) else b""
+                            generated = await asyncio.wait_for(
+                                verifier.generate_description(desc_text, bytes(shot), name, addr_raw),
+                                timeout=clamp_timeout(ai_call_timeout),
+                            )
+                            apply_ai_description(generated)
+                        except Exception:
+                            pass
 
                     if homepage and info_dict:
                         absorb_doc_data(info_url, info_dict)
@@ -4468,7 +4526,7 @@ async def process():
                                 and verifier is not None
                                 and not timed_out
                                 and has_time_for_ai()
-                                and (not USE_AI_OFFICIAL or AI_FINAL_WITH_OFFICIAL)
+                                and (not USE_AI_OFFICIAL or AI_FINAL_WITH_OFFICIAL or AI_FINAL_ALWAYS)
                                 and (
                                     missing_contact > 0
                                     or missing_extra > 0

@@ -29,6 +29,10 @@ DEFAULT_MODEL: str = (os.getenv("GEMINI_MODEL") or "gemini-2.5-flash-lite").stri
 AI_CONTEXT_PATH: str = os.getenv("AI_CONTEXT_PATH", "docs/ai_context.md")
 AI_DESCRIPTION_MAX_LEN = int(os.getenv("AI_DESCRIPTION_MAX_LEN", "140"))
 AI_DESCRIPTION_MIN_LEN = int(os.getenv("AI_DESCRIPTION_MIN_LEN", "80"))
+# verify_info / judge_official_homepage で使う description の長さ制約（環境変数で強化可能）。
+# 既定は互換性優先で緩め（短文も許容）にしておく。
+AI_DESCRIPTION_VERIFY_MIN_LEN = int(os.getenv("AI_DESCRIPTION_VERIFY_MIN_LEN", "20"))
+AI_DESCRIPTION_VERIFY_MAX_LEN = int(os.getenv("AI_DESCRIPTION_VERIFY_MAX_LEN", "120"))
 
 # ---- deps -------------------------------------------------------
 try:
@@ -399,7 +403,10 @@ class AIVerifier:
         if "http://" in desc or "https://" in desc or "＠" in desc or "@" in desc:
             return None
         desc = re.sub(r"\s+", " ", desc.strip())
-        if len(desc) < 20 or len(desc) > AI_DESCRIPTION_MAX_LEN:
+        min_len = max(1, int(AI_DESCRIPTION_VERIFY_MIN_LEN or 0))
+        max_len = int(AI_DESCRIPTION_VERIFY_MAX_LEN or AI_DESCRIPTION_MAX_LEN or 120)
+        max_len = min(int(AI_DESCRIPTION_MAX_LEN or max_len), max_len)
+        if len(desc) < min_len or len(desc) > max_len:
             return None
         if not re.search(r"[ぁ-んァ-ン一-龥]", desc):
             return None

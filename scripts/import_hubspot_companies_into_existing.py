@@ -158,11 +158,95 @@ def clean_description_text(val):
     text = re.sub(r"\s+", " ", text).strip()
     if not text:
         return None
-    if re.search(r"https?://|mailto:|@|＠|tel[:：]|電話|ＴＥＬ|ＴＥＬ：", text, flags=re.I):
+    if re.search(r"https?://|mailto:|@|＠|tel[:：]|電話|ＴＥＬ|TEL|ＦＡＸ|FAX", text, flags=re.I):
         return None
-    if any(term in text for term in ("お問い合わせ", "お問合せ", "アクセス", "採用", "求人", "予約")):
+    if any(term in text for term in ("お問い合わせ", "お問合せ", "お問合わせ", "アクセス", "採用", "求人", "予約", "営業時間", "受付時間")):
         return None
-    return text
+    # 企業DB/まとめサイトの定型文を除外
+    if ("サイト" in text or "ページ" in text) and any(
+        w in text
+        for w in (
+            "データベース",
+            "登録企業",
+            "掲載",
+            "企業詳細",
+            "会社情報を掲載",
+            "企業情報を掲載",
+            "口コミ",
+            "評判",
+            "ランキング",
+        )
+    ):
+        return None
+    # 複数文は先頭の「事業っぽい1文」だけを採用（混入対策）
+    parts = [p.strip() for p in re.split(r"[。．]", text) if p.strip()] or [text]
+    biz_hints = (
+        "事業", "製造", "開発", "販売", "提供", "サービス", "運営", "支援", "施工", "設計",
+        "物流", "運送", "建設", "工事", "コンサル", "システム", "IT", "クラウド", "SaaS",
+        "医療", "教育", "介護", "福祉", "食品", "不動産", "金融", "EC", "通販",
+    )
+    for p in parts:
+        if any(h in p for h in biz_hints):
+            return p[:200]
+    return None
+
+
+def clean_listing_text(val):
+    if val is None:
+        return None
+    text = unicodedata.normalize("NFKC", str(val)).strip().replace("　", " ")
+    if not text:
+        return None
+    if re.search(r"[。！？!?\n]", text):
+        return None
+    text = re.sub(r"\s+", "", text)
+    if len(text) > 15:
+        return None
+    allowed = (
+        "上場", "未上場", "非上場", "東証", "名証", "札証", "福証", "JASDAQ",
+        "TOKYO PRO", "マザーズ", "グロース", "スタンダード", "プライム",
+        "Nasdaq", "NYSE",
+    )
+    low = text.lower()
+    if any(k.lower() in low for k in allowed):
+        return text
+    if re.fullmatch(r"(?:上場|未上場|非上場)", text):
+        return text
+    if re.fullmatch(r"[0-9]{4}", text):
+        return text
+    return None
+
+
+def clean_phone_text(val):
+    if val is None:
+        return None
+    s = unicodedata.normalize("NFKC", str(val)).strip()
+    if not s:
+        return None
+    s = re.sub(r"[‐―－ー]+", "-", s)
+    s = re.sub(r"（.*?）", "", s)
+    s = re.sub(r"TEL[:：]\s*", "", s, flags=re.I)
+    m = re.search(r"(0\d{1,4})-?(\d{1,4})-?(\d{3,4})", s)
+    if not m:
+        return None
+    return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+
+
+def clean_address_text(val):
+    if val is None:
+        return None
+    s = unicodedata.normalize("NFKC", str(val)).strip().replace("　", " ")
+    if not s:
+        return None
+    s = re.sub(r"\s+", " ", s)
+    cut_re = re.compile(
+        r"\s*(?:TEL|電話|☎|℡|FAX|ファックス|メール|E[-\s]?mail|地図|マップ|Google\s*マップ|アクセス|営業時間|受付時間|定休日)\b",
+        re.IGNORECASE,
+    )
+    m = cut_re.search(s)
+    if m:
+        s = s[: m.start()].strip()
+    return s or None
 
 
 def clean(val):
@@ -210,15 +294,15 @@ def normalize_row(row):
     data = {
         "hubspot_id": clean(row.get("レコードID")),
         "company_name": clean(row.get("会社名")),
-        "address": clean(row.get("都道府県／地域")),
-        "phone": clean(row.get("電話番号")),
+        "address": clean_address_text(row.get("都道府県／地域")) or clean(row.get("都道府県／地域")),
+        "phone": clean_phone_text(row.get("電話番号")) or clean(row.get("電話番号")),
         "homepage": homepage,
         "corporate_number": clean(row.get("法人番号")),
         "corporate_number_norm": clean(row.get("法人番号（名寄せ）")),
         "employee_count": to_int(row.get("従業員数")),
         "rep_name": rep_name,
         "description": description,
-        "listing": clean(row.get("上場区分")),
+        "listing": clean_listing_text(row.get("上場区分")) or clean(row.get("上場区分")),
         "industry_group": clean(row.get("業種グループ")),
         "industry": industry,
     }
