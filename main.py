@@ -4021,7 +4021,7 @@ async def process():
                         ai_phone: str | None = None
                         ai_addr: str | None = None
                         ai_rep: str | None = None
-    
+
                         missing_contact, missing_extra = refresh_need_flags()
                         if need_description:
                             payloads: list[dict[str, Any]] = []
@@ -4034,7 +4034,7 @@ async def process():
                                     description_val = desc
                                     need_description = False
                                     break
-    
+
                         if rule_phone:
                             phone = rule_phone
                             phone_source = "rule"
@@ -4043,7 +4043,7 @@ async def process():
                         else:
                             phone = ""
                             phone_source = "none"
-    
+
                         if rule_address:
                             found_address = rule_address
                             address_source = "rule"
@@ -4052,7 +4052,7 @@ async def process():
                         else:
                             found_address = rule_address or ""
                             address_source = "none"
-    
+
                         if rule_rep:
                             if not rep_name_val or len(rule_rep) > len(rep_name_val):
                                 rep_name_val = rule_rep
@@ -4067,7 +4067,7 @@ async def process():
                         deep_phone_candidates = 0
                         deep_address_candidates = 0
                         deep_rep_candidates = 0
-    
+
                         missing_contact, missing_extra = refresh_need_flags()
                         need_extra_fields = missing_extra > 0
                         related = {}
@@ -4169,7 +4169,7 @@ async def process():
                             )
                             if weak_provisional_target and not deep_on_weak:
                                 deep_skip_reason = "weak_provisional_target"
-    
+
                             if not deep_skip_reason and (not timed_out) and ((missing_contact > 0) or need_extra_fields):
                                 if over_time_limit() or over_deep_limit() or over_hard_deadline() or over_deep_phase_deadline():
                                     deep_skip_reason = "over_limit_before_deep"
@@ -4220,7 +4220,7 @@ async def process():
                                         related = {}
                                         related_meta = {}
                                         deep_skip_reason = deep_skip_reason or "deep_exception"
-    
+
                             deep_pages_visited = int((related_meta or {}).get("pages_visited") or len(related))
                             deep_fetch_count = int((related_meta or {}).get("fetch_count") or 0)
                             deep_fetch_failures = int((related_meta or {}).get("fetch_failures") or 0)
@@ -4415,7 +4415,7 @@ async def process():
                                         or need_revenue or need_profit or need_fiscal or need_founded or need_description
                                     ):
                                         break
-    
+
                             if homepage and (need_addr or not found_address) and not timed_out and not over_deep_phase_deadline():
                                 try:
                                     extra_docs = await asyncio.wait_for(
@@ -4434,7 +4434,7 @@ async def process():
                                 for url, pdata in extra_docs.items():
                                     priority_docs[url] = pdata
                                     absorb_doc_data(url, pdata)
-    
+
                             deep_phase_end = elapsed()
                             # ---- AI (final, max 1 call/company) ----
                             missing_contact, missing_extra = refresh_need_flags()
@@ -4466,13 +4466,13 @@ async def process():
                                     for u, d in (related or {}).items():
                                         if u not in docs_by_url:
                                             docs_by_url[u] = {
-                                                "text": d.get("text", "") or "",
-                                                "html": d.get("html", "") or "",
-                                            }
-    
+                                            "text": d.get("text", "") or "",
+                                            "html": d.get("html", "") or "",
+                                        }
+
                                     def _pt_priority(pt: str) -> int:
                                         return {"COMPANY_PROFILE": 0, "ACCESS_CONTACT": 1, "OTHER": 2, "BASES_LIST": 3, "DIRECTORY_DB": 4}.get(pt, 9)
-    
+
                                     scored_urls: list[tuple[int, str]] = []
                                     for u, d in docs_by_url.items():
                                         try:
@@ -4485,7 +4485,7 @@ async def process():
                                         scored_urls.append((_pt_priority(str(pt)), u))
                                     scored_urls.sort(key=lambda x: (x[0], x[1]))
                                     top_urls_for_ai = [u for _, u in scored_urls if u][:3]
-    
+
                                     def _pack_candidates(urls_for_ai: list[str]) -> dict[str, Any]:
                                         out: dict[str, Any] = {
                                             "company_name": name,
@@ -4522,7 +4522,7 @@ async def process():
                                             if biz:
                                                 out["business_snippets"].append({"url": u, "snippet": biz[:800], "page_type": pt})
                                         return out
-    
+
                                     ai_payload = _pack_candidates(top_urls_for_ai)
                                     screenshot_payload = None
                                     if info_url:
@@ -4534,7 +4534,7 @@ async def process():
                                             policy=VERIFY_AI_SCREENSHOT_POLICY,
                                         )
                                         screenshot_payload = (info_dict or {}).get("screenshot")
-    
+
                                     ai_started = time.monotonic()
                                     ai_attempted = True
                                     ai_result = await asyncio.wait_for(
@@ -4544,7 +4544,7 @@ async def process():
                                     ai_time_spent += time.monotonic() - ai_started
                                 except Exception:
                                     ai_result = None
-    
+
                                 if isinstance(ai_result, dict):
                                     ai_used = 1
                                     ai_model = AI_MODEL_NAME
@@ -4629,7 +4629,7 @@ async def process():
                                             company["business_tags"] = json.dumps(ai_result.get("business_tags")[:5], ensure_ascii=False)
                                         except Exception:
                                             company["business_tags"] = ""
-    
+
                             expected_phone = phone or rule_phone or None
                             expected_addr = found_address or addr or rule_address or ""
                             expected_addr = normalize_address(expected_addr) or ""
@@ -4671,7 +4671,7 @@ async def process():
                                     log.warning("[%s] verify_on_site 失敗", cid, exc_info=True)
                                     verify_result = quick_verify_result
                                     verify_result_source = "docs"
-    
+
                             phone_ok = bool(verify_result.get("phone_ok"))
                             addr_ok = bool(verify_result.get("address_ok"))
                             required = int(require_phone) + int(require_addr)
@@ -4685,7 +4685,7 @@ async def process():
                                 confidence = 0.75
                             else:
                                 confidence = 0.45
-    
+
                             # 公式フラグは「公式らしさ」の判定を優先し、verifyは追加根拠として扱う。
                             # ただし、電話/住所ともに具体的な期待値があるのに両方拾えない場合は疑わしいので降格する。
                             # 逆に、AI未確定/ブランドドメイン等で公式フラグが立たない場合でも、
