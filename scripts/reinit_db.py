@@ -49,6 +49,9 @@ CREATE TABLE IF NOT EXISTS companies (
     homepage_official_flag INTEGER,
     homepage_official_source TEXT,
     homepage_official_score REAL,
+    official_homepage TEXT,
+    alt_homepage TEXT,
+    alt_homepage_type TEXT,
     source_url_phone TEXT,
     source_url_address TEXT,
     source_url_rep TEXT

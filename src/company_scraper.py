@@ -481,6 +481,11 @@ class CompanyScraper:
         "akala.ai",
         "catr.jp",
         "metoree.com",
+        # 採用/求人・企業DB系（物流DBで誤採用が目立つ）
+        "job-gear.net",
+        "atcompany.jp",
+        "imitsu.jp",
+        "jbplt.jp",
     }
 
     SUSPECT_HOSTS = {
@@ -982,6 +987,24 @@ class CompanyScraper:
         whitelist_hit = any(host == wh or host.endswith(f".{wh}") for wh in cls.ALLOWED_HOST_WHITELIST)
         is_google_sites = host == "sites.google.com" or (host.endswith(".google.com") and "sites" in path_lower)
         return host, path_lower, allowed_tld, whitelist_hit, is_google_sites
+
+    @classmethod
+    def is_disallowed_official_host(cls, url: str) -> bool:
+        """
+        公式ホームページとして扱うべきでないホストかどうか。
+        - 企業DB/求人/ニュース配信など「第三者プラットフォーム」をここに集約し、
+          公式採用ロジックの複数箇所で統一して参照する。
+        """
+        try:
+            parsed = urllib.parse.urlparse(url or "")
+            host = (parsed.netloc or "").lower().split(":")[0]
+        except Exception:
+            host = ""
+        if host.startswith("www."):
+            host = host[4:]
+        if not host:
+            return False
+        return any(host == d or host.endswith(f".{d}") for d in (cls.HARD_EXCLUDE_HOSTS or set()))
 
     def is_relevant_profile_url(self, company_name: str, url: str) -> bool:
         try:

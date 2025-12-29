@@ -240,7 +240,7 @@ def clean_address_text(val):
         return None
     s = re.sub(r"\s+", " ", s)
     cut_re = re.compile(
-        r"\s*(?:TEL|電話|☎|℡|FAX|ファックス|メール|E[-\s]?mail|地図|マップ|Google\s*マップ|アクセス|営業時間|受付時間|定休日)\b",
+        r"\s*(?:TEL|電話|☎|℡|FAX|ファックス|メール|E[-\s]?mail|地図|マップ|Google(?:\s*マップ)?|アクセス|営業時間|受付時間|定休日|代表)\b",
         re.IGNORECASE,
     )
     m = cut_re.search(s)

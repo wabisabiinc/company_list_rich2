@@ -370,6 +370,17 @@ class DatabaseManager:
         if "ai_reason" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN ai_reason TEXT;")
             cols.add("ai_reason")
+        # ---- homepage model v2 ----
+        # homepage（互換）は「公式のみ」を維持し、候補URLや求人/企業DB等は別カラムに分離する。
+        if "official_homepage" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN official_homepage TEXT;")
+            cols.add("official_homepage")
+        if "alt_homepage" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN alt_homepage TEXT;")
+            cols.add("alt_homepage")
+        if "alt_homepage_type" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN alt_homepage_type TEXT;")
+            cols.add("alt_homepage_type")
 
         self.conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_companies_name_addr ON companies(company_name, address);"
@@ -709,7 +720,7 @@ class DatabaseManager:
             contact_match = contact_pattern.search(s)
             if contact_match:
                 s = s[: contact_match.start()]
-            map_match = re.search(r"(地図アプリ|地図で見る|マップ|Google\s*マップ|アクセス|ルート|Route|Directions|行き方)", s, flags=re.IGNORECASE)
+            map_match = re.search(r"(地図アプリ|地図で見る|マップ|Google(?:\s*マップ)?|アクセス|ルート|Route|Directions|行き方)", s, flags=re.IGNORECASE)
             if map_match:
                 s = s[: map_match.start()]
             arrow_idx = min([idx for idx in (s.find("→"), s.find("⇒")) if idx >= 0], default=-1)
@@ -720,7 +731,7 @@ class DatabaseManager:
                 r"\s*(?:"
                 r"従業員(?:数)?|社員(?:数)?|職員(?:数)?|スタッフ(?:数)?|人数|"
                 r"営業時間|受付時間|定休日|"
-                r"代表者|代表取締役|取締役|社長|会長|理事長|"
+                r"代表者|代表取締役|取締役|社長|会長|理事長|代表|"
                 r"資本金|設立|創業|沿革|"
                 r"(?:一般|特定)?(?:貨物|運送|建設|産廃|産業廃棄物|古物)?(?:業)?(?:許可|免許|登録|届出)|"
                 r"事業内容|サービス|"

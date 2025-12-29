@@ -55,6 +55,7 @@ SELECT id, company_name, homepage, phone, source_csv
 ## データ保全ポリシー
 
 - `homepage/phone/address/rep_name/description/listing…` など既存の列は**空欄のみ**を埋め、値が入っている場合は触りません。
+- `homepage` は「公式と確定したURLのみ」を保存し、公式でない候補URL（求人/企業DB等）は `provisional_homepage` や `alt_homepage/alt_homepage_type` 側に退避します。
 - 公式スクレイプの進捗を壊さないため、既存の `done/review/error` は維持し、新規行のみ `pending` で挿入します。
 - 取り込みスクリプトは `hubspot_id/corporate_number` などの追加カラムを使って名寄せし、同一企業を重複登録しないようにしています。
 - DB保存時に各テキスト列（`description/listing/revenue/...`）はクレンジングされ、列に不適切なノイズ（URL/連絡先/定型文など）が混入した場合は空欄化されます。

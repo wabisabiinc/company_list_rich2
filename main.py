@@ -308,13 +308,13 @@ def normalize_address(s: str | None) -> str | None:
             r"\s*(?:"
             r"従業員(?:数)?|社員(?:数)?|職員(?:数)?|スタッフ(?:数)?|人数|"
             r"営業時間|受付時間|定休日|"
-            r"代表者|代表取締役|取締役|社長|会長|理事長|rep(?:\s|$)|rep\s*[:=]?|"
+            r"代表者|代表取締役|取締役|社長|会長|理事長|代表|rep(?:\s|$)|rep\s*[:=]?|"
             r"資本金|設立|創業|沿革|"
             r"(?:一般|特定)?(?:貨物|運送|建設|産廃|産業廃棄物|古物)?(?:業)?(?:許可|免許|登録|届出)|"
             r"ホーム|home|トップ|top|最新情報|お知らせ|ニュース|news|ブログ|blog|"
             r"会社概要|会社情報|企業情報|会社案内|"
             r"事業内容|サービス|"
-            r"お問い合わせ|お問合せ|問い合わせ|採用|求人"
+            r"お問い合わせ|お問合せ|問い合わせ|採用|求人|Google"
             r")",
             re.IGNORECASE,
         )
@@ -1836,8 +1836,10 @@ async def process():
 
             cid = company.get("id")
             name = (company.get("company_name") or "").strip()
-            addr_raw = (company.get("address") or "").strip()
-            company["csv_address"] = addr_raw
+            # 入力住所は csv_address を優先（古いDBは address に入っているためフォールバック）
+            addr_raw = (company.get("csv_address") or company.get("address") or "").strip()
+            if not (company.get("csv_address") or "").strip():
+                company["csv_address"] = addr_raw
             addr = normalize_address(addr_raw) or ""
             input_addr_has_zip = bool(ZIP_CODE_RE.search(addr))
             input_addr_has_city = bool(CITY_RE.search(addr))
@@ -3027,8 +3029,10 @@ async def process():
                                 # AIの"official"は誤爆もあるため、弱い根拠だけで早期確定しない。
                                 # （総処理時間の上限は変えず、候補の追加fetchも増やさずに、採用条件のみ厳格化する）
                                 news_like = _is_news_like_url(normalized_url)
+                                disallowed_official_host = CompanyScraper.is_disallowed_official_host(normalized_url or "")
                                 ai_strong_accept = bool(
                                     (not directory_like)
+                                    and (not disallowed_official_host)
                                     and fast_domain_ok
                                     and (
                                         name_hit
@@ -3040,7 +3044,7 @@ async def process():
                                 if not ai_strong_accept:
                                     force_review = True
                                     log.info(
-                                        "[%s] AI official (weak) -> review-only: %s (domain=%s host=%s name=%s addr=%s evidence=%s conf=%.2f)",
+                                        "[%s] AI official (weak) -> review-only: %s (domain=%s host=%s name=%s addr=%s evidence=%s disallowed_host=%s conf=%.2f)",
                                         cid,
                                         normalized_url,
                                         domain_score,
@@ -3048,6 +3052,7 @@ async def process():
                                         name_hit,
                                         fast_address_ok,
                                         evidence_score,
+                                        disallowed_official_host,
                                         ai_conf_f,
                                     )
                                     # ルール評価に回して、より強い候補があればそちらを優先する
@@ -3105,6 +3110,7 @@ async def process():
                                     and not directory_like
                                     and not record.get("ai_conflict")
                                     and ai_is_official_effective is not False
+                                    and not CompanyScraper.is_disallowed_official_host(normalized_url or "")
                                     and (
                                         evidence_score >= 10
                                         or (address_ok and not input_addr_pref_only)
@@ -3237,6 +3243,11 @@ async def process():
                                 homepage_official_score = float(rule_details.get("score") or 0.0)
                                 chosen_domain_score = domain_score
                                 if ai_official_primary:
+                                    force_review = True
+                                # disallowed host は公式にしない（候補としては保持）
+                                if homepage and int(homepage_official_flag or 0) == 1 and CompanyScraper.is_disallowed_official_host(homepage):
+                                    homepage_official_flag = 0
+                                    homepage_official_source = "rule_review_disallowed_host"
                                     force_review = True
                                 if record.get("ai_conflict"):
                                     homepage_official_source = "rule_ai_conflict" if not ai_official_primary else "rule_review_ai_conflict"
@@ -5217,12 +5228,41 @@ async def process():
                                 homepage_official_score = 0.0
                                 chosen_domain_score = 0
 
+                        # 4) disallowed host は official でも homepage に保存しない（DB汚染を防ぐ）
+                        if homepage and int(homepage_official_flag or 0) == 1 and CompanyScraper.is_disallowed_official_host(homepage):
+                            if not provisional_store:
+                                provisional_store = homepage
+                                if not (company.get("provisional_reason") or "").strip():
+                                    company["provisional_reason"] = "disallowed_official_host"
+                            homepage = ""
+                            homepage_official_flag = 0
+                            homepage_official_source = ""
+                            homepage_official_score = 0.0
+                            chosen_domain_score = 0
+
+                        # 5) homepageモデルv2: official と候補を分離して保持
+                        official_homepage = homepage if (homepage and int(homepage_official_flag or 0) == 1) else ""
+                        alt_homepage = ""
+                        alt_homepage_type = ""
+                        if not official_homepage:
+                            alt_homepage = (provisional_store or final_homepage_candidate or "").strip()
+                            if alt_homepage:
+                                if CompanyScraper.is_disallowed_official_host(alt_homepage):
+                                    alt_homepage_type = "platform"
+                                elif _is_free_host(alt_homepage):
+                                    alt_homepage_type = "free_host"
+                                else:
+                                    alt_homepage_type = "candidate"
+
                         # company dict も同期してDB/CSVと状態が一致するようにする
                         company["homepage"] = homepage
                         company["homepage_official_flag"] = int(homepage_official_flag or 0)
                         company["homepage_official_source"] = str(homepage_official_source or "")
                         company["homepage_official_score"] = float(homepage_official_score or 0.0)
                         company["provisional_homepage"] = provisional_store
+                        company["official_homepage"] = official_homepage
+                        company["alt_homepage"] = alt_homepage
+                        company["alt_homepage_type"] = alt_homepage_type
                         company["final_homepage"] = final_homepage_candidate
 
                         if not homepage:
