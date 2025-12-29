@@ -1288,8 +1288,14 @@ class CompanyScraper:
         # remove parentheses content
         text = re.sub(r"[（(][^）)]*[）)]", "", text)
         # keep only segment before punctuation/newline
-        text = re.split(r"[、。\n/|｜,;；]", text)[0]
+        text = re.split(r"[、。\n/|｜,;；:：]", text)[0]
         text = text.strip(" 　:：-‐―－ー'\"/／")
+        # フォーム/検索UI由来の誤抽出を除外
+        if re.search(r"(キーワード|検索)", text):
+            return None
+        # 代表者欄に自治体/官公庁名が入る誤抽出を除外
+        if re.search(r"(県庁|市役所|区役所|町役場|村役場|都庁|庁)$", text):
+            return None
         titles = (
             "代表取締役社長", "代表取締役副社長", "代表取締役会長", "代表取締役",
             "代表社員", "代表理事", "代表理事長", "代表執行役", "代表執行役社長",
@@ -1319,6 +1325,8 @@ class CompanyScraper:
             "取締役副社長",
             "専務取締役",
             "常務取締役",
+            "専務",
+            "常務",
             "取締役",
             "執行役",
             "監査役",

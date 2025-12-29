@@ -896,7 +896,8 @@ def _rep_candidate_ok(
     if page_type == "OTHER":
         if low_role:
             return False, "low_role_other"
-        if profile_like or strong_source:
+        # OTHER は誤爆が多い（検索UI/フッター断片等）。URLがプロフィール導線である場合のみ許可する。
+        if profile_like:
             return True, ""
         return False, "other_not_profile"
     return False, f"not_profile:{page_type}"
@@ -1964,7 +1965,8 @@ async def process():
             phone = (company.get("phone") or "").strip()
             found_address = (company.get("found_address") or "").strip()
             rep_name_val = (scraper.clean_rep_name(company.get("rep_name")) or "").strip()
-            description_val = (company.get("description") or "").strip()
+            # description を毎回AI由来にする場合は、既存値でAI生成がブロックされないように初期値を空にする
+            description_val = "" if AI_DESCRIPTION_ALWAYS else (company.get("description") or "").strip()
             listing_val = clean_listing_value(company.get("listing") or "")
             revenue_val = clean_amount_value(company.get("revenue") or "")
             profit_val = clean_amount_value(company.get("profit") or "")
@@ -2726,6 +2728,14 @@ async def process():
                                         return record, None
                                     ai_time_spent += time.monotonic() - ai_started
                                     ai_official_attempted = True
+                                    # AI公式判定を呼んだ事実は保存しておく（descriptionの由来追跡などに使う）
+                                    try:
+                                        nonlocal ai_used, ai_model
+                                        ai_used = 1
+                                        if not ai_model:
+                                            ai_model = AI_MODEL_NAME or ""
+                                    except Exception:
+                                        pass
                                     # AI公式のうち、ドメイン/ルール根拠が弱いものは「確定公式には使わない」が、
                                     # deep起点としては保持する（除外扱いに落とさない）。
                                     if ai_verdict and ai_verdict.get("is_official") and domain_score < 4 and not record.get("rule", {}).get("address_match"):
@@ -4133,12 +4143,13 @@ async def process():
                             if info_dict:
                                 payloads.append(info_dict)
                             payloads.extend(priority_docs.values())
-                            for pdata in payloads:
-                                desc = extract_description_from_payload(pdata)
-                                if desc:
-                                    description_val = desc
-                                    need_description = False
-                                    break
+                            if not AI_DESCRIPTION_ALWAYS:
+                                for pdata in payloads:
+                                    desc = extract_description_from_payload(pdata)
+                                    if desc:
+                                        description_val = desc
+                                        need_description = False
+                                        break
 
                         if rule_phone:
                             phone = rule_phone
@@ -4480,7 +4491,7 @@ async def process():
                                                 drop_reasons["rep"] = drop_reasons.get("rep") or reason
                                                 drop_details_by_url.setdefault(url, {})["rep"] = reason
                                                 log.info("[%s] deep_crawl rejected rep reason=%s url=%s cand=%s", cid, reason, url, cand_rep)
-                                    if need_description and cc.get("description"):
+                                    if (not AI_DESCRIPTION_ALWAYS) and need_description and cc.get("description"):
                                         desc = clean_description_value(cc["description"])
                                         if desc:
                                             description_val = desc
@@ -4905,6 +4916,26 @@ async def process():
                         # 公式サイトが無い場合のみ、検索結果の非公式ページから連絡先を補完
                         if not homepage and (not phone or not found_address or not rep_name_val):
                             for url, data in fallback_cands:
+                                # 企業DB/ディレクトリ/まとめサイト由来の代表者は誤爆が多いので採用しない
+                                try:
+                                    dir_hint = scraper._detect_directory_like(url or "", text="", html="")  # type: ignore[attr-defined]
+                                    if bool(dir_hint.get("is_directory_like")) and int(dir_hint.get("directory_score") or 0) >= DIRECTORY_HARD_REJECT_SCORE:
+                                        # phone/address は補完対象として残すが rep_name は見ない
+                                        if not phone and data.get("phone_numbers"):
+                                            cand = pick_best_phone(data["phone_numbers"])
+                                            if cand:
+                                                phone = cand
+                                                phone_source = "rule"
+                                                src_phone = url
+                                        if not found_address and data.get("addresses"):
+                                            cand_addr = pick_best_address(addr, data["addresses"])
+                                            if cand_addr:
+                                                found_address = cand_addr
+                                                address_source = "rule"
+                                                src_addr = url
+                                        continue
+                                except Exception:
+                                    pass
                                 if not phone and data.get("phone_numbers"):
                                     cand = pick_best_phone(data["phone_numbers"])
                                     if cand:
@@ -4921,6 +4952,16 @@ async def process():
                                     cand_rep = pick_best_rep(data["rep_names"], url)
                                     cand_rep = scraper.clean_rep_name(cand_rep) if cand_rep else None
                                     if cand_rep:
+                                        # no_homepage（非公式補完）の代表者は「構造化+役職ペア」由来のみ許可し、LABEL単独は弾く
+                                        try:
+                                            meta = _rep_candidate_meta(data.get("rep_names") or [], cand_rep)
+                                            strong_structured = bool(meta.get("table") or meta.get("role") or meta.get("jsonld"))
+                                            if not strong_structured:
+                                                drop_reasons["rep"] = drop_reasons.get("rep") or "fallback_rep_not_structured"
+                                                continue
+                                        except Exception:
+                                            drop_reasons["rep"] = drop_reasons.get("rep") or "fallback_rep_meta_error"
+                                            continue
                                         pt_fallback = page_type_per_url.get(url) or "OTHER"
                                         rep_ok, rep_reason = _rep_candidate_ok(
                                             cand_rep,
@@ -5002,6 +5043,9 @@ async def process():
                         city_match = int(bool(csv_city_m and hp_city_m and csv_city_m.group(1) == hp_city_m.group(1))) if (csv_city_m and hp_city_m) else None
                         rep_name_val = scraper.clean_rep_name(rep_name_val) or ""
                         description_val = clean_description_value(sanitize_text_block(description_val))
+                        # AI_DESCRIPTION_ALWAYS でも生成できなかった場合、既存の説明があれば保持（空欄化による情報欠落を防ぐ）
+                        if AI_DESCRIPTION_ALWAYS and not description_val:
+                            description_val = clean_description_value(company.get("description") or "")
                         listing_val = clean_listing_value(listing_val)
                         capital_val = ai_normalize_amount(capital_val) or clean_amount_value(capital_val)
                         revenue_val = ai_normalize_amount(revenue_val) or clean_amount_value(revenue_val)

@@ -22,3 +22,13 @@ def test_rep_candidate_ok_allows_greeting_like_url_even_if_other():
     assert ok is True
     assert reason == ""
 
+
+def test_rep_candidate_ok_rejects_other_even_if_strong_source_when_not_profile_like():
+    ok, reason = _rep_candidate_ok(
+        "キーワード",
+        ["[LABEL]キーワード"],
+        "OTHER",
+        "https://houjin.example.com/search",
+    )
+    assert ok is False
+    assert reason == "other_not_profile"
