@@ -1638,8 +1638,8 @@ class CompanyScraper:
             if marker in path_lower:
                 score += 3
                 break
-        # 採用/ブログ等なら減点
-        for marker in ("/recruit", "/careers", "/job", "/jobs", "/blog", "/news"):
+        # 採用/ブログ/ニュース/プレス/リリース等なら減点（トップページ採用の誤爆抑止）
+        for marker in ("/recruit", "/careers", "/job", "/jobs", "/blog", "/news", "/press", "/release", "/topics", "/media", "/information"):
             if marker in path_lower:
                 score -= 2
                 break
@@ -1664,7 +1664,7 @@ class CompanyScraper:
                 score += 3
                 break
         # 非公式に寄せるパスの軽い減点
-        for marker in ("/recruit", "/careers", "/job", "/jobs", "/blog", "/news", "/store", "/shop"):
+        for marker in ("/recruit", "/careers", "/job", "/jobs", "/blog", "/news", "/press", "/release", "/topics", "/media", "/information", "/store", "/shop"):
             if marker in path:
                 score -= 2
                 break

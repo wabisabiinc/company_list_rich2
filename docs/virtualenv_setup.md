@@ -74,7 +74,7 @@ python -m playwright install chromium
 cp .env.example .env
 ```
 
-`.env` の `GEMINI_API_KEY` を設定してください（他PCでも同じキーでOK）。必要に応じて `DATABASE_URL` なども調整します。
+`.env` の `GEMINI_API_KEY` を設定してください（運用上は「PC/ユーザーごとに別キー」を推奨。共有すると漏洩時の影響が大きくなります）。必要に応じて `DATABASE_URL` なども調整します。
 
 ### 5-2. マスターPC: DB を分配する
 

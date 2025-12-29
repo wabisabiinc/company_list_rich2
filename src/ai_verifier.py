@@ -22,7 +22,8 @@ def _getenv_bool(name: str, default: bool = False) -> bool:
     v = os.getenv(name)
     return (str(v).strip().lower() == "true") if v is not None else default
 
-USE_AI: bool = _getenv_bool("USE_AI", False)
+# main.py と挙動を揃える（未指定時は true）。
+USE_AI: bool = _getenv_bool("USE_AI", True)
 API_KEY: str = (os.getenv("GEMINI_API_KEY") or "").strip()
 DEFAULT_MODEL: str = (os.getenv("GEMINI_MODEL") or "gemini-2.5-flash-lite").strip()
 AI_CONTEXT_PATH: str = os.getenv("AI_CONTEXT_PATH", "docs/ai_context.md")
@@ -51,13 +52,7 @@ if AI_ENABLED:
         AI_ENABLED = False
         GEN_IMPORT_ERROR = e
 
-# ---- logging ----------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
 log = logging.getLogger(__name__)
-log.info(f"[ai_verifier] AI_ENABLED={AI_ENABLED}, USE_AI={USE_AI}, KEY_SET={bool(API_KEY)}, GEN_OK={generativeai is not None}")
 AI_CALL_TIMEOUT_SEC = float(os.getenv("AI_CALL_TIMEOUT_SEC", "20") or 0)
 
 # ---- compiled regex (noise filters) -----------------------------
@@ -295,6 +290,14 @@ class AIVerifier:
         if model is not None:
             self.model = model
         else:
+            log.info(
+                "[ai_verifier] AI_ENABLED=%s USE_AI=%s KEY_SET=%s GEN_OK=%s model=%s",
+                AI_ENABLED,
+                USE_AI,
+                bool(API_KEY),
+                generativeai is not None,
+                DEFAULT_MODEL,
+            )
             if AI_ENABLED:
                 try:
                     self.model = generativeai.GenerativeModel(DEFAULT_MODEL)  # type: ignore

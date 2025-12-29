@@ -797,6 +797,29 @@ def _is_profile_like_url(url: str | None) -> bool:
         return False
     return any(seg in path for seg in ("/company", "/about", "/corporate", "/profile", "/overview", "/summary", "/gaiyo", "/gaiyou"))
 
+def _is_news_like_url(url: str | None) -> bool:
+    """
+    公式判定で「記事/リリース/ニュース」系が強く混ざるURLを検出する。
+    子会社紹介/グループニュース等は住所が一致しても誤って公式採用されやすいので、早期確定を抑止する。
+    """
+    if not url:
+        return False
+    try:
+        path = urlparse(url).path.lower()
+    except Exception:
+        return False
+    return any(seg in path for seg in (
+        "/news",
+        "/release",
+        "/press",
+        "/topics",
+        "/media",
+        "/information",
+        "/blog",
+        "/article",
+        "/post",
+    ))
+
 def _is_contact_like_url(url: str | None) -> bool:
     if not url:
         return False
@@ -2954,11 +2977,12 @@ async def process():
                             if ai_is_official_effective is True:
                                 # AIの"official"は誤爆もあるため、弱い根拠だけで早期確定しない。
                                 # （総処理時間の上限は変えず、候補の追加fetchも増やさずに、採用条件のみ厳格化する）
+                                news_like = _is_news_like_url(normalized_url)
                                 ai_strong_accept = bool(
                                     fast_domain_ok
                                     and (
                                         name_hit
-                                        or address_ok
+                                        or (address_ok and name_present and not news_like)
                                         or evidence_score >= 10
                                         or ("jsonld:org_name" in official_evidence)
                                     )
