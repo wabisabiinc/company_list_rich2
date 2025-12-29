@@ -143,7 +143,13 @@ AI_CLEAR_NEGATIVE_FLAGS = os.getenv("AI_CLEAR_NEGATIVE_FLAGS", "false").lower() 
 
 # 暫定URL（provisional_*）を homepage として保存するかどうか。
 # - false の場合でも provisional_homepage/final_homepage には記録する。
-SAVE_PROVISIONAL_HOMEPAGE = os.getenv("SAVE_PROVISIONAL_HOMEPAGE", "true").lower() == "true"
+SAVE_PROVISIONAL_HOMEPAGE = os.getenv("SAVE_PROVISIONAL_HOMEPAGE", "false").lower() == "true"
+# 暫定URL（provisional/ai_provisional）を落とすポリシー判定を適用するか（既定: true）
+APPLY_PROVISIONAL_HOMEPAGE_POLICY = os.getenv("APPLY_PROVISIONAL_HOMEPAGE_POLICY", "true").lower() == "true"
+# official 判定できない場合、homepage を空欄にする（誤保存を防ぐ。既定: true）
+REQUIRE_OFFICIAL_HOMEPAGE = os.getenv("REQUIRE_OFFICIAL_HOMEPAGE", "true").lower() == "true"
+# directory_like を強く疑う場合のハード拒否閾値（既定: 9）
+DIRECTORY_HARD_REJECT_SCORE = int(os.getenv("DIRECTORY_HARD_REJECT_SCORE", "9"))
 DEFAULT_TIME_LIMIT_FETCH_ONLY = TIME_LIMIT_FETCH_ONLY
 DEFAULT_TIME_LIMIT_WITH_OFFICIAL = TIME_LIMIT_WITH_OFFICIAL
 DEFAULT_TIME_LIMIT_DEEP = TIME_LIMIT_DEEP
@@ -2877,6 +2883,7 @@ async def process():
                             address_ok = bool(addr) and (addr_hit or zip_hit or pref_only_ok)
                             evidence_score = int(rule_details.get("official_evidence_score") or 0)
                             directory_like = bool(rule_details.get("directory_like"))
+                            directory_score = int(rule_details.get("directory_score") or 0)
                             host_name, _, allowed_tld, whitelist_host, _ = CompanyScraper._allowed_official_host(normalized_url or "")
                             content_strong = name_hit and (address_ok or evidence_score >= 9)
                             ai_judge = record.get("ai_judge")
@@ -2962,13 +2969,27 @@ async def process():
                                     # Low confidence: keep for rule evaluation
                                     record["ai_low_confidence"] = True
 
+                            # directory_like は原則非公式（企業DB/まとめ）。強いシグナルはAIの誤爆でも採用しない。
+                            # domain_scoreが極端に強い場合は例外を残すが、基本はハードに落とす。
+                            if directory_like and directory_score >= DIRECTORY_HARD_REJECT_SCORE and domain_score < 4 and not (host_token_hit or strong_domain_host):
+                                manager.upsert_url_flag(
+                                    normalized_url,
+                                    is_official=False,
+                                    source="rule",
+                                    reason="directory_like_hard",
+                                    confidence=directory_score,
+                                )
+                                fallback_cands.append((record.get("url"), extracted))
+                                log.info("[%s] directory_like(hard) -> skip: %s", cid, record.get("url"))
+                                continue
+
                             if directory_like and not ai_is_official_effective:
                                 manager.upsert_url_flag(
                                     normalized_url,
                                     is_official=False,
                                     source="rule",
                                     reason="directory_like",
-                                    confidence=rule_details.get("directory_score"),
+                                    confidence=directory_score,
                                 )
                                 fallback_cands.append((record.get("url"), extracted))
                                 log.info("[%s] directory_like -> skip: %s", cid, record.get("url"))
@@ -2987,7 +3008,8 @@ async def process():
                                 # （総処理時間の上限は変えず、候補の追加fetchも増やさずに、採用条件のみ厳格化する）
                                 news_like = _is_news_like_url(normalized_url)
                                 ai_strong_accept = bool(
-                                    fast_domain_ok
+                                    (not directory_like)
+                                    and fast_domain_ok
                                     and (
                                         name_hit
                                         or (address_ok and name_present and not news_like)
@@ -3060,6 +3082,7 @@ async def process():
                                     brand_allowed
                                     and content_strong
                                     and not _is_free_host(normalized_url)
+                                    and not directory_like
                                     and not record.get("ai_conflict")
                                     and ai_is_official_effective is not False
                                     and (
@@ -5085,8 +5108,9 @@ async def process():
                             if accuracy_payload:
                                 company.update(accuracy_payload)
 
-                        # 暫定URLの保存可否（SAVE_PROVISIONAL_HOMEPAGE=false のときだけ抑制）
-                        if not SAVE_PROVISIONAL_HOMEPAGE:
+                        # ---- homepage保存ポリシー（誤保存を防ぐ最終ゲート） ----
+                        # 1) provisional_* の弱いものを落とす（既定: 有効）
+                        if APPLY_PROVISIONAL_HOMEPAGE_POLICY and homepage:
                             decision = apply_provisional_homepage_policy(
                                 homepage=homepage,
                                 homepage_official_flag=int(homepage_official_flag or 0),
@@ -5102,7 +5126,7 @@ async def process():
                             )
                             if decision.dropped:
                                 log.info(
-                                    "[%s] 暫定URLを保存しません (domain_score=%s host_token=%s name=%s addr=%s): %s",
+                                    "[%s] provisional policy dropped (domain_score=%s host_token=%s name=%s addr=%s): %s",
                                     cid,
                                     chosen_domain_score,
                                     provisional_host_token,
@@ -5115,12 +5139,33 @@ async def process():
                             homepage_official_source = decision.homepage_official_source
                             homepage_official_score = decision.homepage_official_score
                             chosen_domain_score = decision.chosen_domain_score
-                            if decision.dropped:
-                                # company dict も同期してDB/CSVと状態が一致するようにする（final_homepage は保持）
-                                company["homepage"] = ""
-                                company["homepage_official_flag"] = 0
-                                company["homepage_official_source"] = ""
-                                company["homepage_official_score"] = 0.0
+
+                        # 2) final_homepage は「候補として最終的に残ったURL」を保持（homepage が空でも残す）
+                        final_homepage_candidate = homepage or ""
+
+                        # 3) official と確定できない場合は homepage を空欄にし、候補は provisional_homepage に退避
+                        provisional_store = (provisional_homepage or forced_provisional_homepage or "").strip()
+                        if homepage and int(homepage_official_flag or 0) != 1:
+                            source = str(homepage_official_source or "")
+                            is_provisional_source = source.startswith("provisional") or source.startswith("ai_provisional")
+                            if REQUIRE_OFFICIAL_HOMEPAGE or (is_provisional_source and not SAVE_PROVISIONAL_HOMEPAGE):
+                                if not provisional_store:
+                                    provisional_store = homepage
+                                    if not (company.get("provisional_reason") or "").strip():
+                                        company["provisional_reason"] = "non_official_candidate"
+                                homepage = ""
+                                homepage_official_flag = 0
+                                homepage_official_source = ""
+                                homepage_official_score = 0.0
+                                chosen_domain_score = 0
+
+                        # company dict も同期してDB/CSVと状態が一致するようにする
+                        company["homepage"] = homepage
+                        company["homepage_official_flag"] = int(homepage_official_flag or 0)
+                        company["homepage_official_source"] = str(homepage_official_source or "")
+                        company["homepage_official_score"] = float(homepage_official_score or 0.0)
+                        company["provisional_homepage"] = provisional_store
+                        company["final_homepage"] = final_homepage_candidate
 
                         if not homepage:
                             top3_urls = list(urls or [])[:3]

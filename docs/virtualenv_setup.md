@@ -27,6 +27,7 @@ python -m playwright install chromium
 - `VERIFY_DOCS_REQUIRED`（デフォルト `true`）は、AI公式採用時に「会社概要/連絡先」ページを最小限だけ事前取得して `verify=docs` の精度と速度を上げます
 - `REP_STRICT_SOURCES`（デフォルト `true`）は、代表者名を構造化ソース（table/dl/label/JSON-LD等）中心に制限して誤抽出を減らします
 - description を毎回AIで作りたい場合は `AI_DESCRIPTION_ALWAYS=true`（既定true）と `AI_DESCRIPTION_FALLBACK_CALL=true` を使います（既存値は保持しません）
+- 公式サイトが無い/不明なケースで誤ったURLを `homepage` に保存したくない場合は `REQUIRE_OFFICIAL_HOMEPAGE=true`（既定true）を維持し、暫定URLは `final_homepage/provisional_homepage` で確認します
 
 ## 3. VS Code と連携して毎回自動で有効化
 

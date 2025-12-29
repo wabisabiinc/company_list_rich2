@@ -82,6 +82,10 @@ COMPANIES_DB_PATH=data/companies_logistics.db python3 main.py
 - `AI_SCREENSHOT_POLICY=auto/always/never`（AIに渡すスクショ方針。`auto` は本文が十分ならスクショ無しで高速化）
 - `OFFICIAL_AI_SCREENSHOT_POLICY=always/never/auto`（公式判定AIのスクショ方針。デフォルト `always`）
 - `VERIFY_AI_SCREENSHOT_POLICY`（抽出AI（verify/最終選択）のスクショ方針。未指定時は `AI_SCREENSHOT_POLICY`）
+- `REQUIRE_OFFICIAL_HOMEPAGE`（official確定できないURLを `homepage` に保存しない。既定 `true`）
+- `SAVE_PROVISIONAL_HOMEPAGE`（暫定URLを `homepage` にも保存する。既定 `false`。`final_homepage/provisional_homepage` には常に記録）
+- `APPLY_PROVISIONAL_HOMEPAGE_POLICY`（弱い暫定URLを自動で落とす。既定 `true`）
+- `DIRECTORY_HARD_REJECT_SCORE`（企業DB/ディレクトリ疑いのハード拒否閾値。既定 `9`）
 - `SEARCH_CANDIDATE_LIMIT`（検索候補の最大数）
 - `RELATED_BASE_PAGES`, `RELATED_MAX_HOPS_BASE`（深掘りのページ数/ホップ上限。内部でも最大3にクランプ）
 
