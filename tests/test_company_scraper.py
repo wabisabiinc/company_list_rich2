@@ -215,6 +215,12 @@ def test_clean_rep_name_strips_exec_officer_variants(scraper):
     assert scraper.clean_rep_name("代表取締役社長執行役員 塩津伸男") == "塩津伸男"
     assert scraper.clean_rep_name("代表取締役社長 執行役員 塩津伸男") == "塩津伸男"
 
+def test_clean_rep_name_strips_candidate_tags_and_bracket_labels(scraper):
+    assert scraper.clean_rep_name("[TABLE] 田中太郎") == "田中太郎"
+    assert scraper.clean_rep_name("[LABEL][ROLE] 代表取締役社長 田中太郎") == "田中太郎"
+    assert scraper.clean_rep_name("【代表取締役】田中太郎") == "田中太郎"
+    assert scraper.clean_rep_name("［代表者］田中太郎") == "田中太郎"
+
 def test_clean_rep_name_rejects_generic_company_word(scraper):
     assert scraper.clean_rep_name("企業") is None
 

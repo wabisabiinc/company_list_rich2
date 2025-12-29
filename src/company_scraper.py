@@ -1295,6 +1295,32 @@ class CompanyScraper:
         text = unicodedata.normalize("NFKC", str(raw).replace("\u200b", "")).strip()
         if not text:
             return None
+        # 抽出候補に付く機械タグ（例: [TABLE][LABEL]）を除去
+        while True:
+            m = re.match(r"^\[([A-Z_]+)\]\s*", text)
+            if not m:
+                break
+            text = text[m.end():].lstrip()
+        # ラベルが角括弧で囲われるケース（例: [代表者]山田太郎）を除去
+        for _ in range(3):
+            m = re.match(r"^\[(.{1,20})\]\s*", text)
+            if not m:
+                break
+            label = m.group(1)
+            if re.search(r"(代表|取締役|社長|会長|理事|CEO|COO|CFO|CTO|院長|学長|園長|校長|所長|組合長)", label, flags=re.I):
+                text = text[m.end():].lstrip()
+                continue
+            break
+        # 代表者ラベルが括弧で囲われるケース（例: 【代表取締役】山田太郎）を除去
+        for _ in range(3):
+            m = re.match(r"^[【［](.{1,20})[】］]\s*", text)
+            if not m:
+                break
+            label = m.group(1)
+            if re.search(r"(代表|取締役|社長|会長|理事|CEO|COO|CFO|CTO|院長|学長|園長|校長|所長|組合長)", label, flags=re.I):
+                text = text[m.end():].lstrip()
+                continue
+            break
         cta_words = (
             "こちら",
             "詳しく",
