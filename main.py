@@ -78,6 +78,7 @@ USE_AI_DESCRIPTION = os.getenv("USE_AI_DESCRIPTION", "false").lower() == "true"
 # description を「毎回AIで作る」方針（既定: true）。false の場合は既存値を保持し、必要時のみ作る。
 AI_DESCRIPTION_ALWAYS = os.getenv("AI_DESCRIPTION_ALWAYS", "true").lower() == "true"
 # AI_DESCRIPTION_ALWAYS=true でも、AI由来descriptionが取れなかったときに追加のAI呼び出しで補うか（既定: true）
+# 呼び出し回数/時間は増えるが、description 欠損を確実に潰すため既定は true
 AI_DESCRIPTION_FALLBACK_CALL = os.getenv("AI_DESCRIPTION_FALLBACK_CALL", "true").lower() == "true"
 # requeue/retry時に既存descriptionを破棄して再生成したい場合のみ true（AI_DESCRIPTION_ALWAYS が優先）
 REGENERATE_DESCRIPTION = os.getenv("REGENERATE_DESCRIPTION", "false").lower() == "true"
@@ -208,6 +209,11 @@ GENERIC_DESCRIPTION_TERMS = {
 }
 DESCRIPTION_MIN_LEN = max(6, int(os.getenv("DESCRIPTION_MIN_LEN", "10")))
 DESCRIPTION_MAX_LEN = max(DESCRIPTION_MIN_LEN, int(os.getenv("DESCRIPTION_MAX_LEN", "200")))
+# DBへ保存する「最終description」の統一ルール（AI/ルール問わず）
+FINAL_DESCRIPTION_MIN_LEN = max(20, int(os.getenv("FINAL_DESCRIPTION_MIN_LEN", "80")))
+FINAL_DESCRIPTION_MAX_LEN = max(FINAL_DESCRIPTION_MIN_LEN, int(os.getenv("FINAL_DESCRIPTION_MAX_LEN", "160")))
+# 「どんな事業・業種か」を毎回推定して格納する（AIの追加呼び出し無し）
+INFER_INDUSTRY_ALWAYS = os.getenv("INFER_INDUSTRY_ALWAYS", "true").lower() == "true"
 DESCRIPTION_BIZ_KEYWORDS = (
     "事業", "製造", "開発", "販売", "提供", "サービス", "運営", "支援", "施工", "設計", "製作",
     "物流", "建設", "工事", "コンサル", "consulting", "solution", "ソリューション",
@@ -579,7 +585,78 @@ def _official_signal_ok(
 ) -> bool:
     strong_domain = host_token_hit or strong_domain_host or domain_score >= 4
     name_or_addr = name_hit or address_ok or official_evidence_score >= 9
-    return bool(strong_domain and name_or_addr)
+    if strong_domain and name_or_addr:
+        return True
+    # ロジスティクス系では「社名(日本語)とドメイン(英字)が一致しにくい」ケースが多いため、
+    # domain_score==3 でも社名/住所の根拠が強ければ公式扱いを許容する（directory対策は前段で実施済み）。
+    medium_domain = domain_score >= 3
+    if medium_domain and name_hit and (address_ok or official_evidence_score >= 7):
+        return True
+    if medium_domain and official_evidence_score >= 11:
+        return True
+    return False
+
+
+def sanitize_input_address_raw(raw: str | None) -> str:
+    """
+    入力住所（CSV由来）に混入しがちな「複数住所/部署名/会社概要の断片」を落とし、
+    公式判定・照合に使える形へ整形する。DBの生データは保持し、内部照合だけで使う想定。
+    """
+    s = (raw or "").strip().replace("　", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    if not s:
+        return ""
+
+    # 住所が2つ以上連結されているケース（例: 〒...A棟 〒...B棟）は最初の1件だけ使う
+    zip_positions = [m.start() for m in re.finditer(r"〒\s*\d{3}-\d{4}", s)]
+    if len(zip_positions) >= 2:
+        s = s[zip_positions[0] : zip_positions[1]].strip()
+
+    # 「会社概要の項目」や「部署/担当者名」等が混入している場合、住所らしい部分だけ残す
+    cut_markers = (
+        "Google",
+        "営業時間",
+        "設立",
+        "資本金",
+        "代表者",
+        "代表番号",
+        "代表",
+        "代表取締役",
+        "執行役員",
+        "役員",
+        "取締役",
+        "管理本部",
+        "電話",
+        "TEL",
+        "ＴＥＬ",
+        "FAX",
+        "メール",
+        "E-mail",
+        "お問い合わせ",
+        "メ-ルでのお問い合わせ",
+        "■",
+    )
+    for marker in cut_markers:
+        pos = s.find(marker)
+        if pos == -1:
+            continue
+        head = s[:pos].strip()
+        # ある程度長く、住所っぽい形を満たす場合のみ切る（過剰カットを避ける）
+        if len(head) >= 10 and (looks_like_address(head) or normalize_address(head)):
+            s = head
+            break
+
+    # 括弧の取りこぼしを軽く修正
+    s = s.strip().strip(")）]").strip()
+    s = re.sub(r"[()（）\\[\\]]", "", s).strip()
+
+    # 住所として使えないものは空にする（誤判定を防ぐ）
+    norm = normalize_address(s) or ""
+    if not norm:
+        return ""
+    if not looks_like_address(norm):
+        return ""
+    return s
 
 def pick_best_address(expected_addr: str | None, candidates: list[str]) -> str | None:
     def _parse_source(raw: str) -> tuple[str, bool, str]:
@@ -806,10 +883,44 @@ def _is_profile_like_url(url: str | None) -> bool:
     if not url:
         return False
     try:
-        path = urlparse(url).path.lower()
+        path = urlparse(url).path or ""
+        try:
+            path = unquote(path)
+        except Exception:
+            pass
+        path = path.lower()
     except Exception:
         return False
-    return any(seg in path for seg in ("/company", "/about", "/corporate", "/profile", "/overview", "/summary", "/gaiyo", "/gaiyou"))
+    return any(
+        seg in path
+        for seg in (
+            # 英語/よくあるパス
+            "/company",
+            "/company-info",
+            "/companyinfo",
+            "/about",
+            "/about-us",
+            "/aboutus",
+            "/corporate",
+            "/profile",
+            "/overview",
+            "/summary",
+            "/outline",
+            "/guide",
+            # 日本語/よくあるローマ字揺れ
+            "/会社概要",
+            "/会社案内",
+            "/会社情報",
+            "/企業情報",
+            "/企業概要",
+            "/法人概要",
+            "/gaiyo",
+            "/gaiyou",
+            "/kaisya",
+            "/kaisha",
+            "/annai",
+        )
+    )
 
 def _is_news_like_url(url: str | None) -> bool:
     """
@@ -1450,6 +1561,210 @@ def extract_description_from_payload(payload: dict[str, Any]) -> str:
         return lead
     return ""
 
+def _truncate_final_description(text: str, max_len: int = FINAL_DESCRIPTION_MAX_LEN) -> str:
+    if not text:
+        return ""
+    if len(text) <= max_len:
+        return text
+    truncated = text[:max_len]
+    truncated = re.sub(r"[、。．,;]+$", "", truncated)
+    trimmed = re.sub(r"\s+\S*$", "", truncated).strip()
+    return trimmed if len(trimmed) >= max(10, FINAL_DESCRIPTION_MIN_LEN // 2) else truncated.rstrip()
+
+def build_final_description_from_payloads(
+    payloads: list[dict[str, Any]],
+    *,
+    min_len: int = FINAL_DESCRIPTION_MIN_LEN,
+    max_len: int = FINAL_DESCRIPTION_MAX_LEN,
+) -> str:
+    """
+    既取得テキストから「事業内容のみ」の description を 80〜160字（既定）に寄せて組み立てる。
+    追加AI呼び出しはしない。
+    """
+    if not payloads:
+        return ""
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    def _push(raw: str | None) -> None:
+        if not raw:
+            return
+        cleaned = clean_description_value(raw)
+        if not cleaned:
+            return
+        if looks_mojibake(cleaned):
+            return
+        if cleaned in seen:
+            return
+        seen.add(cleaned)
+        candidates.append(cleaned)
+
+    for p in payloads:
+        try:
+            _push(extract_description_from_payload(p))
+        except Exception:
+            pass
+        try:
+            text = p.get("text", "") or ""
+            if text:
+                biz = select_relevant_paragraphs(text, limit=6)
+                for line in [x.strip() for x in biz.splitlines() if x.strip()]:
+                    _push(line)
+        except Exception:
+            pass
+
+    if not candidates:
+        return ""
+
+    def _cand_score(s: str) -> tuple[int, int, int]:
+        kw_hits = sum(1 for kw in DESCRIPTION_BIZ_KEYWORDS if kw and kw in s)
+        # 120字付近を好む
+        target_penalty = abs(len(s) - 120)
+        return (kw_hits, -target_penalty, len(s))
+
+    candidates.sort(key=_cand_score, reverse=True)
+    chosen: list[str] = []
+    used: set[str] = set()
+
+    for cand in candidates:
+        if cand in used:
+            continue
+        if not chosen:
+            chosen.append(cand)
+            used.add(cand)
+            if len(cand) >= min_len:
+                break
+            continue
+        # 2文までに抑える
+        if len(chosen) >= 2:
+            break
+        joined_probe = "。".join([*chosen, cand]).strip("。") + "。"
+        joined_probe = re.sub(r"\s+", " ", joined_probe).strip()
+        if len(joined_probe) > max_len:
+            continue
+        chosen.append(cand)
+        used.add(cand)
+        if len(joined_probe) >= min_len:
+            break
+
+    out = "。".join([c.strip("。") for c in chosen if c.strip()]).strip()
+    if out and not out.endswith("。") and any(k in out for k in ("。", "．")):
+        # 既に文末が句点系ならそのまま
+        pass
+    elif out and not out.endswith("。"):
+        out += "。"
+
+    out = re.sub(r"\s+", " ", out).strip()
+    if not out:
+        return ""
+    out = _truncate_final_description(out, max_len=max_len)
+    # 最終的に事業キーワードが無いものは落とす（DB汚染を防ぐ）
+    if not any(k in out for k in DESCRIPTION_BIZ_KEYWORDS):
+        return ""
+    # min_len 未満でも、材料不足のときは空欄よりマシなので返す（保存側で上書き条件を調整）
+    return out
+
+def _collect_business_text_blocks(payloads: list[dict[str, Any]]) -> list[str]:
+    blocks: list[str] = []
+    for p in payloads or []:
+        try:
+            text = (p.get("text", "") or "").strip()
+            if text:
+                biz = select_relevant_paragraphs(text, limit=3)
+                if biz:
+                    blocks.append(biz[:1200])
+        except Exception:
+            pass
+        try:
+            html = p.get("html", "") or ""
+            meta = extract_meta_description(html)
+            if meta:
+                blocks.append(meta)
+        except Exception:
+            pass
+    # 重複除去（順序保持）
+    out: list[str] = []
+    seen2: set[str] = set()
+    for b in blocks:
+        bb = (b or "").strip()
+        if not bb or bb in seen2:
+            continue
+        seen2.add(bb)
+        out.append(bb)
+    return out[:10]
+
+def infer_industry_and_business_tags(text_blocks: list[str]) -> tuple[str, list[str]]:
+    """
+    既取得のテキストから業種とタグを推定（追加AI呼び出し無し）。
+    """
+    joined = "\n".join([b for b in (text_blocks or []) if b and str(b).strip()]).strip()
+    if not joined:
+        return ("", [])
+    s = unicodedata.normalize("NFKC", joined)
+    s_lower = s.lower()
+
+    rules: dict[str, list[tuple[str, int]]] = {
+        "物流・運送": [("物流", 4), ("運送", 4), ("配送", 3), ("倉庫", 3), ("輸送", 2), ("通関", 2), ("フォワーダー", 2), ("海運", 2), ("陸運", 2), ("航空", 1)],
+        "建設・設備": [("建設", 4), ("工事", 4), ("施工", 3), ("土木", 3), ("設備", 3), ("電気工事", 4), ("管工事", 4), ("解体", 3), ("リフォーム", 2), ("設計", 2)],
+        "製造": [("製造", 4), ("加工", 3), ("工場", 2), ("部品", 2), ("金属", 2), ("樹脂", 2), ("組立", 2), ("生産", 2), ("機械", 1), ("装置", 1)],
+        "IT・ソフトウェア": [("ソフトウェア", 4), ("システム", 3), ("it", 3), ("saas", 4), ("クラウド", 4), ("dx", 3), ("アプリ", 2), ("web", 2), ("開発", 1), ("ai", 1), ("データ", 1)],
+        "不動産": [("不動産", 4), ("賃貸", 3), ("仲介", 3), ("売買", 3), ("管理", 2), ("マンション", 2), ("テナント", 2), ("物件", 2)],
+        "医療・福祉": [("医療", 4), ("介護", 4), ("福祉", 3), ("クリニック", 3), ("病院", 3), ("訪問", 1), ("看護", 2)],
+        "飲食・食品": [("食品", 4), ("飲食", 4), ("レストラン", 3), ("カフェ", 3), ("製菓", 2), ("惣菜", 2), ("給食", 2)],
+        "小売・EC": [("小売", 4), ("販売", 2), ("通販", 4), ("ec", 3), ("ショップ", 2), ("店舗", 1), ("卸", 2)],
+        "人材・HR": [("人材", 4), ("派遣", 4), ("紹介", 2), ("求人", 3), ("採用支援", 3), ("転職", 3)],
+        "コンサルティング": [("コンサル", 4), ("コンサルティング", 4), ("顧問", 2), ("支援", 1)],
+        "金融・保険": [("金融", 4), ("保険", 4), ("銀行", 4), ("証券", 3), ("融資", 2)],
+        "教育": [("教育", 4), ("学習", 3), ("塾", 3), ("スクール", 3), ("研修", 2)],
+        "広告・マーケ": [("広告", 4), ("マーケ", 4), ("マーケティング", 4), ("pr", 3), ("デザイン", 2), ("制作", 1)],
+        "エネルギー": [("エネルギー", 4), ("電力", 4), ("ガス", 3), ("太陽光", 4), ("再生可能", 3)],
+        "清掃・警備": [("清掃", 4), ("警備", 4), ("ビルメンテ", 3), ("施設管理", 3)],
+        "士業": [("税理士", 4), ("弁護士", 4), ("行政書士", 4), ("社労士", 4), ("司法書士", 4)],
+    }
+
+    industry_scores: dict[str, int] = {}
+    tag_scores: dict[str, int] = {}
+    for industry, kws in rules.items():
+        score = 0
+        for kw, w in kws:
+            needle = kw.lower()
+            if not needle:
+                continue
+            if needle in s_lower:
+                # 出現回数を軽く加味
+                count = min(3, s_lower.count(needle))
+                score += w * count
+                # 代表的なタグ化（英字は上げすぎない）
+                tag = kw.upper() if kw.isascii() and len(kw) <= 4 else kw
+                tag_scores[tag] = max(tag_scores.get(tag, 0), w)
+        if score:
+            industry_scores[industry] = score
+
+    if not industry_scores:
+        return ("", [])
+
+    best_industry = max(industry_scores.items(), key=lambda x: x[1])[0]
+    best_score = industry_scores.get(best_industry, 0)
+    if best_score < 4:
+        return ("", [])
+
+    # タグは上位から最大5件
+    tags = [t for t, _ in sorted(tag_scores.items(), key=lambda x: x[1], reverse=True)]
+    # ノイズっぽい汎用語は落とす
+    tags = [t for t in tags if t not in {"開発", "制作", "支援", "販売"}]
+    dedup: list[str] = []
+    seen3: set[str] = set()
+    for t in tags:
+        tt = (t or "").strip()
+        if not tt or tt in seen3:
+            continue
+        seen3.add(tt)
+        dedup.append(tt)
+        if len(dedup) >= 5:
+            break
+    return (best_industry, dedup)
+
 def _sanitize_ai_text_block(text: str | None) -> str:
     if not text:
         return ""
@@ -1837,9 +2152,11 @@ async def process():
             cid = company.get("id")
             name = (company.get("company_name") or "").strip()
             # 入力住所は csv_address を優先（古いDBは address に入っているためフォールバック）
-            addr_raw = (company.get("csv_address") or company.get("address") or "").strip()
+            addr_raw_original = (company.get("csv_address") or company.get("address") or "").strip()
             if not (company.get("csv_address") or "").strip():
-                company["csv_address"] = addr_raw
+                company["csv_address"] = addr_raw_original
+            # 照合用は「混入ノイズ」を落としたものを使う（DBの生値は保持）
+            addr_raw = sanitize_input_address_raw(addr_raw_original) or addr_raw_original
             addr = normalize_address(addr_raw) or ""
             input_addr_has_zip = bool(ZIP_CODE_RE.search(addr))
             input_addr_has_city = bool(CITY_RE.search(addr))
@@ -3646,9 +3963,11 @@ async def process():
                         and homepage_official_source.startswith("ai")
                     )
                     # 優先docs（会社概要/連絡先）取得は「公式とみなせるホームページ」なら許可する。
-                    # deep crawl は「AIで公式採用したときのみ」実行する（誤って非公式を巡回しないため）。
                     docs_allowed = bool(homepage and int(homepage_official_flag or 0) == 1)
-                    deep_allowed = bool(ai_official_selected)
+                    # deep crawl は profile/rep を拾うのに有効だが、誤巡回を避けるため「公式判定が立っている場合」のみに限定する。
+                    # 既定では rule 公式でも deep を許可する（会社概要ページ到達を取りこぼさないため）。
+                    DEEP_ALLOW_RULE_OFFICIAL = (os.getenv("DEEP_ALLOW_RULE_OFFICIAL", "true") or "true").strip().lower() == "true"
+                    deep_allowed = bool(ai_official_selected or (docs_allowed and DEEP_ALLOW_RULE_OFFICIAL))
 
                     def absorb_doc_data(url: str, pdata: dict[str, Any]) -> None:
                         nonlocal rule_phone, rule_address, rule_rep
@@ -3938,11 +4257,17 @@ async def process():
                                 or need_listing
                             )
                             try:
+                                priority_max_links = 0
+                                if should_fetch_priority:
+                                    # 代表者/会社概要の取りこぼしが多いので、必要時は探索枠を少し広げる
+                                    priority_max_links = 5 if (need_rep or need_description or need_founded or need_listing) else 3
+                                elif want_docs_for_verify:
+                                    priority_max_links = 2
                                 early_priority_docs = await asyncio.wait_for(
                                     scraper.fetch_priority_documents(
                                         homepage,
                                         info_dict.get("html", ""),
-                                        max_links=(3 if should_fetch_priority else (2 if want_docs_for_verify else 0)),
+                                        max_links=priority_max_links,
                                         concurrency=(FETCH_CONCURRENCY if should_fetch_priority else 2),
                                         target_types=(["about", "contact", "finance"] if should_fetch_priority else (["about", "contact"] if want_docs_for_verify else None)),
                                         allow_slow=(allow_slow_priority if should_fetch_priority else False),
@@ -3950,7 +4275,7 @@ async def process():
                                     ),
                                     timeout=bulk_timeout(
                                         PAGE_FETCH_TIMEOUT_SEC,
-                                        3 if should_fetch_priority else 2,
+                                        priority_max_links if priority_max_links > 0 else (3 if should_fetch_priority else 2),
                                         slow=(allow_slow_priority if should_fetch_priority else False),
                                     ),
                                 ) if (should_fetch_priority or want_docs_for_verify) else {}
@@ -3959,10 +4284,45 @@ async def process():
                             for url, pdata in early_priority_docs.items():
                                 priority_docs[url] = pdata
                                 absorb_doc_data(url, pdata)
-                        if timed_out:
-                            missing_contact, missing_extra = refresh_need_flags()
-                            fully_filled = False
-                            related = {}
+                            # 会社概要/企業情報ページに到達できている場合は、以降の抽出の起点をそちらに寄せる
+                            # （トップページだけでは代表者等が載っていないケースが多いため）
+                            try:
+                                profile_seed_urls: list[str] = []
+                                for u in list((priority_docs or {}).keys()):
+                                    pt = str((page_type_per_url or {}).get(u) or "OTHER")
+                                    if pt == "COMPANY_PROFILE" or _is_profile_like_url(str(u)):
+                                        profile_seed_urls.append(str(u))
+                                if profile_seed_urls:
+                                    profile_seed_urls.sort(
+                                        key=lambda u: (
+                                            0 if str((page_type_per_url or {}).get(u) or "") == "COMPANY_PROFILE" else 1,
+                                            0 if _is_profile_like_url(u) else 1,
+                                            0 if any(seg in (u or "").lower() for seg in ("/company/overview", "/company/profile", "/company/outline", "/company/summary")) else 1,
+                                            len(u or ""),
+                                            u,
+                                        )
+                                    )
+                                    adopted_url = profile_seed_urls[0]
+                                    adopted = (priority_docs or {}).get(adopted_url) or {}
+                                    if adopted_url and adopted and adopted_url != info_url:
+                                        log.info("[%s] prioritize profile doc as primary info_url: %s (was %s)", cid, adopted_url, info_url)
+                                        info_url = adopted_url
+                                        info_dict = {"url": adopted_url, "text": adopted.get("text", "") or "", "html": adopted.get("html", "") or ""}
+                                        try:
+                                            pt_hint = str((page_type_per_url or {}).get(adopted_url) or "OTHER")
+                                            primary_cands = scraper.extract_candidates(
+                                                info_dict.get("text", "") or "",
+                                                info_dict.get("html", "") or "",
+                                                page_type_hint=pt_hint,
+                                            )
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
+                            if timed_out:
+                                missing_contact, missing_extra = refresh_need_flags()
+                                fully_filled = False
+                                related = {}
 
                         cands = primary_cands or {}
                         phones = cands.get("phone_numbers") or []
@@ -4232,7 +4592,15 @@ async def process():
                                     u = p.get("url")
                                     if not u or u in profile_urls:
                                         continue
-                                    if str(p.get("page_type") or "") == "COMPANY_PROFILE":
+                                    # AI公式判定側の page_type は分類ミスもあり得るため、URL形状も併用して拾う
+                                    if str(p.get("page_type") or "") == "COMPANY_PROFILE" or _is_profile_like_url(str(u)):
+                                        profile_urls.append(u)
+                            except Exception:
+                                pass
+                            # ルール分類が profile を落とした場合でも、URL形状が強い「会社概要」パスは起点候補に含める
+                            try:
+                                for u in list((page_type_per_url or {}).keys()):
+                                    if u and (u not in profile_urls) and _is_profile_like_url(str(u)):
                                         profile_urls.append(u)
                             except Exception:
                                 pass
@@ -4245,17 +4613,18 @@ async def process():
                                     else:
                                         base_html = (info_dict or {}).get("html", "") if isinstance(info_dict, dict) else ""
                                         exclude_urls = set((page_type_per_url or {}).keys())
+                                        discover_max_links = 4 if (need_rep or need_description or need_founded or need_listing) else 2
                                         discovered = await asyncio.wait_for(
                                             scraper.fetch_priority_documents(
                                                 info_url,
                                                 base_html=base_html,
-                                                max_links=2,
+                                                max_links=discover_max_links,
                                                 concurrency=2,
                                                 target_types=["about"],
                                                 allow_slow=False,
                                                 exclude_urls=exclude_urls,
                                             ),
-                                            timeout=bulk_timeout(6.0, count=2),
+                                            timeout=bulk_timeout(6.0, count=discover_max_links),
                                         )
                                         for u, pdata in (discovered or {}).items():
                                             absorb_doc_data(u, pdata)
@@ -5071,6 +5440,90 @@ async def process():
                         # AI_DESCRIPTION_ALWAYS でも生成できなかった場合、既存の説明があれば保持（空欄化による情報欠落を防ぐ）
                         if AI_DESCRIPTION_ALWAYS and not description_val:
                             description_val = clean_description_value(company.get("description") or "")
+
+                        # ---- description品質統一（追加AI呼び出し無し） ----
+                        payloads_for_desc: list[dict[str, Any]] = []
+                        try:
+                            if info_dict:
+                                payloads_for_desc.append(info_dict)
+                        except Exception:
+                            pass
+                        try:
+                            payloads_for_desc.extend(list((priority_docs or {}).values())[:6])
+                        except Exception:
+                            pass
+                        try:
+                            for _, d in list((related or {}).items())[:6]:
+                                if isinstance(d, dict):
+                                    payloads_for_desc.append({"text": d.get("text", "") or "", "html": d.get("html", "") or ""})
+                        except Exception:
+                            pass
+
+                            # 80〜160字（既定）に寄せる。短すぎ/長すぎの場合は既取得テキストから再構成する。
+                            if (not description_val) or (len(description_val) < FINAL_DESCRIPTION_MIN_LEN) or (len(description_val) > FINAL_DESCRIPTION_MAX_LEN):
+                                rebuilt = build_final_description_from_payloads(payloads_for_desc)
+                                if rebuilt and ((not description_val) or (len(description_val) < FINAL_DESCRIPTION_MIN_LEN) or (len(description_val) > FINAL_DESCRIPTION_MAX_LEN)):
+                                    description_val = rebuilt
+                            # それでも description が欠損/規格外なら、最後に AI で description だけ再生成して穴を塞ぐ
+                            if (
+                                AI_DESCRIPTION_ALWAYS
+                                and AI_DESCRIPTION_FALLBACK_CALL
+                                and USE_AI
+                                and verifier is not None
+                                and (not timed_out)
+                                and has_time_for_ai()
+                                and (
+                                    (not description_val)
+                                    or (len(description_val) < FINAL_DESCRIPTION_MIN_LEN)
+                                    or (len(description_val) > FINAL_DESCRIPTION_MAX_LEN)
+                                )
+                            ):
+                                try:
+                                    blocks = _collect_business_text_blocks(payloads_for_desc)
+                                    if not blocks and info_dict:
+                                        blocks.append(info_dict.get("text", "") or "")
+                                    desc_text = build_ai_text_payload(*blocks)
+                                    shot = b""
+                                    try:
+                                        maybe_shot = (info_dict or {}).get("screenshot")
+                                        if isinstance(maybe_shot, (bytes, bytearray)) and maybe_shot:
+                                            shot = bytes(maybe_shot)
+                                    except Exception:
+                                        shot = b""
+                                    prev_desc = description_val
+                                    generated = await asyncio.wait_for(
+                                        verifier.generate_description(desc_text, shot, name, addr_raw),
+                                        timeout=clamp_timeout(ai_call_timeout),
+                                    )
+                                    apply_ai_description(generated)
+                                    # 生成に失敗/不適合なら直前の値に戻す（空欄化で欠損を作らない）
+                                    if (not description_val) or (len(description_val) < 10):
+                                        description_val = prev_desc
+                                except Exception:
+                                    pass
+                            if description_val and len(description_val) > FINAL_DESCRIPTION_MAX_LEN:
+                                description_val = _truncate_final_description(description_val, max_len=FINAL_DESCRIPTION_MAX_LEN)
+
+                        # ---- 業種/タグを毎回推定して格納（追加AI呼び出し無し） ----
+                        industry_val = (company.get("industry") or "").strip()
+                        business_tags_val = (company.get("business_tags") or "").strip()
+                        if INFER_INDUSTRY_ALWAYS:
+                            blocks = _collect_business_text_blocks(payloads_for_desc)
+                            if description_val:
+                                blocks.append(description_val)
+                            inferred_industry, inferred_tags = infer_industry_and_business_tags(blocks)
+                            if inferred_industry:
+                                # 推定できた場合は毎回更新（既存があっても上書き）
+                                industry_val = inferred_industry[:60]
+                            elif not industry_val:
+                                industry_val = "不明"
+                            if inferred_tags:
+                                try:
+                                    business_tags_val = json.dumps(inferred_tags[:5], ensure_ascii=False)
+                                except Exception:
+                                    business_tags_val = ""
+                            elif not business_tags_val:
+                                business_tags_val = ""
                         listing_val = clean_listing_value(listing_val)
                         capital_val = ai_normalize_amount(capital_val) or clean_amount_value(capital_val)
                         revenue_val = ai_normalize_amount(revenue_val) or clean_amount_value(revenue_val)
@@ -5118,6 +5571,8 @@ async def process():
                             "found_address": normalized_found_address,
                             "rep_name": rep_name_val,
                             "description": description_val,
+                            "industry": industry_val,
+                            "business_tags": business_tags_val,
                             "listing": listing_val,
                             "revenue": revenue_val,
                             "profit": profit_val,
@@ -5148,6 +5603,23 @@ async def process():
                             "top3_urls": json.dumps(list(urls or [])[:3], ensure_ascii=False),
                             "exclude_reasons": json.dumps(exclude_reasons or {}, ensure_ascii=False),
                             "skip_reason": (company.get("skip_reason") or "").strip(),
+                            # 参照URL（どのページを“真”として扱ったか）。会社概要/会社案内/企業情報系を最優先で選ぶ。
+                            "reference_homepage": (lambda: (
+                                (sorted(
+                                    [
+                                        (
+                                            0 if str(pt or "") == "COMPANY_PROFILE" else 1,
+                                            0 if any(seg in (unquote(urlparse(u).path or "").lower()) for seg in ("/company/overview", "/overview", "/outline", "/summary")) else 1,
+                                            len(u or ""),
+                                            u,
+                                        )
+                                        for u, pt in (page_type_per_url or {}).items()
+                                        if u and (str(pt or "") == "COMPANY_PROFILE" or _is_profile_like_url(u))
+                                    ]
+                                )[0][3])
+                                if any(u and (str(pt or "") == "COMPANY_PROFILE" or _is_profile_like_url(u)) for u, pt in (page_type_per_url or {}).items())
+                                else ""
+                            ))(),
                             "provisional_homepage": (provisional_homepage or forced_provisional_homepage or ""),
                             "provisional_reason": ((company.get("provisional_reason") or "").strip() or forced_provisional_reason or ""),
                             "final_homepage": (homepage or ""),

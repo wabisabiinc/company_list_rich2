@@ -486,6 +486,8 @@ class CompanyScraper:
         "atcompany.jp",
         "imitsu.jp",
         "jbplt.jp",
+        "conomet.com",
+        "houjin.conomet.com",
     }
 
     SUSPECT_HOSTS = {
@@ -4102,33 +4104,49 @@ class CompanyScraper:
         if not base_root:
             return []
         types = target_types or ["about", "contact"]
-        fallback_map = {
-            "about": [
-                "/company",
-                "/about",
-                "/profile",
-                "/overview",
-                "/summary",
-                "/outline",
-                "/corporate",
-                "/company/outline",
-                "/company/profile",
-                "/company/overview",
-                "/company/summary",
-                "/company.html",
-                "/about.html",
-                "/company.php",
-                "/about.php",
-            ],
-            "contact": [
-                "/contact",
-                "/contactus",
-                "/inquiry",
-                "/contact.html",
-                "/contact.php",
-                "/inquiry.html",
-                "/form",
-            ],
+        # ページ側に導線が無い/JSでリンクが取れないケースでも「会社概要」へ到達できるよう、
+        # deep最優先のパス候補（日本語含む）をフォールバックで試す。
+        fallback_map: dict[str, list[str]] = {
+            "about": list(
+                dict.fromkeys(
+                    [
+                        # よくある深い会社概要パス（まずここを当てる）
+                        "/company/overview",
+                        "/company/profile",
+                        "/company/outline",
+                        "/company/summary",
+                        # 代表的なプロフィールパス（日本語含む）
+                        *PROFILE_PRIORITY_PATHS,
+                        # 拡張子付き/よくある揺れ
+                        "/company.html",
+                        "/about.html",
+                        "/company.php",
+                        "/about.php",
+                    ]
+                )
+            ),
+            "contact": list(
+                dict.fromkeys(
+                    [
+                        *CONTACT_PRIORITY_PATHS,
+                        "/contact.html",
+                        "/contact.php",
+                        "/inquiry.html",
+                    ]
+                )
+            ),
+            # finance は about を流用（会社概要ページに載ることが多い）
+            "finance": list(
+                dict.fromkeys(
+                    [
+                        "/company/overview",
+                        "/company/profile",
+                        "/company/outline",
+                        "/company/summary",
+                        *PROFILE_PRIORITY_PATHS,
+                    ]
+                )
+            ),
         }
         ordered: list[str] = []
         seen: set[str] = set()
@@ -4454,8 +4472,24 @@ class CompanyScraper:
         head_low = unicodedata.normalize("NFKC", head_all).lower()
 
         profile_kw = (
-            "会社概要", "会社情報", "企業情報", "会社案内", "法人概要", "企業概要",
-            "outline", "profile", "overview", "company profile", "corporate profile",
+            "会社概要",
+            "会社情報",
+            "企業情報",
+            "企業概要",
+            "会社案内",
+            "企業案内",
+            "会社紹介",
+            "企業紹介",
+            "基本情報",
+            "法人概要",
+            "団体概要",
+            "outline",
+            "profile",
+            "overview",
+            "summary",
+            "company profile",
+            "corporate profile",
+            "company information",
         )
         contact_kw = (
             "お問い合わせ", "お問合せ", "問合せ", "contact", "inquiry",
@@ -4478,7 +4512,40 @@ class CompanyScraper:
         )
 
         is_profile_heading = any(kw in head_low for kw in (k.lower() for k in profile_kw))
-        is_profile_path = any(seg in (url.lower()) for seg in ("/company", "/about", "/corporate", "/profile", "/overview", "/outline"))
+        try:
+            url_low = (url or "").lower()
+            url_low = urllib.parse.unquote(url_low)
+        except Exception:
+            url_low = (url or "").lower()
+        is_profile_path = any(
+            seg in url_low
+            for seg in (
+                "/company",
+                "/companyinfo",
+                "/company-info",
+                "/about",
+                "/about-us",
+                "/aboutus",
+                "/corporate",
+                "/profile",
+                "/overview",
+                "/summary",
+                "/outline",
+                "/guide",
+                "/会社概要",
+                "/会社案内",
+                "/会社情報",
+                "/企業情報",
+                "/企業概要",
+                "/法人概要",
+                "/団体概要",
+                "/gaiyo",
+                "/gaiyou",
+                "/kaisya",
+                "/kaisha",
+                "/annai",
+            )
+        )
         has_hq_marker = ("本社所在地" in text_nfkc) or ("本店所在地" in text_nfkc) or ("本社" in text_nfkc) or ("本店" in text_nfkc)
         is_profile_text = any(kw.lower() in text_low for kw in (k.lower() for k in profile_kw))
 

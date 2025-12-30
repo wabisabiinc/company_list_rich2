@@ -165,6 +165,9 @@ class DatabaseManager:
         if "locked_at" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN locked_at TEXT;")
             cols.add("locked_at")
+        if "error_code" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN error_code TEXT;")
+            cols.add("error_code")
         if "rep_name" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN rep_name TEXT;")
             cols.add("rep_name")
