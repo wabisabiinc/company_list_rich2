@@ -92,6 +92,9 @@ REGENERATE_DESCRIPTION = os.getenv("REGENERATE_DESCRIPTION", "false").lower() ==
 AI_FINAL_WITH_OFFICIAL = os.getenv("AI_FINAL_WITH_OFFICIAL", "false").lower() == "true"
 # USE_AI_OFFICIAL=true の場合でも、最終AI(select_company_fields)を毎回許可する（既定: false / 追加コスト）
 AI_FINAL_ALWAYS = os.getenv("AI_FINAL_ALWAYS", "false").lower() == "true"
+# 代表者名の誤格納（「コンテンツ」「キーワード」等）を構造的に防ぐため、
+# 代表者は TABLE/LABEL/ROLE/JSONLD 等の「構造化ソース」由来のみ採用する（既定: true）
+REP_REQUIRE_STRUCTURED_SOURCE = os.getenv("REP_REQUIRE_STRUCTURED_SOURCE", "true").lower() == "true"
 WORKER_ID = os.getenv("WORKER_ID", "w1")  # 並列識別子
 COMPANIES_DB_PATH = os.getenv("COMPANIES_DB_PATH", "data/companies.db")
 
@@ -1046,6 +1049,8 @@ def _rep_candidate_ok(
         if strong_source:
             return True, ""
         return False, "greeting_not_paired"
+    if REP_REQUIRE_STRUCTURED_SOURCE and (not strong_source):
+        return False, "not_structured_source"
     if page_type == "COMPANY_PROFILE":
         return True, ""
     if page_type == "ACCESS_CONTACT":

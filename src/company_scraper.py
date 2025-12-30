@@ -133,9 +133,16 @@ REP_NAME_EXACT_BLOCKLIST = {
         "メニュー", "Menu", "menu",
         "トップページ", "Home", "home", "ホーム",
         "沿革", "法人紹介", "会社紹介",
-        "交代", "任を仰せつかりました",
-        "所属",
-    }
+	        "交代", "任を仰せつかりました",
+	        "所属",
+	        # UI/サイト断片（代表者名の誤爆が多い）
+	        "コンテンツ",
+	        "キーワード",
+	        "Keyword",
+	        "keyword",
+	        "Keywords",
+	        "keywords",
+	    }
 REP_NAME_SUBSTR_BLOCKLIST = (
     "ブログ", "news", "お知らせ", "採用", "求人", "recruit",
         "代表者", "代表者名", "氏名", "お名前", "名前", "担当", "担当者",
@@ -148,7 +155,14 @@ REP_NAME_SUBSTR_BLOCKLIST = (
     "トップページ", "home", "沿革", "法人紹介", "会社紹介", "会社情報", "基本情報",
     "に関する", "について", "保管", "業務", "役割", "委員会",
     "学校", "学園", "大学", "保育園", "こども園", "組合", "協会",
-    "センター", "法人", "こと", "公印", "いただき", "役", "組織"
+	    "センター", "法人", "こと", "公印", "いただき", "役", "組織"
+	    ,
+	    # UI/サイト断片（代表者名の誤爆が多い）
+	    "コンテンツ",
+	    "キーワード",
+	    "keyword",
+	    "keywords",
+	    "contents",
 )
 REP_NAME_EXACT_BLOCKLIST_LOWER = {s.lower() for s in REP_NAME_EXACT_BLOCKLIST}
 NAME_CHUNK_RE = re.compile(r"[\u4E00-\u9FFF]{1,3}(?:[??\s]{0,1}[\u4E00-\u9FFF]{1,3})+")
@@ -1501,6 +1515,14 @@ class CompanyScraper:
             return None
         for stop_word in REP_NAME_SUBSTR_BLOCKLIST:
             if stop_word in text or stop_word in lower_text or stop_word in compact or stop_word in lower_compact:
+                return None
+        # 代表者名としての「カタカナのみ」は誤爆が多い（メニュー/導線/タグ等）。
+        # 外国人名でよく使われる中点（・）が無い場合は除外する。
+        has_kanji = bool(re.search(r"[一-龥]", text))
+        has_hiragana = bool(re.search(r"[ぁ-ん]", text))
+        has_katakana = bool(re.search(r"[ァ-ン]", text))
+        if (not has_kanji) and has_katakana and (not has_hiragana):
+            if ("・" not in text) and ("･" not in text):
                 return None
         if text in PREFECTURE_NAMES or compact in PREFECTURE_NAMES:
             return None
