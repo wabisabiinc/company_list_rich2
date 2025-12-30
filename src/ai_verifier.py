@@ -27,12 +27,12 @@ USE_AI: bool = _getenv_bool("USE_AI", True)
 API_KEY: str = (os.getenv("GEMINI_API_KEY") or "").strip()
 DEFAULT_MODEL: str = (os.getenv("GEMINI_MODEL") or "gemini-2.5-flash-lite").strip()
 AI_CONTEXT_PATH: str = os.getenv("AI_CONTEXT_PATH", "docs/ai_context.md")
-AI_DESCRIPTION_MAX_LEN = int(os.getenv("AI_DESCRIPTION_MAX_LEN", "140"))
+AI_DESCRIPTION_MAX_LEN = int(os.getenv("AI_DESCRIPTION_MAX_LEN", "160"))
 AI_DESCRIPTION_MIN_LEN = int(os.getenv("AI_DESCRIPTION_MIN_LEN", "80"))
 # verify_info / judge_official_homepage で使う description の長さ制約（環境変数で強化可能）。
 # 既定は互換性優先で緩め（短文も許容）にしておく。
 AI_DESCRIPTION_VERIFY_MIN_LEN = int(os.getenv("AI_DESCRIPTION_VERIFY_MIN_LEN", "20"))
-AI_DESCRIPTION_VERIFY_MAX_LEN = int(os.getenv("AI_DESCRIPTION_VERIFY_MAX_LEN", "120"))
+AI_DESCRIPTION_VERIFY_MAX_LEN = int(os.getenv("AI_DESCRIPTION_VERIFY_MAX_LEN", "160"))
 
 # ---- deps -------------------------------------------------------
 try:
@@ -382,15 +382,21 @@ class AIVerifier:
             f"# 本文テキスト抜粋\n{snippet}\n"
         )
 
-    def _build_description_prompt(self, text: str, company_name: str = "", address: str = "") -> str:
+    def _build_description_prompt(self, text: str, company_name: str = "", address: str = "", industry_hint: str = "") -> str:
         snippet = _shorten_text(text or "", max_len=3500)
         return (
-            "あなたは企業サイトから事業内容だけを1文で要約する専門家です。問い合わせ・採用・アクセス・代表者情報は除外し、事業内容のみを60〜120文字で日本語1文にまとめてください。JSONのみ返してください。\n"
-            "ルール: 文章内に必ず次のいずれかの「事業動詞/キーワード」を含めてください（例: 製造/開発/販売/提供/運営/施工/設計/支援/卸売/小売/仲介/運用/保守/メンテナンス）。根拠が弱い・該当が無い場合は null。\n"
+            "あなたは企業サイトから「何をしているどの会社か」が一目で分かるように要約する専門家です。\n"
+            "次の要件を満たす description を JSON のみで返してください（説明文やマークダウンは禁止）。\n"
+            "- 日本語1文・80〜160文字\n"
+            "- 会社名を必ず含める（先頭推奨）\n"
+            "- 可能なら業種（例: 物流・運送業 / IT・ソフトウェア業 / 製造業 などの大分類）も短く含める\n"
+            "- 事業内容のみ（問い合わせ/採用/アクセス/所在地/電話/URL/メール/代表者情報は除外）\n"
+            "- 「当社/弊社」など一人称は使わない\n"
+            "ルール: 文章内に必ず次のいずれかの「事業動詞/キーワード」を含める（例: 製造/開発/販売/提供/運営/施工/設計/支援/卸売/小売/仲介/運用/保守/メンテナンス）。根拠が弱い場合は null。\n"
             "{\n"
             '  "description": "〇〇を行う企業です" または null\n'
             "}\n"
-            f"対象企業: {company_name or '不明'} / 入力住所: {address or '不明'}\n"
+            f"対象企業: {company_name or '不明'} / 入力住所: {address or '不明'} / 業種ヒント: {industry_hint or '不明'}\n"
             "禁止: URL, メール, 電話番号, 住所, 募集/採用/問い合わせ/アクセス情報, 記号の羅列。\n"
             f"# 本文テキスト抜粋\n{snippet}\n"
         )
@@ -822,11 +828,11 @@ class AIVerifier:
             raw = _resp_text(resp)
             return _extract_first_json(raw) or None
 
-    async def generate_description(self, text: str, screenshot: bytes, company_name: str, address: str) -> Optional[str]:
+    async def generate_description(self, text: str, screenshot: bytes, company_name: str, address: str, industry_hint: str = "") -> Optional[str]:
         if not self.model:
             return None
 
-        prompt = self._build_description_prompt(text, company_name, address)
+        prompt = self._build_description_prompt(text, company_name, address, industry_hint)
 
         def _build_content(use_image: bool) -> list[Any]:
             payload: list[Any] = []
@@ -894,7 +900,7 @@ class AIVerifier:
             "出力フォーマット:\n"
             "{\\\"is_official\\\": true/false, \\\"confidence\\\": 0.0-1.0, \\\"reason\\\": \"簡潔な根拠\","
             " \\\"is_official_site\\\": true/false, \\\"official_confidence\\\": 0.0-1.0, \\\"official_evidence\\\": [\"根拠\", ...],"
-            " \\\"description\\\": \"事業内容の要約(60〜120文字・日本語1文)\" または null}\n"
+            " \\\"description\\\": \"事業内容の要約(80〜160文字・日本語1文。可能なら会社名と業種も含む)\" または null}\n"
             "判断基準:\n"
             "- 企業名・所在地・サービス内容の一致を確認。\n"
             "- 口コミ/求人/まとめサイト・予約サイトは false。\n"
@@ -905,7 +911,8 @@ class AIVerifier:
             "- title/og:site_name/h1/ロゴ等で社名一致が強ければ公式寄り。\n"
             "- [SIGNALS] があれば参考情報として扱う（directory_like=true の場合は false に寄せる）。\n"
             "description のルール:\n"
-            "- 事業内容だけを60〜120文字の日本語1文で要約（推測せず、根拠が弱ければ null）\n"
+            "- 事業内容だけを80〜160文字の日本語1文で要約（推測せず、根拠が弱ければ null）\n"
+            "- 可能なら会社名と業種（大分類）も短く含める\n"
             "- 文章内に必ず「製造/開発/販売/提供/運営/施工/設計/支援/卸売/小売/仲介/運用/保守/メンテナンス」等の事業キーワードを含める\n"
             "- 禁止: URL/メール/電話番号/住所/採用/問い合わせ/アクセス/代表者情報\n"
             f"企業名: {company_name}\n住所: {address}\n候補URL: {url}\n本文抜粋:\n{snippet}\n"

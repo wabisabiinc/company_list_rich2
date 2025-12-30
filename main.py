@@ -1619,6 +1619,29 @@ def _truncate_final_description(text: str, max_len: int = FINAL_DESCRIPTION_MAX_
     trimmed = re.sub(r"\s+\S*$", "", truncated).strip()
     return trimmed if len(trimmed) >= max(10, FINAL_DESCRIPTION_MIN_LEN // 2) else truncated.rstrip()
 
+
+def _ensure_name_industry_in_description(description: str, company_name: str, industry: str) -> str:
+    desc = (description or "").strip()
+    if not desc:
+        return ""
+    name = (company_name or "").strip()
+    ind = (industry or "").strip()
+    if ind == "不明":
+        ind = ""
+    if name and name in desc:
+        if ind and (ind not in desc):
+            # 最初の企業名だけに業種を付与
+            return desc.replace(name, f"{name}（{ind}）", 1)
+        return desc
+    # 先頭が一人称だと「会社名は、当社は…」になりやすいので削る
+    desc_body = desc.rstrip("。").strip()
+    desc_body = re.sub(r"^(?:当社|弊社|私たち|わたしたち|当グループ)\s*(?:は|が)?[、,]?\s*", "", desc_body)
+    if not name:
+        return (desc_body + "。") if desc_body and not desc_body.endswith("。") else desc_body
+    if ind:
+        return f"{name}（{ind}）は、{desc_body}。"
+    return f"{name}は、{desc_body}。"
+
 def build_final_description_from_payloads(
     payloads: list[dict[str, Any]],
     *,
@@ -4259,9 +4282,24 @@ async def process():
                             for pdata in list(priority_docs.values())[:2]:
                                 blocks.append(pdata.get("text", "") or "")
                             desc_text = build_ai_text_payload(*blocks)
-                            shot = info_dict.get("screenshot") if isinstance(info_dict.get("screenshot"), (bytes, bytearray)) else b""
+                            shot = (
+                                info_dict.get("screenshot")
+                                if isinstance(info_dict, dict) and isinstance(info_dict.get("screenshot"), (bytes, bytearray))
+                                else b""
+                            )
+                            industry_hint = (company.get("industry") or "").strip()
+                            if not industry_hint:
+                                hint_payloads: list[dict[str, Any]] = []
+                                if isinstance(info_dict, dict):
+                                    hint_payloads.append(info_dict)
+                                try:
+                                    hint_payloads.extend(list(priority_docs.values()))
+                                except Exception:
+                                    pass
+                                inferred, _ = infer_industry_and_business_tags(_collect_business_text_blocks(hint_payloads))
+                                industry_hint = inferred or ""
                             generated = await asyncio.wait_for(
-                                verifier.generate_description(desc_text, bytes(shot), name, addr_raw),
+                                verifier.generate_description(desc_text, bytes(shot), name, addr_raw, industry_hint=industry_hint),
                                 timeout=clamp_timeout(ai_call_timeout),
                             )
                             apply_ai_description(generated)
@@ -5560,8 +5598,12 @@ async def process():
                                 ai_used = 1
                                 if not ai_model:
                                     ai_model = AI_MODEL_NAME or ""
+                                industry_hint = (company.get("industry") or "").strip()
+                                if not industry_hint:
+                                    inferred, _ = infer_industry_and_business_tags(blocks)
+                                    industry_hint = inferred or ""
                                 generated = await asyncio.wait_for(
-                                    verifier.generate_description(desc_text, shot, name, addr_raw),
+                                    verifier.generate_description(desc_text, shot, name, addr_raw, industry_hint=industry_hint),
                                     timeout=clamp_timeout(ai_call_timeout),
                                 )
                                 apply_ai_description(generated)
@@ -5596,8 +5638,12 @@ async def process():
                                 except Exception:
                                     shot = b""
                                 prev_desc = description_val
+                                industry_hint = (company.get("industry") or "").strip()
+                                if not industry_hint:
+                                    inferred, _ = infer_industry_and_business_tags(blocks)
+                                    industry_hint = inferred or ""
                                 generated = await asyncio.wait_for(
-                                    verifier.generate_description(desc_text, shot, name, addr_raw),
+                                    verifier.generate_description(desc_text, shot, name, addr_raw, industry_hint=industry_hint),
                                     timeout=clamp_timeout(ai_call_timeout),
                                 )
                                 apply_ai_description(generated)
@@ -5630,6 +5676,11 @@ async def process():
                                     business_tags_val = ""
                             elif not business_tags_val:
                                 business_tags_val = ""
+                        # description は「何をしているどの会社か」が分かる形に整形（会社名/業種を補う）
+                        description_val = _ensure_name_industry_in_description(description_val, name, industry_val)
+                        description_val = clean_description_value(sanitize_text_block(description_val))
+                        if description_val and len(description_val) > FINAL_DESCRIPTION_MAX_LEN:
+                            description_val = _truncate_final_description(description_val, max_len=FINAL_DESCRIPTION_MAX_LEN)
                         listing_val = clean_listing_value(listing_val)
                         capital_val = ai_normalize_amount(capital_val) or clean_amount_value(capital_val)
                         revenue_val = ai_normalize_amount(revenue_val) or clean_amount_value(revenue_val)
