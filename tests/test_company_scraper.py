@@ -262,6 +262,10 @@ def test_clean_rep_name_allows_single_kanji_tokens(scraper):
     assert scraper.clean_rep_name("関 進") == "関 進"
     assert scraper.clean_rep_name("関進") == "関進"
 
+def test_looks_like_person_name_rejects_common_hiragana_non_names(scraper):
+    assert scraper._looks_like_person_name("これからも") is False
+    assert scraper._looks_like_person_name("そして") is False
+
 
 def test_extract_candidates_keeps_full_rep_name(scraper):
     text = "会社概要\n所在地 東京都千代田区"
@@ -295,6 +299,24 @@ def test_extract_candidates_rep_picks_ceo_when_multiple(scraper):
     """
     cands = scraper.extract_candidates(text, html=html)
     assert any(_strip_rep_tags(name).replace(" ", "").endswith("関裕之") for name in cands["rep_names"])
+
+def test_extract_candidates_rep_from_greeting_sentence_with_company_name(scraper):
+    text = "ジャパンムーブ株式会社　代表取締役社長の田頭千恵（たがしら ちえ）と申します。"
+    cands = scraper.extract_candidates(text, html="")
+    assert any(_strip_rep_tags(name).replace(" ", "") == "田頭千恵" for name in cands.get("rep_names") or [])
+
+def test_extract_candidates_rep_from_caption_with_noise_paragraph(scraper):
+    html = """
+    <html><body>
+      <p class="tac">ジャパンムーブ株式会社<br>代表取締役　田頭 千恵</p>
+      <p>これからも、私たちは「海外引越しでお客様に感動していただけるサービスを提供しよう」という初心を忘れず…</p>
+    </body></html>
+    """
+    text = "ジャパンムーブ株式会社\n代表取締役　田頭 千恵\nこれからも、私たちは…"
+    cands = scraper.extract_candidates(text, html=html)
+    reps = [(_strip_rep_tags(r).replace(" ", "")) for r in (cands.get("rep_names") or [])]
+    assert "田頭千恵" in reps
+    assert "これからも" not in reps
 
 
 def test_extract_candidates_finance_inline_variations(scraper):

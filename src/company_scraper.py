@@ -1269,6 +1269,36 @@ class CompanyScraper:
         cleaned = CompanyScraper.clean_rep_name(name)
         if not cleaned:
             return False
+        # ひらがなだけの短い語は UI/本文の接続語・助詞を誤爆しやすいので除外する
+        # （例: 「これからも」「そして」「また」等）。かな表記の人名はスペース区切り等で拾えるため過度に厳格化しない。
+        if re.fullmatch(r"[ぁ-ゖー]{2,}", cleaned):
+            stopwords = {
+                "これから",
+                "これからも",
+                "今後",
+                "今後も",
+                "そして",
+                "また",
+                "さらに",
+                "なお",
+                "もちろん",
+                "まず",
+                "または",
+                "それでは",
+                "それでも",
+                "おかげさま",
+                "よろしく",
+                "よろしくお願いします",
+                "ありがとうございます",
+                "ありがとう",
+                "どうぞ",
+                "はじめまして",
+            }
+            if cleaned in stopwords:
+                return False
+            # 終端が助詞/接続助詞っぽい場合は非人名扱い（誤爆が多い）
+            if cleaned.endswith(("も", "は", "が", "を", "に", "へ", "と", "で", "や", "か")):
+                return False
         return bool(NAME_CHUNK_RE.search(cleaned) or KANA_NAME_RE.search(cleaned))
 
     @staticmethod
@@ -5147,11 +5177,33 @@ class CompanyScraper:
                 # 「代表者あいさつ」等の見出し/メニューは役職行ではないため除外（誤爆で「信頼」等を代表者名にしない）
                 if greeting_heading_re.search(line):
                     continue
-                stripped = role_kw.sub(" ", line)
-                # 役職行に社名（株式会社〜）が混在する場合、NAME_CHUNK_RE が社名を人名として誤爆しやすいので除外する
-                if re.search(r"(株式会社|有限会社|合同会社|合名会社|合資会社|㈱|（株）|\\(株\\))", stripped):
-                    continue
-                name_match = NAME_CHUNK_RE.search(stripped) or KANA_NAME_RE.search(stripped)
+                # 役職行に社名（株式会社〜）が混在する場合でも、
+                # 「役職の後ろ」にある氏名を優先して拾う（例: ○○株式会社 代表取締役社長の田中太郎 と申します）
+                # 社名が混ざると NAME_CHUNK_RE が社名を人名として誤爆しやすいため、役職以降を切り出す。
+                m_role = role_kw.search(line)
+                after_role = line[m_role.end():] if m_role else ""
+                # 助詞/区切りを軽く除去
+                after_role = re.sub(r"^[\\s\\u3000:：・/／\\-‐―－ー]{0,6}", "", after_role)
+                after_role = re.sub(r"^(?:の|が|は|を|と|より|から)\\s*", "", after_role)
+                # 自己紹介の定型や後続文を切る
+                after_role = re.split(
+                    r"(?:と申します|です|でございます|を務め|を担当|[（(]|[、,。\.]|\n)",
+                    after_role,
+                    maxsplit=1,
+                )[0].strip()
+                # 役職以降に社名語尾が残る場合は氏名抽出対象にしない
+                if re.search(r"(株式会社|有限会社|合同会社|合名会社|合資会社|㈱|（株）|\\(株\\))", after_role):
+                    after_role = ""
+
+                name_match = None
+                if after_role:
+                    name_match = NAME_CHUNK_RE.search(after_role) or KANA_NAME_RE.search(after_role)
+                if not name_match:
+                    stripped = role_kw.sub(" ", line)
+                    # 役職行に社名（株式会社〜）が混在する場合、NAME_CHUNK_RE が社名を人名として誤爆しやすいので除外する
+                    if re.search(r"(株式会社|有限会社|合同会社|合名会社|合資会社|㈱|（株）|\\(株\\))", stripped):
+                        continue
+                    name_match = NAME_CHUNK_RE.search(stripped) or KANA_NAME_RE.search(stripped)
                 if not name_match:
                     continue
                 cleaned = self.clean_rep_name(name_match.group(0))
