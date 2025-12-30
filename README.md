@@ -77,7 +77,9 @@ COMPANIES_DB_PATH=data/companies_logistics.db python3 main.py
 - `USE_AI_DESCRIPTION`（現在未使用。description専用の追加AI呼び出しは `AI_DESCRIPTION_FALLBACK_CALL` で制御）
 - `REGENERATE_DESCRIPTION`（retry/requeue時に既存descriptionを破棄して再生成する。既定 `false`）
 - `AI_DESCRIPTION_ALWAYS`（description を毎回AI由来で埋める。既定 `true`）
+- `AI_DESCRIPTION_ALWAYS_CALL`（description 生成AIを毎回呼ぶ。既定 `true`）
 - `AI_DESCRIPTION_FALLBACK_CALL`（AI由来descriptionが取れない場合に、追加AI呼び出しでdescriptionだけ生成する。既定 `true`）
+- `PRIORITY_DOCS_MAX_LINKS_CAP` / `PROFILE_DISCOVERY_MAX_LINKS_CAP`（会社概要系の優先docs取得リンク数の上限。時間爆発防止）
 - `AI_FINAL_ALWAYS`（USE_AI_OFFICIAL=true でも最終AI(select_company_fields)を許可する。既定 `false` / 追加コスト）
 - `AI_DESCRIPTION_VERIFY_MIN_LEN` / `AI_DESCRIPTION_VERIFY_MAX_LEN`（AIが返すdescriptionの受理条件を調整）
 - `AI_SCREENSHOT_POLICY=auto/always/never`（AIに渡すスクショ方針。`auto` は本文が十分ならスクショ無しで高速化）

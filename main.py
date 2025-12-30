@@ -12,10 +12,12 @@ import threading
 import unicodedata
 from difflib import SequenceMatcher
 from typing import Any, Dict
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 try:
     from dotenv import load_dotenv
+    DOTENV_AVAILABLE = True
 except ImportError:
+    DOTENV_AVAILABLE = False
     def load_dotenv() -> None:  # type: ignore
         return None
 from bs4 import BeautifulSoup
@@ -56,6 +58,8 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # .env 読み込み
+if not DOTENV_AVAILABLE and os.path.exists(".env"):
+    log.warning("python-dotenv が未導入のため .env を読み込めません（venv有効化 or `pip install -r requirements.txt` を実行してください）")
 load_dotenv()
 
 # --------------------------------------------------
@@ -80,6 +84,9 @@ AI_DESCRIPTION_ALWAYS = os.getenv("AI_DESCRIPTION_ALWAYS", "true").lower() == "t
 # AI_DESCRIPTION_ALWAYS=true でも、AI由来descriptionが取れなかったときに追加のAI呼び出しで補うか（既定: true）
 # 呼び出し回数/時間は増えるが、description 欠損を確実に潰すため既定は true
 AI_DESCRIPTION_FALLBACK_CALL = os.getenv("AI_DESCRIPTION_FALLBACK_CALL", "true").lower() == "true"
+# AI_DESCRIPTION_ALWAYS=true のとき、毎回 description 生成AIを呼ぶか（既定: true）
+# 速度/コストよりも「常にAIで読みやすい事業説明」を優先したい場合に有効。
+AI_DESCRIPTION_ALWAYS_CALL = os.getenv("AI_DESCRIPTION_ALWAYS_CALL", "true").lower() == "true"
 # requeue/retry時に既存descriptionを破棄して再生成したい場合のみ true（AI_DESCRIPTION_ALWAYS が優先）
 REGENERATE_DESCRIPTION = os.getenv("REGENERATE_DESCRIPTION", "false").lower() == "true"
 AI_FINAL_WITH_OFFICIAL = os.getenv("AI_FINAL_WITH_OFFICIAL", "false").lower() == "true"
@@ -98,6 +105,9 @@ REFERENCE_CSVS = [p.strip() for p in os.getenv("REFERENCE_CSVS", "").split(",") 
 FETCH_CONCURRENCY = max(1, int(os.getenv("FETCH_CONCURRENCY", "3")))
 PROFILE_FETCH_CONCURRENCY = max(1, int(os.getenv("PROFILE_FETCH_CONCURRENCY", "3")))
 SEARCH_CANDIDATE_LIMIT = max(1, int(os.getenv("SEARCH_CANDIDATE_LIMIT", "3")))
+# 優先docs（会社概要等）の取得上限（時間爆発防止）
+PRIORITY_DOCS_MAX_LINKS_CAP = max(1, int(os.getenv("PRIORITY_DOCS_MAX_LINKS_CAP", "5")))
+PROFILE_DISCOVERY_MAX_LINKS_CAP = max(1, int(os.getenv("PROFILE_DISCOVERY_MAX_LINKS_CAP", "4")))
 # 検索フェーズ全体の早期タイムアウト（0で無効）
 SEARCH_PHASE_TIMEOUT_SEC = float(os.getenv("SEARCH_PHASE_TIMEOUT_SEC", "30"))
 # 深掘りページ/ホップを環境変数で制御（デフォルトは軽め）
@@ -216,10 +226,15 @@ FINAL_DESCRIPTION_MAX_LEN = max(FINAL_DESCRIPTION_MIN_LEN, int(os.getenv("FINAL_
 INFER_INDUSTRY_ALWAYS = os.getenv("INFER_INDUSTRY_ALWAYS", "true").lower() == "true"
 DESCRIPTION_BIZ_KEYWORDS = (
     "事業", "製造", "開発", "販売", "提供", "サービス", "運営", "支援", "施工", "設計", "製作",
+    "卸", "卸売", "小売", "商社", "代理", "代理店", "仲介",
+    "広告", "マーケティング", "企画", "制作", "運用", "運用支援", "保守", "メンテナンス", "maintenance",
+    "清掃", "警備",
     "物流", "建設", "工事", "コンサル", "consulting", "solution", "ソリューション",
     "product", "製品", "プロダクト", "システム", "プラント", "加工", "レンタル", "運送",
     "IT", "デジタル", "ITソリューション", "プロジェクト", "アウトソーシング", "研究", "技術",
-    "人材", "教育", "ヘルスケア", "医療", "食品", "エネルギー", "不動産", "金融", "EC", "通販",
+    "人材", "教育", "ヘルスケア", "医療", "介護", "保育", "福祉",
+    "宿泊", "ホテル", "旅行", "観光", "飲食", "レストラン", "カフェ",
+    "食品", "エネルギー", "不動産", "金融", "EC", "通販",
     "プラットフォーム", "クラウド", "SaaS", "DX", "AI", "データ分析", "セキュリティ", "インフラ",
     "基盤", "ソフトウェア", "ハードウェア", "ロボット", "IoT", "モビリティ", "物流DX",
 )
@@ -922,6 +937,43 @@ def _is_profile_like_url(url: str | None) -> bool:
         )
     )
 
+
+def _pick_reference_homepage(page_type_per_url: dict[str, str] | None) -> str:
+    """
+    「真」として扱う参照URL（会社概要/会社案内/企業情報系）を一意に決める。
+    例外が起きても処理全体を落とさない（参照URLは空欄で続行）。
+    """
+    if not page_type_per_url:
+        return ""
+    candidates: list[tuple[int, int, int, str]] = []
+    try:
+        for u, pt in (page_type_per_url or {}).items():
+            if not u:
+                continue
+            pt_s = str(pt or "")
+            if pt_s != "COMPANY_PROFILE" and not _is_profile_like_url(u):
+                continue
+            try:
+                path = urlparse(u).path or ""
+                path = unquote(path)
+                path_low = path.lower()
+            except Exception:
+                path_low = ""
+            candidates.append(
+                (
+                    0 if pt_s == "COMPANY_PROFILE" else 1,
+                    0 if any(seg in path_low for seg in ("/company/overview", "/overview", "/outline", "/summary")) else 1,
+                    len(u),
+                    u,
+                )
+            )
+    except Exception:
+        return ""
+    if not candidates:
+        return ""
+    candidates.sort()
+    return candidates[0][3] or ""
+
 def _is_news_like_url(url: str | None) -> bool:
     """
     公式判定で「記事/リリース/ニュース」系が強く混ざるURLを検出する。
@@ -1396,11 +1448,6 @@ def clean_description_value(val: str) -> str:
         )
     ):
         return ""
-    # URL/メール/TEL系は説明にしない
-    if re.search(r"https?://|mailto:|@|＠|tel[:：]|電話|ＴＥＬ|ＴＥＬ：", stripped, flags=re.I):
-        return ""
-    if any(term in stripped for term in ("お問い合わせ", "お問合せ", "アクセス", "予約", "営業時間")):
-        return ""
     policy_blocks = (
         "方針",
         "ポリシー",
@@ -1415,10 +1462,6 @@ def clean_description_value(val: str) -> str:
         "コンプライアンス",
         "情報セキュリティ",
     )
-    if any(word in stripped for word in policy_blocks):
-        return ""
-    if stripped in GENERIC_DESCRIPTION_TERMS:
-        return ""
     if len(stripped) < DESCRIPTION_MIN_LEN:
         return ""
     if re.fullmatch(r"(会社概要|事業概要|法人概要|沿革|会社案内|企業情報)", stripped):
@@ -2350,12 +2393,12 @@ async def process():
                         "deep_fetch_count": int(deep_fetch_count or 0),
                         "deep_fetch_failures": int(deep_fetch_failures or 0),
                         "deep_skip_reason": company.get("deep_skip_reason", "") or deep_skip_reason or "",
-                            "deep_urls_visited": json.dumps(list(deep_urls_visited or [])[:5], ensure_ascii=False),
-                            "deep_phone_candidates": int(deep_phone_candidates or 0),
-                            "deep_address_candidates": int(deep_address_candidates or 0),
-                            "deep_rep_candidates": int(deep_rep_candidates or 0),
-                            "timeout_stage": timeout_stage or "",
-                        })
+                        "deep_urls_visited": json.dumps(list(deep_urls_visited or [])[:5], ensure_ascii=False),
+                        "deep_phone_candidates": int(deep_phone_candidates or 0),
+                        "deep_address_candidates": int(deep_address_candidates or 0),
+                        "deep_rep_candidates": int(deep_rep_candidates or 0),
+                        "timeout_stage": timeout_stage or "",
+                    })
                     manager.save_company_data(company, status="review")
                     timeout_saved = True
                 except Exception:
@@ -2977,7 +3020,8 @@ async def process():
                                                 base_html,
                                                 max_links=2,
                                                 concurrency=FETCH_CONCURRENCY,
-                                                target_types=["about", "contact"],
+                                                # 会社概要系を優先（contactはdescription材料としてノイズになりやすいため優先しない）
+                                                target_types=["about", "finance"],
                                                 allow_slow=allow_slow_ai,
                                                 exclude_urls={base_url} if base_url else None,
                                             )
@@ -3953,6 +3997,7 @@ async def process():
                     info_dict = info or {}
                     info_url = homepage
                     page_type_per_url: dict[str, str] = {}
+                    page_score_per_url: dict[str, int] = {}
                     drop_reasons: dict[str, str] = {}
                     drop_details_by_url: dict[str, dict[str, str]] = {}
                     candidates_brief_by_url: dict[str, dict[str, Any]] = {}
@@ -3983,9 +4028,15 @@ async def process():
                         text_val = pdata.get("text", "") or ""
                         html_val = pdata.get("html", "") or ""
                         try:
-                            pt = scraper.classify_page_type(url, text=text_val, html=html_val).get("page_type") or "OTHER"
+                            pt_rec = scraper.classify_page_type(url, text=text_val, html=html_val) or {}
+                            pt = pt_rec.get("page_type") or "OTHER"
+                            try:
+                                page_score_per_url[url] = int(pt_rec.get("score") or 0)
+                            except Exception:
+                                page_score_per_url[url] = 0
                         except Exception:
                             pt = "OTHER"
+                            page_score_per_url[url] = 0
                         page_type_per_url[url] = str(pt)
 
                         cc = scraper.extract_candidates(text_val, html_val, page_type_hint=str(pt))
@@ -4094,6 +4145,30 @@ async def process():
                         ])
                         return missing_contact, missing_extra
 
+                    def pick_primary_info_url(candidates: list[str], current: str) -> str:
+                        pool = [u for u in candidates if isinstance(u, str) and u]
+                        if not pool:
+                            return current
+
+                        def _key(u: str) -> tuple[int, int, int, int, int, str]:
+                            pt = str(page_type_per_url.get(u) or "OTHER")
+                            score = int(page_score_per_url.get(u) or 0)
+                            is_profile_like = _is_profile_like_url(u)
+                            is_contactish = pt == "ACCESS_CONTACT"
+                            return (
+                                0 if pt == "COMPANY_PROFILE" else 1,
+                                1 if is_contactish else 0,
+                                0 if is_profile_like else 1,
+                                -score,
+                                len(u or ""),
+                                u,
+                            )
+
+                        best = sorted(pool, key=_key)[0]
+                        if str(page_type_per_url.get(best) or "") == "ACCESS_CONTACT" and current:
+                            return current
+                        return best or current
+
                     def update_description_candidate(candidate: str | None) -> bool:
                         nonlocal description_val, need_description
                         if not candidate:
@@ -4162,6 +4237,7 @@ async def process():
                     # 3) それでもAI由来が無い場合、追加AI呼び出しでdescriptionだけ生成（保証モード）
                     if (
                         AI_DESCRIPTION_ALWAYS
+                        and (not AI_DESCRIPTION_ALWAYS_CALL)
                         and not description_val
                         and AI_DESCRIPTION_FALLBACK_CALL
                         and USE_AI
@@ -4263,13 +4339,15 @@ async def process():
                                     priority_max_links = 5 if (need_rep or need_description or need_founded or need_listing) else 3
                                 elif want_docs_for_verify:
                                     priority_max_links = 2
+                                if priority_max_links > 0:
+                                    priority_max_links = min(priority_max_links, PRIORITY_DOCS_MAX_LINKS_CAP)
                                 early_priority_docs = await asyncio.wait_for(
                                     scraper.fetch_priority_documents(
                                         homepage,
                                         info_dict.get("html", ""),
                                         max_links=priority_max_links,
                                         concurrency=(FETCH_CONCURRENCY if should_fetch_priority else 2),
-                                        target_types=(["about", "contact", "finance"] if should_fetch_priority else (["about", "contact"] if want_docs_for_verify else None)),
+                                        target_types=(["about", "finance"] if should_fetch_priority else (["about"] if want_docs_for_verify else None)),
                                         allow_slow=(allow_slow_priority if should_fetch_priority else False),
                                         exclude_urls=set(priority_docs.keys()) if priority_docs else None,
                                     ),
@@ -4287,36 +4365,22 @@ async def process():
                             # 会社概要/企業情報ページに到達できている場合は、以降の抽出の起点をそちらに寄せる
                             # （トップページだけでは代表者等が載っていないケースが多いため）
                             try:
-                                profile_seed_urls: list[str] = []
-                                for u in list((priority_docs or {}).keys()):
-                                    pt = str((page_type_per_url or {}).get(u) or "OTHER")
-                                    if pt == "COMPANY_PROFILE" or _is_profile_like_url(str(u)):
-                                        profile_seed_urls.append(str(u))
-                                if profile_seed_urls:
-                                    profile_seed_urls.sort(
-                                        key=lambda u: (
-                                            0 if str((page_type_per_url or {}).get(u) or "") == "COMPANY_PROFILE" else 1,
-                                            0 if _is_profile_like_url(u) else 1,
-                                            0 if any(seg in (u or "").lower() for seg in ("/company/overview", "/company/profile", "/company/outline", "/company/summary")) else 1,
-                                            len(u or ""),
-                                            u,
+                                candidates = [info_url, *list((priority_docs or {}).keys())]
+                                adopted_url = pick_primary_info_url(candidates, info_url)
+                                adopted = (priority_docs or {}).get(adopted_url) or {}
+                                if adopted_url and adopted and adopted_url != info_url:
+                                    log.info("[%s] prioritize profile doc as primary info_url: %s (was %s)", cid, adopted_url, info_url)
+                                    info_url = adopted_url
+                                    info_dict = {"url": adopted_url, "text": adopted.get("text", "") or "", "html": adopted.get("html", "") or ""}
+                                    try:
+                                        pt_hint = str((page_type_per_url or {}).get(adopted_url) or "OTHER")
+                                        primary_cands = scraper.extract_candidates(
+                                            info_dict.get("text", "") or "",
+                                            info_dict.get("html", "") or "",
+                                            page_type_hint=pt_hint,
                                         )
-                                    )
-                                    adopted_url = profile_seed_urls[0]
-                                    adopted = (priority_docs or {}).get(adopted_url) or {}
-                                    if adopted_url and adopted and adopted_url != info_url:
-                                        log.info("[%s] prioritize profile doc as primary info_url: %s (was %s)", cid, adopted_url, info_url)
-                                        info_url = adopted_url
-                                        info_dict = {"url": adopted_url, "text": adopted.get("text", "") or "", "html": adopted.get("html", "") or ""}
-                                        try:
-                                            pt_hint = str((page_type_per_url or {}).get(adopted_url) or "OTHER")
-                                            primary_cands = scraper.extract_candidates(
-                                                info_dict.get("text", "") or "",
-                                                info_dict.get("html", "") or "",
-                                                page_type_hint=pt_hint,
-                                            )
-                                        except Exception:
-                                            pass
+                                    except Exception:
+                                        pass
                             except Exception:
                                 pass
                             if timed_out:
@@ -4427,15 +4491,12 @@ async def process():
                             target_types: list[str] = []
                             if not timed_out and not fully_filled and not over_deep_phase_deadline():
                                 if missing_contact > 0:
-                                    priority_limit = 3
-                                    target_types.append("contact")
+                                    # 連絡先ページはノイズになりやすいので、会社概要系から拾う方針に寄せる
+                                    priority_limit = 2
                                     base_pt = page_type_per_url.get(info_url) or page_type_per_url.get(homepage) or "OTHER"
-                                    # provisional/非プロフィール起点だと contact だけでは会社概要に到達しにくいので about も許可する
+                                    # provisional/非プロフィール起点でも会社概要へ寄せる
                                     if base_pt != "COMPANY_PROFILE" and "about" not in target_types:
-                                        priority_limit = max(priority_limit, 2)
                                         target_types.append("about")
-                                        # 会社概要導線は1〜2本だけ辿る（既存max_pages内、無駄打ち禁止）
-                                        priority_limit = min(priority_limit, 2)
                                 if need_description or need_founded or need_listing:
                                     priority_limit = max(priority_limit, 2)
                                     target_types.append("about")
@@ -4445,7 +4506,7 @@ async def process():
                             site_docs = {}
                             # 既取得URLは除外しつつ不足がある場合のみ追加巡回する
                             if priority_limit > 0 and not over_deep_phase_deadline():
-                                allow_slow_priority = bool("about" in target_types or "contact" in target_types)
+                                allow_slow_priority = bool("about" in target_types)
                                 site_docs = await asyncio.wait_for(
                                     scraper.fetch_priority_documents(
                                         homepage,
@@ -4470,46 +4531,43 @@ async def process():
                             except Exception:
                                 base_pt = page_type_per_url.get(info_url) or "OTHER"
                             if homepage and homepage_official_flag == 0 and base_pt != "COMPANY_PROFILE":
-                                profile_urls = [u for u in site_docs.keys() if page_type_per_url.get(u) == "COMPANY_PROFILE"]
-                                if profile_urls:
-                                    profile_urls.sort(key=lambda u: (0 if any(seg in (u or "").lower() for seg in ("/company", "/about", "/corporate", "/profile", "/overview", "/outline")) else 1, len(u or ""), u))
-                                    adopted_url = profile_urls[0]
-                                    adopted = site_docs.get(adopted_url) or priority_docs.get(adopted_url)
-                                    if adopted and adopted_url and adopted_url != homepage:
-                                        log.info("[%s] provisional起点から会社概要へ誘導: adopt=%s from=%s", cid, adopted_url, homepage)
-                                        info_url = adopted_url
-                                        info_dict = adopted
-                                        homepage = adopted_url
-                                        try:
-                                            provisional_profile_hit = True
-                                            if adopted_url:
-                                                ds = scraper._domain_score(company_tokens, adopted_url)  # type: ignore
-                                                provisional_domain_score = max(int(provisional_domain_score or 0), int(ds or 0))
-                                                provisional_host_token = provisional_host_token or scraper._host_token_hit(company_tokens, adopted_url)  # type: ignore
-                                            text_val = adopted.get("text", "") or ""
-                                            html_val = adopted.get("html", "") or ""
-                                            extracted = scraper.extract_candidates(text_val, html_val, page_type_hint=str(page_type_per_url.get(adopted_url) or "OTHER"))
-                                            adopted_rule = scraper.is_likely_official_site(
-                                                name,
-                                                adopted_url,
-                                                {"url": adopted_url, "text": text_val, "html": html_val},
-                                                addr,
-                                                extracted,
-                                                return_details=True,
+                                adopted_url = pick_primary_info_url([homepage, info_url, *list(site_docs.keys())], homepage)
+                                adopted = site_docs.get(adopted_url) or priority_docs.get(adopted_url)
+                                if adopted and adopted_url and adopted_url != homepage:
+                                    log.info("[%s] provisional起点から会社概要へ誘導: adopt=%s from=%s", cid, adopted_url, homepage)
+                                    info_url = adopted_url
+                                    info_dict = adopted
+                                    homepage = adopted_url
+                                    try:
+                                        provisional_profile_hit = True
+                                        if adopted_url:
+                                            ds = scraper._domain_score(company_tokens, adopted_url)  # type: ignore
+                                            provisional_domain_score = max(int(provisional_domain_score or 0), int(ds or 0))
+                                            provisional_host_token = provisional_host_token or scraper._host_token_hit(company_tokens, adopted_url)  # type: ignore
+                                        text_val = adopted.get("text", "") or ""
+                                        html_val = adopted.get("html", "") or ""
+                                        extracted = scraper.extract_candidates(text_val, html_val, page_type_hint=str(page_type_per_url.get(adopted_url) or "OTHER"))
+                                        adopted_rule = scraper.is_likely_official_site(
+                                            name,
+                                            adopted_url,
+                                            {"url": adopted_url, "text": text_val, "html": html_val},
+                                            addr,
+                                            extracted,
+                                            return_details=True,
+                                        )
+                                        if isinstance(adopted_rule, dict):
+                                            provisional_name_present = provisional_name_present or bool(adopted_rule.get("name_present"))
+                                            provisional_address_ok = provisional_address_ok or bool(
+                                                adopted_rule.get("address_match")
+                                                or adopted_rule.get("prefecture_match")
+                                                or adopted_rule.get("postal_code_match")
                                             )
-                                            if isinstance(adopted_rule, dict):
-                                                provisional_name_present = provisional_name_present or bool(adopted_rule.get("name_present"))
-                                                provisional_address_ok = provisional_address_ok or bool(
-                                                    adopted_rule.get("address_match")
-                                                    or adopted_rule.get("prefecture_match")
-                                                    or adopted_rule.get("postal_code_match")
-                                                )
-                                                provisional_evidence_score = max(
-                                                    int(provisional_evidence_score or 0),
-                                                    int(adopted_rule.get("official_evidence_score") or 0),
-                                                )
-                                        except Exception:
-                                            pass
+                                            provisional_evidence_score = max(
+                                                int(provisional_evidence_score or 0),
+                                                int(adopted_rule.get("official_evidence_score") or 0),
+                                            )
+                                    except Exception:
+                                        pass
                                         # 保存用の暫定URL(起点)は保持しつつ、採用URLは切り替える
                                         force_review = True
                             missing_contact, missing_extra = refresh_need_flags()
@@ -4614,6 +4672,7 @@ async def process():
                                         base_html = (info_dict or {}).get("html", "") if isinstance(info_dict, dict) else ""
                                         exclude_urls = set((page_type_per_url or {}).keys())
                                         discover_max_links = 4 if (need_rep or need_description or need_founded or need_listing) else 2
+                                        discover_max_links = min(discover_max_links, PROFILE_DISCOVERY_MAX_LINKS_CAP)
                                         discovered = await asyncio.wait_for(
                                             scraper.fetch_priority_documents(
                                                 info_url,
@@ -4934,6 +4993,8 @@ async def process():
                                             info_dict.get("html", ""),
                                             max_links=3,
                                             concurrency=FETCH_CONCURRENCY,
+                                            # 住所は会社概要系に載ることが多い。contactを優先しない。
+                                            target_types=["about"],
                                             allow_slow=need_addr,
                                             exclude_urls=set(priority_docs.keys()) if priority_docs else None,
                                         ),
@@ -5459,50 +5520,90 @@ async def process():
                         except Exception:
                             pass
 
-                            # 80〜160字（既定）に寄せる。短すぎ/長すぎの場合は既取得テキストから再構成する。
-                            if (not description_val) or (len(description_val) < FINAL_DESCRIPTION_MIN_LEN) or (len(description_val) > FINAL_DESCRIPTION_MAX_LEN):
-                                rebuilt = build_final_description_from_payloads(payloads_for_desc)
-                                if rebuilt and ((not description_val) or (len(description_val) < FINAL_DESCRIPTION_MIN_LEN) or (len(description_val) > FINAL_DESCRIPTION_MAX_LEN)):
-                                    description_val = rebuilt
-                            # それでも description が欠損/規格外なら、最後に AI で description だけ再生成して穴を塞ぐ
-                            if (
-                                AI_DESCRIPTION_ALWAYS
-                                and AI_DESCRIPTION_FALLBACK_CALL
-                                and USE_AI
-                                and verifier is not None
-                                and (not timed_out)
-                                and has_time_for_ai()
-                                and (
-                                    (not description_val)
-                                    or (len(description_val) < FINAL_DESCRIPTION_MIN_LEN)
-                                    or (len(description_val) > FINAL_DESCRIPTION_MAX_LEN)
-                                )
+                        # 80〜160字（既定）に寄せる。短すぎ/長すぎの場合は既取得テキストから再構成する。
+                        if (not description_val) or (len(description_val) < FINAL_DESCRIPTION_MIN_LEN) or (len(description_val) > FINAL_DESCRIPTION_MAX_LEN):
+                            rebuilt = build_final_description_from_payloads(payloads_for_desc)
+                            if rebuilt and (
+                                (not description_val)
+                                or (len(description_val) < FINAL_DESCRIPTION_MIN_LEN)
+                                or (len(description_val) > FINAL_DESCRIPTION_MAX_LEN)
                             ):
+                                description_val = rebuilt
+
+                        ai_desc_attempted = False
+                        # ---- AIで毎回 description を生成（読みやすい事業説明を優先） ----
+                        if (
+                            AI_DESCRIPTION_ALWAYS
+                            and AI_DESCRIPTION_ALWAYS_CALL
+                            and USE_AI
+                            and verifier is not None
+                            and remaining_time_budget() > 0.3
+                        ):
+                            try:
+                                blocks = _collect_business_text_blocks(payloads_for_desc)
+                                if not blocks and info_dict:
+                                    blocks.append(info_dict.get("text", "") or "")
+                                desc_text = build_ai_text_payload(*blocks)
+                                shot = b""
                                 try:
-                                    blocks = _collect_business_text_blocks(payloads_for_desc)
-                                    if not blocks and info_dict:
-                                        blocks.append(info_dict.get("text", "") or "")
-                                    desc_text = build_ai_text_payload(*blocks)
-                                    shot = b""
-                                    try:
-                                        maybe_shot = (info_dict or {}).get("screenshot")
-                                        if isinstance(maybe_shot, (bytes, bytearray)) and maybe_shot:
-                                            shot = bytes(maybe_shot)
-                                    except Exception:
-                                        shot = b""
-                                    prev_desc = description_val
-                                    generated = await asyncio.wait_for(
-                                        verifier.generate_description(desc_text, shot, name, addr_raw),
-                                        timeout=clamp_timeout(ai_call_timeout),
-                                    )
-                                    apply_ai_description(generated)
-                                    # 生成に失敗/不適合なら直前の値に戻す（空欄化で欠損を作らない）
-                                    if (not description_val) or (len(description_val) < 10):
-                                        description_val = prev_desc
+                                    maybe_shot = (info_dict or {}).get("screenshot")
+                                    if isinstance(maybe_shot, (bytes, bytearray)) and maybe_shot:
+                                        shot = bytes(maybe_shot)
                                 except Exception:
-                                    pass
-                            if description_val and len(description_val) > FINAL_DESCRIPTION_MAX_LEN:
-                                description_val = _truncate_final_description(description_val, max_len=FINAL_DESCRIPTION_MAX_LEN)
+                                    shot = b""
+                                ai_desc_attempted = True
+                                ai_used = 1
+                                if not ai_model:
+                                    ai_model = AI_MODEL_NAME or ""
+                                generated = await asyncio.wait_for(
+                                    verifier.generate_description(desc_text, shot, name, addr_raw),
+                                    timeout=clamp_timeout(ai_call_timeout),
+                                )
+                                apply_ai_description(generated)
+                            except Exception:
+                                pass
+
+                        # それでも description が欠損/規格外なら、最後に AI で description だけ再生成して穴を塞ぐ
+                        if (
+                            AI_DESCRIPTION_ALWAYS
+                            and AI_DESCRIPTION_FALLBACK_CALL
+                            and USE_AI
+                            and verifier is not None
+                            and (not timed_out)
+                            and has_time_for_ai()
+                            and (not ai_desc_attempted)
+                            and (
+                                (not description_val)
+                                or (len(description_val) < FINAL_DESCRIPTION_MIN_LEN)
+                                or (len(description_val) > FINAL_DESCRIPTION_MAX_LEN)
+                            )
+                        ):
+                            try:
+                                blocks = _collect_business_text_blocks(payloads_for_desc)
+                                if not blocks and info_dict:
+                                    blocks.append(info_dict.get("text", "") or "")
+                                desc_text = build_ai_text_payload(*blocks)
+                                shot = b""
+                                try:
+                                    maybe_shot = (info_dict or {}).get("screenshot")
+                                    if isinstance(maybe_shot, (bytes, bytearray)) and maybe_shot:
+                                        shot = bytes(maybe_shot)
+                                except Exception:
+                                    shot = b""
+                                prev_desc = description_val
+                                generated = await asyncio.wait_for(
+                                    verifier.generate_description(desc_text, shot, name, addr_raw),
+                                    timeout=clamp_timeout(ai_call_timeout),
+                                )
+                                apply_ai_description(generated)
+                                # 生成に失敗/不適合なら直前の値に戻す（空欄化で欠損を作らない）
+                                if (not description_val) or (len(description_val) < 10):
+                                    description_val = prev_desc
+                            except Exception:
+                                pass
+
+                        if description_val and len(description_val) > FINAL_DESCRIPTION_MAX_LEN:
+                            description_val = _truncate_final_description(description_val, max_len=FINAL_DESCRIPTION_MAX_LEN)
 
                         # ---- 業種/タグを毎回推定して格納（追加AI呼び出し無し） ----
                         industry_val = (company.get("industry") or "").strip()
@@ -5601,28 +5702,13 @@ async def process():
                             "deep_address_candidates": int(deep_address_candidates or 0),
                             "deep_rep_candidates": int(deep_rep_candidates or 0),
                             "top3_urls": json.dumps(list(urls or [])[:3], ensure_ascii=False),
-                            "exclude_reasons": json.dumps(exclude_reasons or {}, ensure_ascii=False),
-                            "skip_reason": (company.get("skip_reason") or "").strip(),
-                            # 参照URL（どのページを“真”として扱ったか）。会社概要/会社案内/企業情報系を最優先で選ぶ。
-                            "reference_homepage": (lambda: (
-                                (sorted(
-                                    [
-                                        (
-                                            0 if str(pt or "") == "COMPANY_PROFILE" else 1,
-                                            0 if any(seg in (unquote(urlparse(u).path or "").lower()) for seg in ("/company/overview", "/overview", "/outline", "/summary")) else 1,
-                                            len(u or ""),
-                                            u,
-                                        )
-                                        for u, pt in (page_type_per_url or {}).items()
-                                        if u and (str(pt or "") == "COMPANY_PROFILE" or _is_profile_like_url(u))
-                                    ]
-                                )[0][3])
-                                if any(u and (str(pt or "") == "COMPANY_PROFILE" or _is_profile_like_url(u)) for u, pt in (page_type_per_url or {}).items())
-                                else ""
-                            ))(),
-                            "provisional_homepage": (provisional_homepage or forced_provisional_homepage or ""),
-                            "provisional_reason": ((company.get("provisional_reason") or "").strip() or forced_provisional_reason or ""),
-                            "final_homepage": (homepage or ""),
+                                "exclude_reasons": json.dumps(exclude_reasons or {}, ensure_ascii=False),
+                                "skip_reason": (company.get("skip_reason") or "").strip(),
+                                # 参照URL（どのページを“真”として扱ったか）。会社概要/会社案内/企業情報系を最優先で選ぶ。
+                                "reference_homepage": _pick_reference_homepage(page_type_per_url),
+                                "provisional_homepage": (provisional_homepage or forced_provisional_homepage or ""),
+                                "provisional_reason": ((company.get("provisional_reason") or "").strip() or forced_provisional_reason or ""),
+                                "final_homepage": (homepage or ""),
                             "deep_enabled": int(bool(deep_pages_visited or deep_fetch_count)),
                             "deep_stop_reason": (deep_stop_reason or deep_skip_reason or ""),
                             "timeout_stage": timeout_stage or "",

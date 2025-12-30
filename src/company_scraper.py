@@ -3755,13 +3755,16 @@ class CompanyScraper:
                     if need_screenshot:
                         screenshot_timeout_ms = _cap_timeout_ms(min(4000, attempt_timeout))
                         if screenshot_timeout_ms > 0:
+                            task: asyncio.Task | None = None
                             try:
-                                screenshot = await asyncio.wait_for(
-                                    page.screenshot(full_page=True),
-                                    timeout=screenshot_timeout_ms / 1000.0,
-                                )
+                                task = asyncio.create_task(page.screenshot(full_page=True))
+                                screenshot = await asyncio.wait_for(task, timeout=screenshot_timeout_ms / 1000.0)
                             except Exception:
                                 screenshot = b""
+                                if task is not None and not task.done():
+                                    task.cancel()
+                                if task is not None:
+                                    await asyncio.gather(task, return_exceptions=True)
                 cleaned_text = self._clean_text_from_html(html, fallback_text=text or "")
                 result = {"url": url, "text": cleaned_text, "html": html, "screenshot": screenshot}
                 if cached and not screenshot:
@@ -4042,6 +4045,9 @@ class CompanyScraper:
 
             if profile_hit:
                 score += 20
+            # URL形状が会社概要っぽい場合は導線テキストが弱くても拾う（"Company" だけのメニュー等）
+            if include_about and any(seg in (parsed.path or "").lower() for seg in ("/company", "/corporate", "/about", "/profile", "/overview", "/outline", "/summary")):
+                score += 6
             if include_about:
                 for kw in PRIORITY_SECTION_KEYWORDS:
                     if kw in token:
@@ -4103,7 +4109,8 @@ class CompanyScraper:
             return []
         if not base_root:
             return []
-        types = target_types or ["about", "contact"]
+        # 優先巡回は会社概要系を基本とする（contact はノイズ/誤取得の起点になりやすい）。
+        types = target_types or ["about"]
         # ページ側に導線が無い/JSでリンクが取れないケースでも「会社概要」へ到達できるよう、
         # deep最優先のパス候補（日本語含む）をフォールバックで試す。
         fallback_map: dict[str, list[str]] = {
