@@ -40,6 +40,20 @@ def test_normalize_address_does_not_reject_city_code_suffix():
     raw = "〒278-0055 千葉県野田市岩名2023番地6（市区町村コード:12208）"
     assert normalize_address(raw) == "〒278-0055 千葉県野田市岩名2023番地6"
 
+def test_normalize_address_strips_map_parenthetical_without_truncating():
+    raw = "〒150-0001 東京都渋谷区神宮前1-1-1（Google Map）"
+    assert normalize_address(raw) == "〒150-0001 東京都渋谷区神宮前1-1-1"
+
+
+def test_normalize_address_strips_trailing_url():
+    raw = "〒150-0001 東京都渋谷区神宮前1-1-1 https://example.com/access"
+    assert normalize_address(raw) == "〒150-0001 東京都渋谷区神宮前1-1-1"
+
+
+def test_normalize_address_prefers_last_address_label_segment():
+    raw = "TEL:03-1111-2222 住所：〒150-0001 東京都渋谷区神宮前1-1-1"
+    assert normalize_address(raw) == "〒150-0001 東京都渋谷区神宮前1-1-1"
+
 
 def test_normalize_address_rejects_address_input_prompt_noise():
     raw = "住所を入力してください（必須）都道府県を選択 市区町村を入力 番地を入力 建物名を入力"

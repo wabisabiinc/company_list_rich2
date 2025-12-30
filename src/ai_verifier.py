@@ -7,6 +7,7 @@ import re
 import unicodedata
 import base64
 import hashlib
+import html as html_mod
 from typing import Optional, Dict, Any
 
 from .jp_number import normalize_kanji_numbers
@@ -129,12 +130,31 @@ def _normalize_address(addr: Optional[str]) -> Optional[str]:
         return None
     if _looks_mojibake(addr):
         return None
-    a = re.sub(r"\s+", " ", addr.strip())
+    a = re.sub(r"[\r\n\t]+", " ", addr.strip())
+    a = re.sub(r"\s+", " ", a)
+    a = html_mod.unescape(a)
+    # URL等の混入除去
+    a = re.sub(r"https?://\S+", " ", a, flags=re.I)
+    a = re.sub(r"\bmailto:\S+", " ", a, flags=re.I)
+    a = re.sub(r"\btel:\S+", " ", a, flags=re.I)
+    # ノイズ語を含む括弧要素（地図・TEL等）を除去
+    def _drop_noise_parens(m: re.Match) -> str:
+        inner = (m.group(2) or "").strip().lower()
+        noise = (
+            "tel", "fax", "電話", "メール", "e-mail", "mail",
+            "地図", "マップ", "map", "google", "アクセス", "行き方", "ルート", "経路",
+            "営業時間", "受付時間", "定休日",
+            "お問い合わせ", "お問合せ", "問い合わせ",
+            "市区町村コード", "自治体コード",
+        )
+        return " " if any(k.lower() in inner for k in noise) else m.group(0)
+    a = re.sub(r"([（(])([^）)]{0,80})([)）])", _drop_noise_parens, a)
+    a = re.sub(r"\s+", " ", a).strip()
     # 住所の後ろに混入しがちな付帯情報をカット（AI出力の誤混入対策）
     cut_re = re.compile(
         r"\s*(?:"
         r"TEL|電話|☎|℡|FAX|ファックス|メール|E[-\s]?mail|"
-        r"地図|マップ|Google\s*マップ|アクセス|行き方|ルート|経路|"
+        r"地図|マップ|Google\s*マップ|Google\s*Map|アクセス|行き方|ルート|経路|"
         r"営業時間|受付時間|定休日|"
         r"従業員(?:数)?|社員(?:数)?|職員(?:数)?|スタッフ(?:数)?|人数|"
         r"資本金|設立|創業|沿革|代表者|代表取締役|"

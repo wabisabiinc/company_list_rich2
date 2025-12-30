@@ -347,25 +347,81 @@ def normalize_address(s: str | None) -> str | None:
             out = out[: m_tail.start()].strip()
         out = out.strip(" 　\t,，;；。．|｜/／・-‐―－ー:：")
         return out
+
+    def _remove_noise_parentheticals(text: str) -> str:
+        """
+        住所に混入しやすい「（地図）」「(TEL...)」等の括弧要素だけを落とす。
+        住所の一部になり得る階数等（例: （2F））は残しやすいよう、ノイズ語がある括弧のみ除去する。
+        """
+        if not text:
+            return text
+        noise_kw = (
+            "tel",
+            "fax",
+            "電話",
+            "メール",
+            "e-mail",
+            "mail",
+            "お問い合わせ",
+            "お問合せ",
+            "問い合わせ",
+            "地図",
+            "マップ",
+            "map",
+            "google",
+            "アクセス",
+            "行き方",
+            "ルート",
+            "経路",
+            "営業時間",
+            "受付時間",
+            "定休日",
+            "市区町村コード",
+            "自治体コード",
+        )
+
+        def _repl(m: re.Match) -> str:
+            inner = (m.group(2) or "").strip()
+            low = inner.lower()
+            if any(k in low for k in noise_kw):
+                return " "
+            return m.group(0)
+
+        # 丸括弧/全角括弧のみ対象（角括弧は JSON 断片等に使われることがあるため別処理）
+        text = re.sub(r"([（(])([^）)]{0,80})([)）])", _repl, text)
+        return re.sub(r"\s+", " ", text).strip()
     s = s.strip().replace("　", " ")
+    s = html_mod.unescape(s)
     s = re.sub(r"<[^>]+>", " ", s)
     # タグが壊れている/途中で切れている場合の残骸を軽く除去（div/nav 等）
     s = s.replace("<", " ").replace(">", " ")
     s = re.sub(r"\b(?:div|nav|footer|header|main|section|article|span|ul|li|br|href|class|id|style)\b", " ", s, flags=re.I)
     s = re.sub(r"=\s*(?:\"[^\"]*\"|'[^']*'|\\\"[^\\\"]*\\\")", " ", s)
     s = re.sub(r"\s*=\s*", " ", s)
+    s = re.sub(r"[\r\n\t]+", " ", s)
     # CSSスタイル断片の除去（スクレイプ時に混入する background: などを落とす）
     s = re.sub(r"(background|color|font-family|font-size|display|position)\s*:\s*[^;]+;?", " ", s, flags=re.I)
     # JSやトラッキング断片をカット（window.dataLayer 等が混入するケース対策）
     m_noise = ADDRESS_JS_NOISE_RE.search(s)
     if m_noise:
         s = s[: m_noise.start()]
+    s = _remove_noise_parentheticals(s)
+    # URL 等の混入を早めに除去（住所の末尾に付くケース）
+    s = re.sub(r"https?://\S+", " ", s, flags=re.I)
+    s = re.sub(r"\bmailto:\S+", " ", s, flags=re.I)
+    s = re.sub(r"\btel:\S+", " ", s, flags=re.I)
+    # 住所ラベルが含まれる場合は、そこから先を優先する（先頭にTEL等があっても住所を拾う）
+    m_label = None
+    for m in re.finditer(r"(?:本社|本店)?(?:所在地|住所)\s*[:：]\s*", s):
+        m_label = m
+    if m_label:
+        s = s[m_label.end():]
     # 連絡先や地図系キーワードが混入した場合はそれ以降をカット
-    contact_pattern = re.compile(r"(TEL|電話|☎|℡|FAX|ファックス|メール|E[-\s]?mail)", re.IGNORECASE)
+    contact_pattern = re.compile(r"(TEL|電話|☎|℡|FAX|ファックス|メール|E[-\s]?mail|Mail|連絡先)", re.IGNORECASE)
     contact_match = contact_pattern.search(s)
     if contact_match:
         s = s[: contact_match.start()]
-    map_pattern = re.compile(r"(地図アプリ|地図で見る|マップ|Google\s*マップ|アクセス|アクセスマップ|ルート|経路|Route|Directions|行き方)", re.IGNORECASE)
+    map_pattern = re.compile(r"(地図アプリ|地図で見る|地図|マップ|Google\s*マップ|Google\s*Map|アクセス|アクセスマップ|ルート|経路|Route|Directions|行き方)", re.IGNORECASE)
     map_match = map_pattern.search(s)
     if map_match:
         s = s[: map_match.start()]
