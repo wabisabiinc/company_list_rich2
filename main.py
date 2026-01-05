@@ -175,6 +175,24 @@ CSV_FIELDNAMES = [
     "homepage", "phone", "found_address", "rep_name", "description",
     "listing", "revenue", "profit", "capital", "fiscal_month", "founded_year"
 ]
+
+# CSV（Excel）インジェクション対策:
+# セル先頭が = + - @ の場合、Excel が式として解釈し得るため先頭に ' を付けて無害化する。
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@")
+
+def _csv_safe_cell(value: Any) -> Any:
+    if value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        return value
+    s = str(value)
+    stripped = s.lstrip(" \t\r\n")
+    if stripped and stripped[0] in _CSV_FORMULA_PREFIXES:
+        return "'" + s
+    return s
+
+def _csv_safe_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {k: _csv_safe_cell(v) for k, v in (row or {}).items()}
 PHASE_METRICS_PATH = os.getenv("PHASE_METRICS_PATH", "logs/phase_metrics.csv")
 NO_OFFICIAL_LOG_PATH = os.getenv("NO_OFFICIAL_LOG_PATH", "logs/no_official.jsonl")
 EXTRACT_DEBUG_JSONL_PATH = os.getenv("EXTRACT_DEBUG_JSONL_PATH", "")
@@ -338,7 +356,10 @@ def normalize_address(s: str | None) -> str | None:
             r"ホーム|home|トップ|top|最新情報|お知らせ|ニュース|news|ブログ|blog|"
             r"会社概要|会社情報|企業情報|会社案内|"
             r"事業内容|サービス|"
-            r"お問い合わせ|お問合せ|問い合わせ|採用|求人|Google"
+            r"お問い合わせ|お問合せ|問い合わせ|採用|求人|Google|"
+            r"次のリンク|別ウィンドウ|クリック|タップ|"
+            r"最寄り駅|(?:JR)?[一-龥ァ-ンA-Za-z0-9]{0,12}駅(?:より|から)|駅(?:より|から)|徒歩\s*\d{1,3}\s*分|"
+            r"交差点|右折|左折|直進"
             r")",
             re.IGNORECASE,
         )
@@ -421,7 +442,14 @@ def normalize_address(s: str | None) -> str | None:
     contact_match = contact_pattern.search(s)
     if contact_match:
         s = s[: contact_match.start()]
-    map_pattern = re.compile(r"(地図アプリ|地図で見る|地図|マップ|Google\s*マップ|Google\s*Map|アクセス|アクセスマップ|ルート|経路|Route|Directions|行き方)", re.IGNORECASE)
+    map_pattern = re.compile(
+        r"(地図アプリ|地図で見る|地図|マップ|Google\s*マップ|Google\s*Map|アクセス|アクセスマップ|"
+        r"ルート|経路|Route|Directions|行き方|"
+        r"次のリンク|別ウィンドウ|クリック|タップ|"
+        r"最寄り駅|(?:JR)?[一-龥ァ-ンA-Za-z0-9]{0,12}駅(?:より|から)|駅(?:より|から)|徒歩\s*\d{1,3}\s*分|"
+        r"交差点|右折|左折|直進)",
+        re.IGNORECASE,
+    )
     map_match = map_pattern.search(s)
     if map_match:
         s = s[: map_match.start()]
@@ -2630,7 +2658,7 @@ async def process():
                         })
                         manager.save_company_data(company, status="review")
                         if csv_writer:
-                            csv_writer.writerow({k: company.get(k, "") for k in CSV_FIELDNAMES})
+                            csv_writer.writerow(_csv_safe_row({k: company.get(k, "") for k in CSV_FIELDNAMES}))
                             csv_file.flush()
                         processed += 1
                         try:
@@ -2958,7 +2986,7 @@ async def process():
                         manager.save_company_data(company, status="review")
                         log.info("[%s] 候補ゼロ -> review/search_timeout で保存", cid)
                         if csv_writer:
-                            csv_writer.writerow({k: company.get(k, "") for k in CSV_FIELDNAMES})
+                            csv_writer.writerow(_csv_safe_row({k: company.get(k, "") for k in CSV_FIELDNAMES}))
                             csv_file.flush()
                         processed += 1
                         if SLEEP_BETWEEN_SEC > 0:
@@ -5269,12 +5297,65 @@ async def process():
                                         a = re.sub(r"\\s+", "", addr_norm)
                                         e = re.sub(r"\\s+", "", ev)
                                         return bool(a and e and (a in e or e in a))
+                                    def _normalize_snippet_for_match(text: str) -> str:
+                                        s = unicodedata.normalize("NFKC", str(text or ""))
+                                        s = re.sub(r"\s+", "", s)
+                                        s = re.sub(r"[\"'`“”‘’]", "", s)
+                                        return s
+                                    def _validate_description_evidence(
+                                        evidence_list: Any,
+                                        allowed_urls: set[str],
+                                        docs: dict[str, dict[str, Any]],
+                                    ) -> list[dict[str, str]]:
+                                        if not isinstance(evidence_list, list):
+                                            return []
+                                        out: list[dict[str, str]] = []
+                                        for it in evidence_list:
+                                            if not isinstance(it, dict):
+                                                continue
+                                            u = it.get("url")
+                                            sn = it.get("snippet")
+                                            if not (isinstance(u, str) and isinstance(sn, str)):
+                                                continue
+                                            u = u.strip()
+                                            sn = sn.strip()
+                                            if not u or not sn:
+                                                continue
+                                            if u not in allowed_urls:
+                                                continue
+                                            doc = docs.get(u) or {}
+                                            doc_text = _normalize_snippet_for_match(doc.get("text", "") or "")
+                                            sn_norm = _normalize_snippet_for_match(sn)
+                                            if not sn_norm or not doc_text:
+                                                continue
+                                            if sn_norm not in doc_text:
+                                                continue
+                                            out.append({"url": u, "snippet": sn[:200]})
+                                        return out[:4]
                                     if not description_val and isinstance(ai_result.get("description"), str) and ai_result.get("description"):
                                         description_val = ai_result["description"]
-                                        try:
-                                            company["description_evidence"] = json.dumps(ai_result.get("description_evidence") or [], ensure_ascii=False)
-                                        except Exception:
-                                            company["description_evidence"] = ""
+                                        require_desc_ev = os.getenv("AI_REQUIRE_DESCRIPTION_EVIDENCE", "true").lower() == "true"
+                                        if require_desc_ev:
+                                            ev_valid = _validate_description_evidence(
+                                                ai_result.get("description_evidence"),
+                                                set(top_urls_for_ai or []),
+                                                docs_by_url,
+                                            )
+                                            if len(ev_valid) < 2:
+                                                # 根拠が取れない description は DB 汚染を避けて破棄
+                                                description_val = ""
+                                                company["description_evidence"] = ""
+                                            else:
+                                                try:
+                                                    company["description_evidence"] = json.dumps(ev_valid[:2], ensure_ascii=False)
+                                                except Exception:
+                                                    description_val = ""
+                                                    company["description_evidence"] = ""
+                                        else:
+                                            try:
+                                                company["description_evidence"] = json.dumps(ai_result.get("description_evidence") or [], ensure_ascii=False)
+                                            except Exception:
+                                                company["description_evidence"] = ""
                                     if not phone and isinstance(ai_result.get("phone_number"), str) and ai_result.get("phone_number"):
                                         phone_candidate = normalize_phone(ai_result.get("phone_number")) or ""
                                         if phone_candidate:
@@ -6090,7 +6171,7 @@ async def process():
                         log.info("[%s] 保存完了: status=%s elapsed=%.1fs (worker=%s)", cid, status, elapsed(), WORKER_ID)
 
                         if csv_writer:
-                            csv_writer.writerow({k: company.get(k, "") for k in CSV_FIELDNAMES})
+                            csv_writer.writerow(_csv_safe_row({k: company.get(k, "") for k in CSV_FIELDNAMES}))
                             csv_file.flush()
 
                         processed += 1
@@ -6100,7 +6181,7 @@ async def process():
                 try:
                     log.info("[%s] 候補が全滅のため次へ (worker=%s)", cid, WORKER_ID)
                     if csv_writer:
-                        csv_writer.writerow({k: company.get(k, "") for k in CSV_FIELDNAMES})
+                        csv_writer.writerow(_csv_safe_row({k: company.get(k, "") for k in CSV_FIELDNAMES}))
                         csv_file.flush()
                     processed += 1
                 except Exception:

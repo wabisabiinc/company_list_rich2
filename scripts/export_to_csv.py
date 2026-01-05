@@ -8,6 +8,17 @@ from typing import Iterable, Sequence
 DB_DEFAULT  = Path("data/companies.db")
 OUT_DEFAULT = Path("data/output.csv")
 
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@")
+
+def _csv_safe_cell(value) -> str:
+    if value is None:
+        return ""
+    s = str(value)
+    stripped = s.lstrip(" \t\r\n")
+    if stripped and stripped[0] in _CSV_FORMULA_PREFIXES:
+        return "'" + s
+    return s
+
 def stream_rows(cur: sqlite3.Cursor, arraysize: int = 5000) -> Iterable[Sequence]:
     """大きな結果を分割取得してストリーミング出力"""
     while True:
@@ -77,10 +88,10 @@ def main():
     # Excel 互換のため UTF-8-SIG
     with args.out.open("w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
-        writer.writerow(headers)
+        writer.writerow([_csv_safe_cell(h) for h in headers])
         count = 0
         for row in stream_rows(cur, arraysize=args.chunk):
-            writer.writerow(row)
+            writer.writerow([_csv_safe_cell(v) for v in row])
             count += 1
 
     conn.close()

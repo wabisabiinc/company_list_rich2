@@ -13,6 +13,7 @@ from playwright.async_api import (
     async_playwright, Browser, BrowserContext, Page,
     TimeoutError as PlaywrightTimeoutError, Route
 )
+import io
 
 from .site_validator import extract_name_signals, score_name_match
 
@@ -25,6 +26,11 @@ try:
     from unidecode import unidecode as _unidecode
 except Exception:
     _unidecode = None
+
+try:
+    from pypdf import PdfReader as _PdfReader  # type: ignore
+except Exception:
+    _PdfReader = None
 
 log = logging.getLogger(__name__)
 
@@ -138,6 +144,11 @@ REP_NAME_EXACT_BLOCKLIST = {
 	        # UI/サイト断片（代表者名の誤爆が多い）
 	        "コンテンツ",
 	        "キーワード",
+	        "写真",
+	        "画像",
+	        "photo",
+	        "Photo",
+	        "PHOTO",
 	        "Keyword",
 	        "keyword",
 	        "Keywords",
@@ -163,6 +174,10 @@ REP_NAME_SUBSTR_BLOCKLIST = (
 	    "keyword",
 	    "keywords",
 	    "contents",
+	    "写真",
+	    "画像",
+	    "photo",
+	    "image",
 )
 REP_NAME_EXACT_BLOCKLIST_LOWER = {s.lower() for s in REP_NAME_EXACT_BLOCKLIST}
 NAME_CHUNK_RE = re.compile(r"[\u4E00-\u9FFF]{1,3}(?:[??\s]{0,1}[\u4E00-\u9FFF]{1,3})+")
@@ -257,8 +272,14 @@ ADDRESS_FORM_NOISE_RE = re.compile(
     re.IGNORECASE,
 )
 _BINARY_EXTS = (".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx")
+# 代表者抽出（会社概要テキスト用）。「代表取締役社長」のように役職語が連結されるケースを拾う。
 REP_RE = re.compile(
-    r"(?:代表者|代表取締役|理事長|学長|院長|組合長|会頭|会長|社長)"
+    r"(?:"
+    r"代表者|"
+    r"代表取締役(?:社長|会長|副社長|専務|常務|専務取締役|常務取締役|社長執行役員|会長執行役員)?|"
+    r"代表理事(?:長)?|"
+    r"理事長|学長|院長|組合長|会頭|会長|社長"
+    r")"
     r"(?:\s*[:：]\s*|\s+)"
     r"([一-龥ァ-ンA-Za-z][^\n\r<>\|（）\(\)]{0,39})"
 )
@@ -1170,8 +1191,16 @@ class CompanyScraper:
         # 以降の余計な部分（TELやリンクの残骸）をカット
         val = re.split(r"(?:TEL|Tel|tel|電話|☎|℡|FAX|Fax|fax|ファックス)[:：.．]?\s*", val)[0]
         val = re.split(r"https?://|href=|HREF=", val)[0]
-        # 地図/マップ/アクセスはここでもカット
-        val = re.split(r"(地図アプリ|地図で見る|マップ|Google\s*マップ|map|アクセス|アクセスマップ|ルート|経路|Directions?)", val, maxsplit=1, flags=re.I)[0]
+        # 地図/マップ/アクセス/道案内はここでもカット
+        val = re.split(
+            r"(地図アプリ|地図で見る|マップ|Google\s*マップ|map|アクセス|アクセスマップ|ルート|経路|Directions?|"
+            r"次のリンク|別ウィンドウ|クリック|タップ|"
+            r"最寄り駅|(?:JR)?[一-龥ァ-ンA-Za-z0-9]{0,12}駅(?:より|から)|駅(?:より|から)|徒歩\s*\d{1,3}\s*分|"
+            r"交差点|右折|左折|直進)",
+            val,
+            maxsplit=1,
+            flags=re.I,
+        )[0]
         arrow_idx = min([idx for idx in (val.find("→"), val.find("⇒")) if idx >= 0], default=-1)
         if arrow_idx >= 0:
             val = val[:arrow_idx]
@@ -1192,7 +1221,10 @@ class CompanyScraper:
             r"ホーム|home|トップ|top|最新情報|お知らせ|ニュース|news|ブログ|blog|"
             r"会社概要|会社情報|企業情報|会社案内|"
             r"事業内容|サービス|"
-            r"お問い合わせ|お問合せ|問い合わせ|採用|求人"
+            r"お問い合わせ|お問合せ|問い合わせ|採用|求人|"
+            r"次のリンク|別ウィンドウ|クリック|タップ|"
+            r"最寄り駅|(?:JR)?[一-龥ァ-ンA-Za-z0-9]{0,12}駅(?:より|から)|駅(?:より|から)|徒歩\s*\d{1,3}\s*分|"
+            r"交差点|右折|左折|直進"
             r")",
             re.IGNORECASE,
         )
@@ -1201,7 +1233,14 @@ class CompanyScraper:
             val = val[: m_tail.start()].strip()
         val = re.sub(r"\s+", " ", val).strip(" \"'")
         # 地図・マップ系が出たらそこまででカット
-        m_map = re.search(r"(地図アプリ|マップ|Google\s*マップ|地図|map)", val, flags=re.I)
+        m_map = re.search(
+            r"(地図アプリ|マップ|Google\s*マップ|地図|map|"
+            r"次のリンク|別ウィンドウ|クリック|タップ|"
+            r"最寄り駅|(?:JR)?[一-龥ァ-ンA-Za-z0-9]{0,12}駅(?:より|から)|駅(?:より|から)|徒歩\s*\d{1,3}\s*分|"
+            r"交差点|右折|左折|直進)",
+            val,
+            flags=re.I,
+        )
         if m_map:
             val = val[: m_map.start()].strip()
         if not val:
@@ -1811,10 +1850,46 @@ class CompanyScraper:
         try:
             path_lower = urllib.parse.urlparse(href).path.lower()
             if any(path_lower.endswith(ext) for ext in _BINARY_EXTS):
+                # 会社概要がPDFのみのケースがあるため、会社情報系パスのPDFだけは許可できるようにする
+                allow_pdf = os.getenv("ALLOW_PROFILE_PDF_URL", "true").lower() == "true"
+                if allow_pdf and path_lower.endswith(".pdf") and any(
+                    seg in path_lower for seg in ("/company", "/about", "/profile", "/overview", "/corporate")
+                ):
+                    return href
                 return None
         except Exception:
             pass
         return href
+
+    @staticmethod
+    def _extract_pdf_text(raw: bytes) -> str:
+        """
+        PDF(bytes)からテキスト抽出（pypdf が利用可能な場合のみ）。
+        - 失敗時は空文字（システム全体を落とさない）
+        """
+        if not raw:
+            return ""
+        if _PdfReader is None:
+            return ""
+        try:
+            reader = _PdfReader(io.BytesIO(raw))
+        except Exception:
+            return ""
+        texts: list[str] = []
+        try:
+            for page in getattr(reader, "pages", []) or []:
+                try:
+                    t = page.extract_text() or ""
+                except Exception:
+                    t = ""
+                if t:
+                    texts.append(t)
+        except Exception:
+            return ""
+        joined = "\n".join(texts)
+        joined = unicodedata.normalize("NFKC", joined)
+        joined = re.sub(r"\s+", " ", joined).strip()
+        return joined
 
     def _is_ddg_challenge(self, html: str) -> bool:
         if not html:
@@ -3574,6 +3649,28 @@ class CompanyScraper:
                     pass
             resp.raise_for_status()
             raw = resp.content or b""
+            # PDF 等のバイナリは HTML として扱わず、可能ならテキスト抽出する
+            try:
+                content_type = (resp.headers.get("Content-Type") or "").lower()
+            except Exception:
+                content_type = ""
+            is_pdf = (
+                "application/pdf" in content_type
+                or (urllib.parse.urlparse(url).path or "").lower().endswith(".pdf")
+                or raw.startswith(b"%PDF")
+            )
+            if is_pdf:
+                text_pdf = self._extract_pdf_text(raw)
+                elapsed_ms = (time.monotonic() - started) * 1000
+                if (
+                    not allow_slow
+                    and self.slow_page_threshold_ms > 0
+                    and elapsed_ms > self.slow_page_threshold_ms
+                    and host
+                ):
+                    self._add_slow_host(host)
+                    log.info("[http] mark slow host (%.0f ms) %s", elapsed_ms, host)
+                return {"url": url, "text": text_pdf, "html": ""}
             encoding = self._detect_html_encoding(resp, raw)
             decoded = raw.decode(encoding, errors="replace") if raw else ""
             html = decoded or ""
@@ -3618,8 +3715,13 @@ class CompanyScraper:
             eff_timeout = min(eff_timeout, self.slow_page_threshold_ms)
 
         http_fallback: Dict[str, Any] | None = None
-        # まずHTTPで軽量取得を試す（スクショ不要の場合）
-        if self.use_http_first and not need_screenshot:
+        # PDFはブラウザ本文が取りにくい（ビューア/空テキスト）ため、スクショ要否に関わらずHTTPで先に本文抽出する
+        try:
+            is_pdf_url = (urllib.parse.urlparse(url).path or "").lower().endswith(".pdf")
+        except Exception:
+            is_pdf_url = False
+        # まずHTTPで軽量取得を試す（スクショ不要、または PDF）
+        if self.use_http_first and (not need_screenshot or is_pdf_url):
             # ブラウザ側のタイムアウトを超えてHTTPだけが長く居座らないように上限を合わせる
             http_timeout_ms = min(self.http_timeout_ms, eff_timeout) if eff_timeout > 0 else self.http_timeout_ms
             http_info = await self._fetch_http_info(url, timeout_ms=http_timeout_ms, allow_slow=allow_slow)
@@ -3634,7 +3736,17 @@ class CompanyScraper:
             # 軽量取得で十分な本文が取れた場合のみ即返す。
             # JSレンダリング前提のテンプレ（Next.js/Nuxt/React等）は HTML が大きくても本文が薄いことがあるため、
             # 本文が薄い場合はブラウザで再取得して取りこぼしを減らす。
-            if text_len >= 220 or (text_len >= 120 and not self._looks_js_heavy_template(html_val, http_fallback["text"])):
+            if is_pdf_url and text_len >= 20 and not need_screenshot:
+                self.page_cache[cache_key] = {
+                    "url": url,
+                    "text": http_fallback["text"],
+                    "html": http_fallback["html"],
+                    "screenshot": b"",
+                }
+                return self.page_cache[cache_key]
+            if (not need_screenshot) and (
+                text_len >= 220 or (text_len >= 120 and not self._looks_js_heavy_template(html_val, http_fallback["text"]))
+            ):
                 self.page_cache[cache_key] = {
                     "url": url,
                     "text": http_fallback["text"],
@@ -3827,6 +3939,12 @@ class CompanyScraper:
                         result["text"] = cached.get("text", "")
                     if not html:
                         result["html"] = cached.get("html", "")
+                # PDF はブラウザ抽出テキストが薄い/空になりやすいので、HTTP抽出（pypdf等）を優先する
+                if is_pdf_url and http_fallback is not None:
+                    http_text = (http_fallback.get("text") or "").strip()
+                    if http_text and len((result.get("text") or "").strip()) < len(http_text):
+                        result["text"] = http_fallback.get("text", "") or ""
+                        result["html"] = http_fallback.get("html", "") or ""
                 elapsed_ms = (time.monotonic() - started) * 1000
                 effective_elapsed_ms = max(0.0, elapsed_ms - network_idle_ms)
                 if elapsed_ms >= eff_timeout:

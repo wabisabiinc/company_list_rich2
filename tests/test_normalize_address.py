@@ -12,6 +12,14 @@ def test_normalize_address_cuts_map_instructions():
     raw = "〒100-0001 東京都千代田区1-1-1 ビルディング → JR東京駅より徒歩5分 アクセスマップはこちら"
     assert normalize_address(raw) == "〒100-0001 東京都千代田区1-1-1 ビルディング"
 
+def test_normalize_address_cuts_link_notice_tail():
+    raw = "〒370-0846 群馬県高崎市下和田町5丁目3番21号 次のリンクは別ウィンドウで開きます"
+    assert normalize_address(raw) == "〒370-0846 群馬県高崎市下和田町5丁目3番21号"
+
+def test_normalize_address_cuts_direction_tail_without_access_word():
+    raw = "〒101-0001 東京都千代田区1-1-1 JR東京駅から徒歩5分 交差点を左折"
+    assert normalize_address(raw) == "〒101-0001 東京都千代田区1-1-1"
+
 
 def test_normalize_address_rejects_address_form_noise():
     raw = (

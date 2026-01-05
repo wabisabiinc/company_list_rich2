@@ -7,6 +7,11 @@ def test_clean_rep_name_rejects_content_keyword_words() -> None:
     assert CompanyScraper.clean_rep_name("キーワード") is None
 
 
+def test_clean_rep_name_rejects_photo_words() -> None:
+    assert CompanyScraper.clean_rep_name("写真") is None
+    assert CompanyScraper.clean_rep_name("画像") is None
+
+
 def test_clean_rep_name_rejects_katakana_only_without_middle_dot() -> None:
     assert CompanyScraper.clean_rep_name("ヤマダ タロウ") is None
 

@@ -723,7 +723,14 @@ class DatabaseManager:
             contact_match = contact_pattern.search(s)
             if contact_match:
                 s = s[: contact_match.start()]
-            map_match = re.search(r"(地図アプリ|地図で見る|マップ|Google(?:\s*マップ)?|アクセス|ルート|Route|Directions|行き方)", s, flags=re.IGNORECASE)
+            map_match = re.search(
+                r"(地図アプリ|地図で見る|マップ|Google(?:\s*マップ)?|アクセス|ルート|Route|Directions|行き方|"
+                r"次のリンク|別ウィンドウ|クリック|タップ|"
+                r"最寄り駅|(?:JR)?[一-龥ァ-ンA-Za-z0-9]{0,12}駅(?:より|から)|駅(?:より|から)|徒歩\s*\d{1,3}\s*分|"
+                r"交差点|右折|左折|直進)",
+                s,
+                flags=re.IGNORECASE,
+            )
             if map_match:
                 s = s[: map_match.start()]
             arrow_idx = min([idx for idx in (s.find("→"), s.find("⇒")) if idx >= 0], default=-1)
@@ -738,7 +745,10 @@ class DatabaseManager:
                 r"資本金|設立|創業|沿革|"
                 r"(?:一般|特定)?(?:貨物|運送|建設|産廃|産業廃棄物|古物)?(?:業)?(?:許可|免許|登録|届出)|"
                 r"事業内容|サービス|"
-                r"お問い合わせ|お問合せ|問い合わせ|採用|求人"
+                r"お問い合わせ|お問合せ|問い合わせ|採用|求人|"
+                r"次のリンク|別ウィンドウ|クリック|タップ|"
+                r"最寄り駅|(?:JR)?[一-龥ァ-ンA-Za-z0-9]{0,12}駅(?:より|から)|駅(?:より|から)|徒歩\s*\d{1,3}\s*分|"
+                r"交差点|右折|左折|直進"
                 r")\b",
                 re.IGNORECASE,
             )
@@ -751,6 +761,61 @@ class DatabaseManager:
             if _looks_mojibake(s):
                 return ""
             return s.strip(" 　\t,，;；。．|｜/／・-‐―－ー:：")
+
+        def _clean_rep_name(raw: Any) -> str:
+            """
+            DB保存直前の代表者名クレンジング（インポート/外部入力の汚染対策）。
+            - 住所/連絡先/役職語/タグ混入などの明確な誤りを落とす
+            - 正規の人名らしさ判定は main/src/company_scraper 側で行う前提のため、ここは保守的に扱う
+            """
+            enabled = os.getenv("DB_CLEAN_REP_NAME", "true").lower() == "true"
+            if not enabled:
+                return (str(raw or "").strip())[:80]
+            text = unicodedata.normalize("NFKC", str(raw or "")).replace("\u200b", "").strip()
+            if not text:
+                return ""
+            # 抽出タグ（例: [TABLE][LABEL]）を除去
+            while True:
+                m = re.match(r"^\\[([A-Z_]+)\\]\\s*", text)
+                if not m:
+                    break
+                text = text[m.end():].lstrip()
+            # 括弧内（役職補足など）を除去
+            text = re.sub(r"[（(][^）)]{0,40}[）)]", "", text)
+            # 行や句読点で区切られている場合は先頭だけ
+            text = re.split(r"[、。\\n/|｜,;；:：]", text)[0].strip()
+            # 役職語を先頭/末尾から除去
+            role_words = (
+                "代表取締役社長", "代表取締役会長", "代表取締役副社長", "代表取締役", "代表社員",
+                "代表理事長", "代表理事", "理事長", "会長", "社長", "CEO", "COO", "CFO", "CTO",
+                "取締役社長", "取締役会長", "取締役", "執行役", "院長", "学長", "園長", "校長", "所長",
+            )
+            changed = True
+            while changed:
+                before = text
+                for w in role_words:
+                    text = re.sub(rf"^{re.escape(w)}[\\s　]*", "", text)
+                    text = re.sub(rf"[\\s　]*{re.escape(w)}$", "", text)
+                text = text.strip()
+                changed = (text != before)
+            if not text:
+                return ""
+            # 明確なノイズ
+            if re.search(r"https?://|mailto:|@|＠|tel[:：]|電話|ＦＡＸ|FAX", text, flags=re.I):
+                return ""
+            if re.search(r"(所在地|住所|本社|本店)", text):
+                return ""
+            if re.search(r"\\d", text):
+                return ""
+            if any(w in text for w in ("お問い合わせ", "お問合せ", "アクセス", "採用", "求人", "ニュース", "お知らせ")):
+                return ""
+            # 会社名/法人格が混入している場合は除外（代表者=人名のみ）
+            if any(w in text for w in ("株式会社", "有限会社", "合同会社", "合名会社", "合資会社")):
+                return ""
+            # 長さチェック
+            if len(text) < 2 or len(text) > 40:
+                return ""
+            return text
 
         DESCRIPTION_MAX_LEN = max(10, int(os.getenv("DESCRIPTION_MAX_LEN", "200")))
         DESCRIPTION_MIN_LEN = max(4, int(os.getenv("DESCRIPTION_MIN_LEN", "10")))
@@ -964,6 +1029,10 @@ class DatabaseManager:
                 return False
             return True
 
+        # CSV住所は誤っていることが多い前提で、公式サイトが強く確定している場合は
+        # 取得住所（特に rule/official）を優先できるようにする（都道府県不一致でも救済）。
+        prefer_official_over_csv = os.getenv("ADDRESS_PREFER_OFFICIAL_OVER_CSV", "true").lower() == "true"
+
         allow_overwrite = False
         if found_addr:
             if not pref_diff:
@@ -1012,6 +1081,27 @@ class DatabaseManager:
                     ):
                         allow_overwrite = True
                         conflict_level = "pref_mismatch_overwritten"
+                # 公式サイトが強く確定していて、住所取得元が rule/official の場合は、
+                # CSV側が十分に具体的でも誤りの可能性があるため上書きを許可する（保守的に条件付き）。
+                if not allow_overwrite and prefer_official_over_csv:
+                    found_has_zip = bool(re.search(r"\d{3}-\d{4}", found_addr))
+                    found_has_city = bool(re.search(r"(\u5e02|\u533a|\u753a|\u6751|\u90e1)", found_addr))
+                    try:
+                        low = src_url_addr.lower()
+                    except Exception:
+                        low = ""
+                    is_profile_like = any(seg in low for seg in ("/company", "/about", "/profile", "/overview", "/corporate"))
+                    if (
+                        strong_official
+                        and addr_source in {"rule", "official"}
+                        and _page_type_ok(src_url_addr)
+                        and is_profile_like
+                        and found_has_zip
+                        and found_has_city
+                        and hp_pref
+                        and (phone_same_page or has_hq_evidence or len(found_addr) >= len(baseline_address))
+                    ):
+                        allow_overwrite = True
                 # 追加オプション：CSV住所が誤っているケース救済（危険なのでデフォルト無効）
                 # - 公式採用（strong_official）で、HP側住所が郵便番号+市区町村を含むなど十分に具体的
                 # - 取得元URLが会社概要系（_page_type_ok）で、CSV側が情報不足（郵便番号/市区町村が欠ける等）
@@ -1034,12 +1124,55 @@ class DatabaseManager:
             final_address = found_addr
             company["address"] = final_address
 
+        # UNIQUE(company_name,address) 衝突の事前回避（住所更新で IntegrityError になって更新全体が落ちるのを防ぐ）
+        avoid_unique_collision = os.getenv("ADDRESS_AVOID_UNIQUE_COLLISION", "true").lower() == "true"
+        # 住所を更新する場合のみ衝突チェック（同一行の既存値で誤検知しない）
+        if (
+            avoid_unique_collision
+            and final_address
+            and final_address != raw_address
+            and company.get("company_name")
+            and isinstance(company.get("id"), (int, str))
+        ):
+            try:
+                cid = int(company.get("id"))
+            except Exception:
+                cid = -1
+            if cid >= 0:
+                try:
+                    other = self.cur.execute(
+                        "SELECT id FROM companies WHERE company_name=? AND address=? LIMIT 1",
+                        (str(company.get("company_name") or "").strip(), final_address),
+                    ).fetchone()
+                except Exception:
+                    other = None
+                if other is not None:
+                    if isinstance(other, (tuple, list)):
+                        other_id = other[0]
+                    elif isinstance(other, sqlite3.Row):
+                        other_id = other["id"]
+                    else:
+                        other_id = getattr(other, "id", None)
+                    try:
+                        other_id_int = int(other_id)
+                    except Exception:
+                        other_id_int = other_id
+                    if other_id_int != cid:
+                        # 住所を元に戻し、レビューへ回す（マージは危険なので別タスク）
+                        final_address = raw_address
+                        company["address"] = final_address
+                        allow_overwrite = False
+                        conflict_level = conflict_level or "unique_collision"
+                        review_reason = "unique_name_addr_collision"
+                        if status == "done":
+                            status = "review"
+
         set_value("address", final_address)
         set_value("address_confidence", address_conf_f)
         set_value("address_evidence", evidence[:200] if evidence else "")
         set_value("address_conflict_level", conflict_level)
         set_value("address_review_reason", review_reason)
-        set_value("rep_name", company.get("rep_name", "") or "")
+        set_value("rep_name", _clean_rep_name(company.get("rep_name")))
         set_value("description", _clean_description(company.get("description")))
         set_value("ai_used", int(company.get("ai_used", 0) or 0))
         set_value("ai_model", company.get("ai_model", "") or "")

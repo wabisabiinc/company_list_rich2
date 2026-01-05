@@ -8,6 +8,17 @@ EXCLUDE_DOMAINS = [
     "navitime.co.jp","yahoo.co.jp","map.yahoo.co.jp","jp-hp.com"
 ]
 
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@")
+
+def csv_safe_cell(value: Optional[str]) -> str:
+    if value is None:
+        return ""
+    s = str(value)
+    stripped = s.lstrip(" \t\r\n")
+    if stripped and stripped[0] in _CSV_FORMULA_PREFIXES:
+        return "'" + s
+    return s
+
 def normalize_phone(s: Optional[str]) -> Optional[str]:
     if not s: return None
     s = re.sub(r"[‐―－ー−]+", "-", s)
@@ -142,7 +153,7 @@ def main():
             }
             if args.add_domain:
                 out["hp_domain"] = hp.split("/")[2] if hp and "://" in hp else ""
-            w.writerow(out)
+            w.writerow({k: csv_safe_cell(v) for k, v in out.items()})
 
     conn.close()
     print(f"Single CSV written -> {args.out}")

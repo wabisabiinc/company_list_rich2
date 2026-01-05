@@ -151,3 +151,74 @@ def test_address_not_overwritten_when_found_missing_prefecture(tmp_path):
         assert updated["status"] in ("done", "review")
     finally:
         manager.close()
+
+
+def test_address_overwritten_on_pref_mismatch_when_official_rule_and_profile_url(tmp_path):
+    db_path = str(tmp_path / "t.db")
+    manager = DatabaseManager(db_path=db_path, worker_id=None)
+    try:
+        manager.conn.execute(
+            "INSERT INTO companies (id, company_name, address, status) VALUES (?,?,?,?)",
+            (1, "テスト株式会社", "東京都中央区1-1-1", "pending"),
+        )
+        manager.conn.commit()
+
+        company = _fetch_one(db_path, "SELECT * FROM companies WHERE id=1")
+        assert company is not None
+        company.update(
+            {
+                "homepage_official_flag": 1,
+                "homepage_official_score": 5.0,
+                "address_source": "rule",
+                "found_address": "〒530-0001 大阪府大阪市北区梅田1-1-1 ○○ビル10F",
+                "source_url_address": "https://example.co.jp/company/overview",
+            }
+        )
+
+        manager.save_company_data(company, status="done")
+
+        updated = _fetch_one(db_path, "SELECT address, status, address_conflict_level, address_review_reason FROM companies WHERE id=1")
+        assert "大阪府" in (updated["address"] or "")
+        assert updated["status"] == "done"
+        assert updated["address_conflict_level"] == "pref_mismatch_overwritten"
+        assert updated["address_review_reason"] in ("", None)
+    finally:
+        manager.close()
+
+
+def test_address_overwrite_avoids_unique_collision(tmp_path):
+    db_path = str(tmp_path / "t.db")
+    manager = DatabaseManager(db_path=db_path, worker_id=None)
+    try:
+        manager.conn.execute(
+            "INSERT INTO companies (id, company_name, address, status) VALUES (?,?,?,?)",
+            (1, "テスト株式会社", "大阪府", "pending"),
+        )
+        manager.conn.execute(
+            "INSERT INTO companies (id, company_name, address, status) VALUES (?,?,?,?)",
+            (2, "テスト株式会社", "大阪府大阪市北区1-1-1", "done"),
+        )
+        manager.conn.commit()
+
+        company = _fetch_one(db_path, "SELECT * FROM companies WHERE id=1")
+        assert company is not None
+        company.update(
+            {
+                "homepage_official_flag": 1,
+                "homepage_official_score": 5.0,
+                "address_source": "rule",
+                # 既存(id=2)と衝突する住所に更新しようとする
+                "found_address": "大阪府大阪市北区1-1-1",
+                "source_url_address": "https://example.co.jp/company/overview",
+            }
+        )
+
+        manager.save_company_data(company, status="done")
+
+        updated = _fetch_one(db_path, "SELECT address, status, address_conflict_level, address_review_reason FROM companies WHERE id=1")
+        assert updated["address"] == "大阪府"
+        assert updated["status"] == "review"
+        assert updated["address_review_reason"] == "unique_name_addr_collision"
+        assert updated["address_conflict_level"] in ("unique_collision", "pref_mismatch")
+    finally:
+        manager.close()
