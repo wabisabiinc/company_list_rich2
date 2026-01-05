@@ -1,5 +1,5 @@
 # src/company_scraper.py
-import re, urllib.parse, json, os, time, logging
+import re, urllib.parse, json, os, time, logging, ssl
 import asyncio
 import unicodedata
 from collections import deque
@@ -280,8 +280,13 @@ REP_RE = re.compile(
     r"代表理事(?:長)?|"
     r"理事長|学長|院長|組合長|会頭|会長|社長"
     r")"
-    r"(?:\s*[:：]\s*|\s+)"
-    r"([一-龥ァ-ンA-Za-z][^\n\r<>\|（）\(\)]{0,39})"
+    # ラベルと氏名が「隣り合わせ」であることを要求（離れすぎた本文からの誤爆を防ぐ）
+    r"(?:\s*[:：]\s*|\s+|の\s*)"
+    # 氏名らしさの強い表記だけを許可（最大2語程度）
+    r"([一-龥ぁ-んァ-ン]{2,12}(?:[・･\s\u3000]{0,2}[一-龥ぁ-んァ-ン]{1,12})?)"
+)
+STRICT_REP_NAME_PREFIX_RE = re.compile(
+    r"^([一-龥ぁ-んァ-ン]{2,12}(?:[・･\s\u3000]{0,2}[一-龥ぁ-んァ-ン]{1,12})?)"
 )
 LISTING_RE = re.compile(r"(?:上場(?:区分|市場|先)?|株式上場|未上場|非上場|未公開|非公開)\s*[:：]?\s*([^\s、。\n]+)")
 KANJI_AMOUNT_CHARS = "0-9０-９零〇一二三四五六七八九十百千万億兆"
@@ -533,7 +538,9 @@ class CompanyScraper:
     }
 
     GOV_ENTITY_KEYWORDS = (
-        "県", "府", "都", "道", "市", "区", "町", "村", "庁", "役所",
+        # NOTE: 単体の「道」は「鉄道/水道/道場/道具」などに広く含まれ誤判定が多いので使わない。
+        # 北海道のみ特例で拾う。
+        "北海道", "県", "府", "都", "庁", "役所",
         "議会", "連合", "連絡協議会", "消防", "警察", "公共", "振興局",
         "上下水道", "教育委員会", "広域", "公社", "公団", "自治体", "道路公社",
     )
@@ -869,9 +876,55 @@ class CompanyScraper:
         tags: set[str] = set()
         if not company_name:
             return tags
-        name = unicodedata.normalize("NFKC", company_name)
-        if any(keyword in name for keyword in cls.GOV_ENTITY_KEYWORDS):
+        name = unicodedata.normalize("NFKC", company_name).strip()
+        if not name:
+            return tags
+
+        # 「株式会社〇〇市」「〇〇鉄道株式会社」など民間企業名に自治体キーワードが混入する誤判定を避ける。
+        # entity tag は host suffix 制約（.lg.jp/.ac.jp等）を伴い致命的な誤除外になり得るため、民間法人形態は除外。
+        private_forms = (
+            "株式会社",
+            "有限会社",
+            "合同会社",
+            "合名会社",
+            "合資会社",
+            "(株)",
+            "（株）",
+            "㈱",
+            "(有)",
+            "（有）",
+            "㈲",
+            "(同)",
+            "（同）",
+        )
+        if any(form in name for form in private_forms):
+            return tags
+
+        # gov は単語の部分一致だと誤判定が出やすいので、強い語（役所/庁など）を優先し、
+        # 「〇〇市/〇〇町」等の単体は末尾一致かつ短めの名称のみで扱う。
+        strong_gov_tokens = (
+            "庁",
+            "役所",
+            "議会",
+            "教育委員会",
+            "警察",
+            "消防",
+            "上下水道",
+            "振興局",
+            "道路公社",
+            "自治体",
+            "公社",
+            "公団",
+        )
+        if any(token in name for token in strong_gov_tokens):
             tags.add("gov")
+        elif name in PREFECTURE_NAMES or name == "北海道" or name.endswith(("県", "府", "都")):
+            tags.add("gov")
+        else:
+            # 例: 「〇〇市」「〇〇町」等（会社名ではなく自治体名である可能性が高い短い名称だけを拾う）
+            if re.fullmatch(r".{1,10}(市|区|町|村)", name):
+                tags.add("gov")
+
         if any(keyword in name for keyword in cls.EDU_ENTITY_KEYWORDS):
             tags.add("edu")
         if any(keyword in name for keyword in cls.MED_ENTITY_KEYWORDS):
@@ -1040,6 +1093,9 @@ class CompanyScraper:
         if host.startswith("www."):
             host = host[4:]
         if not host:
+            return False
+        # 明示的に許可しているホストは disallowed 扱いしない
+        if any(host == wh or host.endswith(f".{wh}") for wh in (cls.ALLOWED_HOST_WHITELIST or set())):
             return False
         return any(host == d or host.endswith(f".{d}") for d in (cls.HARD_EXCLUDE_HOSTS or set()))
 
@@ -2470,6 +2526,7 @@ class CompanyScraper:
             domain_score: int = 0,
             host_value: str = "",
             blocked_host: bool = False,
+            blocked_reason: str = "",
             prefecture_mismatch: bool = False,
             official_evidence_score: int = 0,
             official_evidence: Optional[List[str]] = None,
@@ -2492,6 +2549,7 @@ class CompanyScraper:
                 "domain_score": domain_score,
                 "host": host_value,
                 "blocked_host": blocked_host,
+                "blocked_reason": blocked_reason,
                 "prefecture_mismatch": prefecture_mismatch,
                 "official_evidence_score": official_evidence_score,
                 "official_evidence": official_evidence or [],
@@ -2511,15 +2569,15 @@ class CompanyScraper:
         if not host:
             return finalize(False)
         if any(path_lower.endswith(ext) for ext in _BINARY_EXTS):
-            return finalize(False, host_value=host, blocked_host=True)
+            return finalize(False, host_value=host, blocked_host=True, blocked_reason="binary_ext")
         if host.endswith(".lg.jp"):
-            return finalize(False, host_value=host, blocked_host=True)
+            return finalize(False, host_value=host, blocked_host=True, blocked_reason="lg_jp_reserved")
         company_tokens = self._company_tokens(company_name)
         domain_match_score = self._domain_score(company_tokens, url)
         host_token_hit = self._host_token_hit(company_tokens, url) if company_tokens else False
         if not (allowed_tld or whitelist_hit or is_google_sites):
             if domain_match_score < 6 and not host_token_hit:
-                return finalize(False, host_value=host, blocked_host=True)
+                return finalize(False, host_value=host, blocked_host=True, blocked_reason="weak_tld_no_name")
         parsed = urllib.parse.urlparse(url)
         base_name = (company_name or "").strip()
         is_prefecture_exact = base_name in PREFECTURE_NAMES
@@ -2531,9 +2589,10 @@ class CompanyScraper:
         if is_prefecture_exact:
             allowed_suffixes = self.ENTITY_SITE_SUFFIXES.get("gov", ())
             if not any(self._host_matches_suffix(host, suffix) for suffix in allowed_suffixes):
-                return finalize(False, host_value=host, blocked_host=True)
-        if not is_google_sites and any(host == domain or host.endswith(f".{domain}") for domain in self.HARD_EXCLUDE_HOSTS):
-            return finalize(False, host_value=host, blocked_host=True)
+                return finalize(False, host_value=host, blocked_host=True, blocked_reason="prefecture_entity_suffix_mismatch")
+        # 明示的に許可したホストは HARD_EXCLUDE を上書きできるようにする（誤除外の緊急回避用）
+        if not is_google_sites and not whitelist_hit and any(host == domain or host.endswith(f".{domain}") for domain in self.HARD_EXCLUDE_HOSTS):
+            return finalize(False, host_value=host, blocked_host=True, blocked_reason="hard_exclude_host")
 
         score = 0
         allowed_host_whitelist = self.ALLOWED_HOST_WHITELIST
@@ -2599,9 +2658,9 @@ class CompanyScraper:
             allowed = self.ENTITY_SITE_SUFFIXES.get(tag, ())
             return any(self._host_matches_suffix(host, suffix) for suffix in allowed)
         if "gov" in entity_tags and not (_entity_suffix_hit("gov") or is_google_sites):
-            return finalize(False, host_value=host, blocked_host=True)
+            return finalize(False, host_value=host, blocked_host=True, blocked_reason="entity_gov_suffix_mismatch")
         if "edu" in entity_tags and not (_entity_suffix_hit("edu") or is_google_sites):
-            return finalize(False, host_value=host, blocked_host=True)
+            return finalize(False, host_value=host, blocked_host=True, blocked_reason="entity_edu_suffix_mismatch")
         company_has_corp = any(suffix in (company_name or "") for suffix in self.CORP_SUFFIXES) or bool(entity_tags)
         host_token_hit = self._host_token_hit(company_tokens, url)
         if not company_tokens:
@@ -3603,7 +3662,9 @@ class CompanyScraper:
             host = (parsed.netloc or "").lower().split(":")[0]
         except Exception:
             host = ""
-        if host and (host in self.HARD_EXCLUDE_HOSTS or self._is_excluded(host)):
+        # 明示的に許可されたホストは除外しない（誤除外の緊急回避用）
+        whitelist_hit = any(host == wh or host.endswith(f".{wh}") for wh in self.ALLOWED_HOST_WHITELIST)
+        if host and not whitelist_hit and (host in self.HARD_EXCLUDE_HOSTS or self._is_excluded(host)):
             return {"url": url, "text": "", "html": ""}
         # 公式候補ホストはスキップ対象から除外するため、上位層で呼び分ける
         if host and self.skip_slow_hosts and self._is_slow_host(host) and not allow_slow:
@@ -3618,18 +3679,52 @@ class CompanyScraper:
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "ja,en-US;q=0.9",
         }
-        try:
-            # requests の timeout は DNS 解決などを完全にはカバーしないことがあるため、
-            # asyncio 側でも wait_for で上限を掛け、全体の停滞を防ぐ。
-            resp = await asyncio.wait_for(
+
+        def _is_ssl_error(exc: Exception) -> bool:
+            if isinstance(exc, (ssl.SSLError, requests.exceptions.SSLError)):
+                return True
+            msg = str(exc).lower()
+            return any(
+                key in msg
+                for key in (
+                    "certificate verify failed",
+                    "hostname mismatch",
+                    "certificate is not valid for",
+                    "sslc",
+                    "err_cert",
+                )
+            )
+
+        def _rewrite_https_to_http(target_url: str) -> str:
+            try:
+                parsed_url = urllib.parse.urlparse(target_url)
+                if (parsed_url.scheme or "").lower() != "https":
+                    return ""
+                return parsed_url._replace(scheme="http").geturl()
+            except Exception:
+                return ""
+
+        async def _session_get_async(target_url: str):
+            return await asyncio.wait_for(
                 asyncio.to_thread(
                     self._session_get,
-                    url,
+                    target_url,
                     timeout=(timeout_sec, timeout_sec),
                     headers=headers,
                 ),
                 timeout=timeout_sec + 0.5,
             )
+        try:
+            # requests の timeout は DNS 解決などを完全にはカバーしないことがあるため、
+            # asyncio 側でも wait_for で上限を掛け、全体の停滞を防ぐ。
+            try:
+                resp = await _session_get_async(url)
+            except Exception as e:
+                http_alt = _rewrite_https_to_http(url)
+                if http_alt and _is_ssl_error(e):
+                    resp = await _session_get_async(http_alt)
+                else:
+                    raise
             # リダイレクトでパスが落ちた場合は www+元パスで再試行
             try:
                 alt = self._rewrite_to_www_preserve_path(url, getattr(resp, "url", "") or "")
@@ -3637,15 +3732,7 @@ class CompanyScraper:
                 alt = ""
             if alt:
                 try:
-                    resp2 = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            self._session_get,
-                            alt,
-                            timeout=(timeout_sec, timeout_sec),
-                            headers=headers,
-                        ),
-                        timeout=timeout_sec + 0.5,
-                    )
+                    resp2 = await _session_get_async(alt)
                     if getattr(resp2, "status_code", 0) and int(resp2.status_code) < 500:
                         resp = resp2
                 except Exception:
@@ -3688,7 +3775,7 @@ class CompanyScraper:
                 self._add_slow_host(host)
                 log.info("[http] mark slow host (%.0f ms) %s", elapsed_ms, host)
             return {"url": url, "text": text, "html": html}
-        except Exception:
+        except Exception as e:
             elapsed_ms = (time.monotonic() - started) * 1000
             if (
                 not allow_slow
@@ -3698,6 +3785,8 @@ class CompanyScraper:
             ):
                 self._add_slow_host(host)
                 log.warning("[http] timeout/slow (%.0f ms) -> skip host next time: %s", elapsed_ms, host or "")
+            if _is_ssl_error(e):
+                log.info("[http] ssl error -> empty html/text url=%s host=%s", url, host or "")
             return {"url": url, "text": "", "html": ""}
 
     # ===== ページ取得（ブラウザ再利用＋軽いリトライ） =====
@@ -3793,7 +3882,8 @@ class CompanyScraper:
             host = (parsed.netloc or "").lower().split(":")[0]
         except Exception:
             host = ""
-        if host and (host in self.HARD_EXCLUDE_HOSTS or self._is_excluded(host)):
+        whitelist_hit = any(host == wh or host.endswith(f".{wh}") for wh in self.ALLOWED_HOST_WHITELIST)
+        if host and not whitelist_hit and (host in self.HARD_EXCLUDE_HOSTS or self._is_excluded(host)):
             return {"url": url, "text": "", "html": "", "screenshot": b""}
 
         # 公式候補などで明示的に許可された場合は skip_slow_hosts を無視できるようにする
@@ -4151,10 +4241,16 @@ class CompanyScraper:
                 score += 30
             if "address" in focus and any(seg in path_lower for seg in ("/access", "/map", "/location", "/head-office", "/headquarters")):
                 score += 30
-            if "rep" in focus and any(seg in path_lower for seg in ("/message", "/greeting", "/president", "/ceo", "/executive", "/leadership", "/management")):
-                score += 30
+            if "rep" in focus and any(seg in path_lower for seg in ("/executive", "/leadership", "/management", "/officer", "/yakuin")):
+                score += 22
+            if "rep" in focus and any(w in anchor_text for w in ("役員紹介", "経営陣", "役員一覧", "役員")):
+                score += 22
+            # 「トップメッセージ/ご挨拶」は代表者名が載っていない（または本文ノイズが多い）ことが多いため、
+            # 会社概要（表/ラベル）より後で拾える程度に控えめに優先する。
+            if "rep" in focus and any(seg in path_lower for seg in ("/message", "/greeting", "/president", "/ceo")):
+                score += 6
             if "rep" in focus and any(w in anchor_text for w in ("メッセージ", "代表挨拶", "ごあいさつ", "ご挨拶", "トップメッセージ")):
-                score += 30
+                score += 6
 
             if score > 0:
                 path_depth = max(parsed.path.count("/"), 1)
@@ -5316,18 +5412,13 @@ class CompanyScraper:
                 if re.search(r"(株式会社|有限会社|合同会社|合名会社|合資会社|㈱|（株）|\\(株\\))", after_role):
                     after_role = ""
 
-                name_match = None
-                if after_role:
-                    name_match = NAME_CHUNK_RE.search(after_role) or KANA_NAME_RE.search(after_role)
-                if not name_match:
-                    stripped = role_kw.sub(" ", line)
-                    # 役職行に社名（株式会社〜）が混在する場合、NAME_CHUNK_RE が社名を人名として誤爆しやすいので除外する
-                    if re.search(r"(株式会社|有限会社|合同会社|合名会社|合資会社|㈱|（株）|\\(株\\))", stripped):
-                        continue
-                    name_match = NAME_CHUNK_RE.search(stripped) or KANA_NAME_RE.search(stripped)
-                if not name_match:
+                # 近傍（ラベル直後）のみ許可: 行内の別位置から氏名を拾うと誤爆しやすいので禁止する
+                if not after_role:
                     continue
-                cleaned = self.clean_rep_name(name_match.group(0))
+                m_name = STRICT_REP_NAME_PREFIX_RE.match(after_role)
+                if not m_name:
+                    continue
+                cleaned = self.clean_rep_name(m_name.group(1))
                 if cleaned and self._looks_like_person_name(cleaned):
                     reps.append(f"[ROLE]{cleaned}")
                     added_roles += 1

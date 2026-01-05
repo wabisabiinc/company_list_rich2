@@ -15,6 +15,5 @@ def test_rank_links_prefers_message_page_when_rep_needed():
     """
     ranked = scraper._rank_links(base, html, focus={"phone", "rep"})  # type: ignore[attr-defined]
     assert ranked
-    # contact は phone で強く優先されるが、rep が必要なら message も上位に来るべき
-    assert ranked.index("https://example.co.jp/message/") < ranked.index("https://example.co.jp/company/")
-
+    # rep は誤爆しやすいので、まずは会社概要（テーブル/ラベル）系を優先し、message はフォールバックに回す
+    assert ranked.index("https://example.co.jp/company/") < ranked.index("https://example.co.jp/message/")
