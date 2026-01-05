@@ -369,7 +369,7 @@ class CompanyScraper:
         "google.com/maps", "maps.google.com", "map.yahoo.co.jp", "mapion.co.jp",
         "yahoo.co.jp", "itp.ne.jp", "hotpepper.jp", "r.gnavi.co.jp",
         "tabelog.com", "ekiten.jp", "goo.ne.jp", "recruit.net", "en-gage.net",
-        "townpage.goo.ne.jp", "jp-hp.com",
+        "townpage.goo.ne.jp",
         "hotfrog.jp", "jigyodan.jp",
         "buffett-code.com",
         "nikkei.com",
@@ -1289,6 +1289,9 @@ class CompanyScraper:
         if pref and has_city:
             return True
         if (pref or has_city) and re.search(r"(丁目|番地|号|ビル|マンション)", s) and re.search(r"\d", s):
+            return True
+        # 「京都市下京区和気町21-1」のように、丁目/番地表記が無いが番地がハイフンで表現されるケースを許容
+        if (pref or has_city) and re.search(r"\d{1,4}\s*[‐―－ー-]\s*\d{1,4}", s):
             return True
         return False
 

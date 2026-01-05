@@ -309,7 +309,10 @@ class AIVerifier:
     def __init__(self, model=None, listoss_data: Dict[str, dict] = None, db_path: str = 'data/companies.db'):
         self.db_path = db_path
         self.listoss_data = listoss_data if listoss_data is not None else {}
-        self.system_prompt = self._load_system_prompt()
+        # docs/ai_context.md は「候補群から最終値を選ぶ」用途のシステムプロンプト。
+        # verify_info / judge_official_homepage / generate_description など別タスクに混ぜると、
+        # 入出力スキーマの衝突で誤動作しやすいので、用途を限定して使う。
+        self.rich_system_prompt = self._load_system_prompt()
 
         if model is not None:
             self.model = model
@@ -616,8 +619,8 @@ class AIVerifier:
 
         def _build_content(use_image: bool) -> list[Any]:
             out: list[Any] = []
-            if self.system_prompt:
-                out.append(self.system_prompt)
+            if self.rich_system_prompt:
+                out.append(self.rich_system_prompt)
             out.append(prompt)
             if use_image and screenshot:
                 try:
@@ -700,8 +703,6 @@ class AIVerifier:
 
         def _build_content(use_image: bool) -> list[Any]:
             payload: list[Any] = []
-            if self.system_prompt:
-                payload.append(self.system_prompt)
             payload.append(self._build_prompt(text, company_name, address))
             if use_image and screenshot:
                 try:
@@ -856,8 +857,6 @@ class AIVerifier:
 
         def _build_content(use_image: bool) -> list[Any]:
             payload: list[Any] = []
-            if self.system_prompt:
-                payload.append(self.system_prompt)
             payload.append(prompt)
             if use_image and screenshot:
                 try:
@@ -915,26 +914,21 @@ class AIVerifier:
         if len(snippet) > 4000:
             snippet = snippet[:4000]
         prompt = (
-            "あなたは企業サイトの審査官です。候補URLが公式ホームページかどうかを判定してください。\n"
-            "以下を根拠に、true/false と理由、信頼度(0-1)をJSONのみで出力してください。説明やマークダウンは禁止。\n"
-            "出力フォーマット:\n"
-            "{\\\"is_official\\\": true/false, \\\"confidence\\\": 0.0-1.0, \\\"reason\\\": \"簡潔な根拠\","
-            " \\\"is_official_site\\\": true/false, \\\"official_confidence\\\": 0.0-1.0, \\\"official_evidence\\\": [\"根拠\", ...],"
-            " \\\"description\\\": \"事業内容の要約(80〜160文字・日本語1文。可能なら会社名と業種も含む)\" または null}\n"
-            "判断基準:\n"
-            "- 企業名・所在地・サービス内容の一致を確認。\n"
-            "- 口コミ/求人/まとめサイト・予約サイトは false。\n"
-            "- 企業DB/会社まとめ/ディレクトリ型サイト（企業一覧・掲載企業数・法人番号・企業データベース等の文言が強い、またはURLが /companies/123 /company/123 /corporations/123 /detail/123 のような構造）は false。\n"
-            "- URLが企業ドメインや自治体/学校の公式ドメイン（例: [SIGNALS] に allowed_tld=true / tld=.co.jp 等）なら true に寄せる。\n"
-            "- 会社名がドメインに含まれない場合でも、親会社/ブランド/グループの公式ドメインで運営されることがあるので、本文/フッター/ロゴ/サイト名の一致が確認できれば true に寄せる。\n"
-            "- 採用/求人ページでも、同一ドメインで社名一致が確認できるなら true に寄せる。\n"
-            "- title/og:site_name/h1/ロゴ等で社名一致が強ければ公式寄り。\n"
-            "- [SIGNALS] があれば参考情報として扱う（directory_like=true の場合は false に寄せる）。\n"
-            "description のルール:\n"
-            "- 事業内容だけを80〜160文字の日本語1文で要約（推測せず、根拠が弱ければ null）\n"
-            "- 可能なら会社名と業種（大分類）も短く含める\n"
-            "- 文章内に必ず「製造/開発/販売/提供/運営/施工/設計/支援/卸売/小売/仲介/運用/保守/メンテナンス」等の事業キーワードを含める\n"
-            "- 禁止: URL/メール/電話番号/住所/採用/問い合わせ/アクセス/代表者情報\n"
+            "あなたは企業サイトの審査官です。候補URLが当該企業の公式ホームページかどうかを判定してください。\n"
+            "以下を根拠に、true/false と理由、信頼度(0-1)を JSON のみで出力してください（説明文/マークダウン禁止）。\n"
+            "出力フォーマット（必須キー）:\n"
+            "{\\\"is_official_site\\\": true/false, \\\"official_confidence\\\": 0.0-1.0, \\\"reason\\\": \"簡潔な根拠\", \\\"official_evidence\\\": [\"根拠\", ...],\n"
+            " \\\"is_official\\\": true/false, \\\"confidence\\\": 0.0-1.0,\n"
+            " \\\"description\\\": \"事業内容の要約(80〜160文字・日本語1文)\" または null}\n"
+            "※ is_official は互換用なので is_official_site と同じ値にしてください。confidence も official_confidence と同値でOKです。\n"
+            "判断ルール（重要）:\n"
+            "- 企業DB/会社まとめ/ディレクトリ/求人/口コミ/予約/地図など「第三者プラットフォーム」は false。\n"
+            "- 公式とするには、(A)社名・ブランド名の強い一致（title/h1/og:site_name/フッター/ロゴ等）または (B)企業ドメインらしさ（[SIGNALS]のallowed_tld/domain_score/host_token_hit等）を満たす。\n"
+            "- 住所一致は強い加点だが、住所入力が弱い場合は無理に使わない。\n"
+            "- [SIGNALS] があれば参考にする（directory_like=true は原則 false）。\n"
+            "description（任意）:\n"
+            "- 事業内容だけを要約。根拠が弱い/材料が無い場合は null。\n"
+            "- 禁止: URL/メール/電話番号/住所/採用/問い合わせ/アクセス/代表者情報。\n"
             f"企業名: {company_name}\n住所: {address}\n候補URL: {url}\n本文抜粋:\n{snippet}\n"
         )
         def _build_content(use_image: bool) -> list[Any]:
@@ -961,6 +955,8 @@ class AIVerifier:
             if not isinstance(result, dict):
                 return None
             verdict = result.get("is_official")
+            if verdict is None:
+                verdict = result.get("is_official_site")
             if isinstance(verdict, str):
                 verdict = verdict.strip().lower()
                 verdict = verdict in {"true", "yes", "official", "1"}
@@ -1018,6 +1014,8 @@ class AIVerifier:
             if not isinstance(result, dict):
                 return None
             verdict = result.get("is_official")
+            if verdict is None:
+                verdict = result.get("is_official_site")
             if isinstance(verdict, str):
                 verdict = verdict.strip().lower()
                 verdict = verdict in {"true", "yes", "official", "1"}
@@ -1098,24 +1096,20 @@ class AIVerifier:
         if not pages_text:
             return None
         prompt = (
-            "あなたは企業サイトの審査官です。候補URLが公式ホームページかどうかを判定してください。\n"
-            "以下の複数ページの本文抜粋と、提供されたスクリーンショットを根拠に、true/false と理由、信頼度(0-1)をJSONのみで出力してください。説明やマークダウンは禁止。\n"
-            "出力フォーマット:\n"
-            "{\\\"is_official\\\": true/false, \\\"confidence\\\": 0.0-1.0, \\\"reason\\\": \"簡潔な根拠\","
-            " \\\"is_official_site\\\": true/false, \\\"official_confidence\\\": 0.0-1.0, \\\"official_evidence\\\": [\"根拠\", ...],"
-            " \\\"description\\\": \"事業内容の要約(60〜120文字・日本語1文)\" または null}\n"
-            "判断基準:\n"
-            "- 企業名・所在地・サービス内容の一致を確認。\n"
-            "- 口コミ/求人/まとめサイト・予約サイトは false。\n"
-            "- 企業DB/会社まとめ/ディレクトリ型サイト（企業一覧・掲載企業数・法人番号・企業データベース等の文言が強い、またはURLが /companies/123 /company/123 /corporations/123 /detail/123 のような構造）は false。\n"
-            "- URLが企業ドメインや自治体/学校の公式ドメイン（例: [SIGNALS] に allowed_tld=true / tld=.co.jp 等）なら true に寄せる。\n"
-            "- 会社名がドメインに含まれない場合でも、親会社/ブランド/グループの公式ドメインで運営されることがあるので、本文/フッター/ロゴ/サイト名の一致が確認できれば true に寄せる。\n"
-            "- 採用/求人ページでも、同一ドメインで社名一致が確認できるなら true に寄せる。\n"
-            "- title/og:site_name/h1/ロゴ等で社名一致が強ければ公式寄り。\n"
-            "- [SIGNALS] があれば参考情報として扱う（directory_like=true の場合は false に寄せる）。\n"
-            "description のルール:\n"
-            "- 事業内容だけを60〜120文字の日本語1文に要約（推測せず、根拠が弱ければ null）\n"
-            "- 禁止: URL/メール/電話番号/住所/採用/問い合わせ/アクセス/代表者情報\n"
+            "あなたは企業サイトの審査官です。候補URLが当該企業の公式ホームページかどうかを判定してください。\n"
+            "以下の複数ページの本文抜粋とスクリーンショットを根拠に、true/false と理由、信頼度(0-1)を JSON のみで出力してください（説明文/マークダウン禁止）。\n"
+            "出力フォーマット（必須キー）:\n"
+            "{\\\"is_official_site\\\": true/false, \\\"official_confidence\\\": 0.0-1.0, \\\"reason\\\": \"簡潔な根拠\", \\\"official_evidence\\\": [\"根拠\", ...],\n"
+            " \\\"is_official\\\": true/false, \\\"confidence\\\": 0.0-1.0,\n"
+            " \\\"description\\\": \"事業内容の要約(80〜160文字・日本語1文)\" または null}\n"
+            "※ is_official は互換用なので is_official_site と同じ値にしてください。confidence も official_confidence と同値でOKです。\n"
+            "判断ルール（重要）:\n"
+            "- 企業DB/会社まとめ/ディレクトリ/求人/口コミ/予約/地図など「第三者プラットフォーム」は false。\n"
+            "- 公式とするには、社名・ブランド名の強い一致（title/h1/og:site_name/フッター等）または [SIGNALS] の強いドメイン根拠が必要。\n"
+            "- [SIGNALS] があれば参考にする（directory_like=true は原則 false）。\n"
+            "description（任意）:\n"
+            "- 事業内容だけを要約。根拠が弱い/材料が無い場合は null。\n"
+            "- 禁止: URL/メール/電話番号/住所/採用/問い合わせ/アクセス/代表者情報。\n"
             f"企業名: {company_name}\n住所: {address}\n候補URL: {url}\n"
             f"ページ情報:\n{pages_text}\n"
         )
@@ -1136,6 +1130,8 @@ class AIVerifier:
             if not isinstance(result, dict):
                 return None
             verdict = result.get("is_official")
+            if verdict is None:
+                verdict = result.get("is_official_site")
             if isinstance(verdict, str):
                 verdict = verdict.strip().lower()
                 verdict = verdict in {"true", "yes", "official", "1"}

@@ -626,6 +626,9 @@ def looks_like_address(text: str | None) -> bool:
         return True
     if (has_pref or has_city) and re.search(r"(ビル|マンション)", s) and re.search(r"\d", s):
         return True
+    # 「京都市下京区和気町21-1」のようなハイフン番地（丁目/番地/号が無い表記）も住所として扱う
+    if (has_pref or has_city) and re.search(r"\d{1,4}\s*[‐―－ー-]\s*\d{1,4}", s):
+        return True
     return False
 
 def addr_compatible(input_addr: str, found_addr: str) -> bool:
@@ -639,6 +642,7 @@ def addr_compatible(input_addr: str, found_addr: str) -> bool:
 FREE_HOST_SUFFIXES = (
     ".wixsite.com", ".ameblo.jp", ".fc2.com", ".jimdo.com", ".blogspot.com",
     ".note.jp", ".hatena.ne.jp", ".weebly.com", ".wordpress.com", ".tumblr.com",
+    "jp-hp.com",
 )
 
 
@@ -3516,6 +3520,13 @@ async def process():
                                 )
                                 if not ai_strong_accept:
                                     force_review = True
+                                    # 「AIは公式寄りだが根拠が弱い」ケースは、公式確定はせず review に落としつつ、
+                                    # 後段の保存モデル(v2)で追跡できるよう provisional として退避しておく。
+                                    if not forced_provisional_homepage and normalized_url:
+                                        forced_provisional_homepage = normalized_url
+                                        forced_provisional_reason = "ai_official_weak"
+                                        if not (company.get("provisional_reason") or "").strip():
+                                            company["provisional_reason"] = "ai_official_weak"
                                     log.info(
                                         "[%s] AI official (weak) -> review-only: %s (domain=%s host=%s name=%s addr=%s evidence=%s disallowed_host=%s conf=%.2f)",
                                         cid,
