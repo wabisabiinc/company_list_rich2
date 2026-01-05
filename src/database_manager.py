@@ -775,15 +775,19 @@ class DatabaseManager:
             if not text:
                 return ""
             # 抽出タグ（例: [TABLE][LABEL]）を除去
-            while True:
-                m = re.match(r"^\\[([A-Z_]+)\\]\\s*", text)
-                if not m:
+            while text.startswith("["):
+                end = text.find("]")
+                if end <= 1:
                     break
-                text = text[m.end():].lstrip()
+                tag = text[1:end]
+                # extraction tag のみ除去（[代表取締役] 等は除去しない）
+                if not re.fullmatch(r"[A-Z_]+", tag):
+                    break
+                text = text[end + 1 :].lstrip()
             # 括弧内（役職補足など）を除去
             text = re.sub(r"[（(][^）)]{0,40}[）)]", "", text)
             # 行や句読点で区切られている場合は先頭だけ
-            text = re.split(r"[、。\\n/|｜,;；:：]", text)[0].strip()
+            text = re.split(r"[、。\n/|｜,;；:：]", text)[0].strip()
             # 役職語を先頭/末尾から除去
             role_words = (
                 "代表取締役社長", "代表取締役会長", "代表取締役副社長", "代表取締役", "代表社員",
@@ -794,8 +798,8 @@ class DatabaseManager:
             while changed:
                 before = text
                 for w in role_words:
-                    text = re.sub(rf"^{re.escape(w)}[\\s　]*", "", text)
-                    text = re.sub(rf"[\\s　]*{re.escape(w)}$", "", text)
+                    text = re.sub(rf"^{re.escape(w)}[\s　]*", "", text)
+                    text = re.sub(rf"[\s　]*{re.escape(w)}$", "", text)
                 text = text.strip()
                 changed = (text != before)
             if not text:

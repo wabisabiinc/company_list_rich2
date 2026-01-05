@@ -56,3 +56,25 @@ def test_save_company_data_cleans_description_listing_and_amounts(tmp_path):
     finally:
         manager.close()
 
+
+def test_save_company_data_cleans_rep_name_tags_without_error(tmp_path):
+    db_path = str(tmp_path / "t.db")
+    manager = DatabaseManager(db_path=db_path, worker_id=None)
+    try:
+        manager.conn.execute(
+            "INSERT INTO companies (id, company_name, address, status) VALUES (?,?,?,?)",
+            (1, "テスト株式会社", "東京都中央区1-1-1", "pending"),
+        )
+        manager.conn.commit()
+
+        company = _fetch_one(db_path, "SELECT * FROM companies WHERE id=1")
+        assert company is not None
+        company["rep_name"] = "[TABLE][LABEL]山田太郎"
+
+        manager.save_company_data(company, status="done")
+
+        updated = _fetch_one(db_path, "SELECT rep_name FROM companies WHERE id=1")
+        assert updated is not None
+        assert updated["rep_name"] == "山田太郎"
+    finally:
+        manager.close()
