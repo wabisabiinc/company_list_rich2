@@ -173,14 +173,29 @@ REP_NAME_SUBSTR_BLOCKLIST = (
 	    "キーワード",
 	    "keyword",
 	    "keywords",
-	    "contents",
-	    "写真",
-	    "画像",
-	    "photo",
-	    "image",
+		    "contents",
+		    "写真",
+		    "画像",
+		    "photo",
+		    "image",
 )
 REP_NAME_EXACT_BLOCKLIST_LOWER = {s.lower() for s in REP_NAME_EXACT_BLOCKLIST}
+# 代表者名（人名）っぽさ判定用。NAME_CHUNK_RE は過去互換のため残すが、判定は専用関数を優先する。
 NAME_CHUNK_RE = re.compile(r"[\u4E00-\u9FFF]{1,3}(?:[??\s]{0,1}[\u4E00-\u9FFF]{1,3})+")
+# 漢字（拡張漢字を含む）: 𠮷 などを含めて代表者名から落とさない
+_KANJI_LIKE_RANGES = (
+    "\u3400-\u4DBF"          # CJK Extension A
+    "\u4E00-\u9FFF"          # CJK Unified Ideographs
+    "\uF900-\uFAFF"          # CJK Compatibility Ideographs
+    "\U00020000-\U0002EBEF"  # CJK Extensions B-F
+    "\U00030000-\U0003134F"  # CJK Extension G (subset)
+)
+# 々/〆 など人名で使われる記号も許可（例: 佐々木）
+_KANJI_NAME_CHARS = _KANJI_LIKE_RANGES + "々〆"
+KANJI_LIKE_RE = re.compile(rf"[{_KANJI_NAME_CHARS}]")
+KANJI_NAME_WITH_SEP_RE = re.compile(rf"[{_KANJI_NAME_CHARS}]{{1,3}}(?:[ 　・･]+[{_KANJI_NAME_CHARS}]{{1,3}})+")
+# 区切り無しの漢字連結（例: 佐々木太郎）も許可するが、過度に長い見出し誤爆を避けるため上限を設ける。
+KANJI_NAME_COMPACT_RE = re.compile(rf"^[{_KANJI_NAME_CHARS}]{{2,8}}$")
 KANA_NAME_RE = re.compile(
     r"[\u3041-\u3096\u30A1-\u30FA\u30FC\u30FB]{2,}"
     r"(?:[\u3041-\u3096\u30A1-\u30FA\u30FC\u30FB\s][\u3041-\u3096\u30A1-\u30FA\u30FC\u30FB]{2,})+"
@@ -1397,7 +1412,19 @@ class CompanyScraper:
             # 終端が助詞/接続助詞っぽい場合は非人名扱い（誤爆が多い）
             if cleaned.endswith(("も", "は", "が", "を", "に", "へ", "と", "で", "や", "か")):
                 return False
-        return bool(NAME_CHUNK_RE.search(cleaned) or KANA_NAME_RE.search(cleaned))
+        compact = re.sub(r"[\s\u3000]+", "", cleaned)
+        has_kanji = bool(KANJI_LIKE_RE.search(cleaned))
+        has_kana = bool(re.search(r"[ぁ-んァ-ン]", cleaned))
+        if has_kanji:
+            # 区切り無しの漢字連結は「2〜4文字」程度に限定（それ以上はUI断片/見出し誤爆が増える）
+            if KANJI_NAME_WITH_SEP_RE.fullmatch(cleaned):
+                return True
+            if KANJI_NAME_COMPACT_RE.match(compact):
+                return True
+            return False
+        if has_kana:
+            return bool(KANA_NAME_RE.fullmatch(cleaned))
+        return False
 
     @staticmethod
     def _looks_like_full_address(text: str) -> bool:
@@ -1439,6 +1466,15 @@ class CompanyScraper:
         text = unicodedata.normalize("NFKC", str(raw).replace("\u200b", "")).strip()
         if not text:
             return None
+        # 互換漢字/部首（例: 社⻑/熊⾕）を正規の字形に寄せる（役職語の一致や氏名判定の落ちを防ぐ）
+        text = text.translate(
+            str.maketrans(
+                {
+                    "⻑": "長",
+                    "⾕": "谷",
+                }
+            )
+        )
         # 抽出候補に付く機械タグ（例: [TABLE][LABEL]）を除去
         while True:
             m = re.match(r"^\[([A-Z_]+)\]\s*", text)
@@ -1480,9 +1516,20 @@ class CompanyScraper:
             return None
         # remove parentheses content
         text = re.sub(r"[（(][^）)]*[）)]", "", text)
+        # 役職:氏名 形式は値側を優先（clean_rep_name にそのまま流れてくるケースの救済）
+        m = re.match(
+            r"^(?:代表取締役(?:社長|会長|副社長)?|代表理事長|代表理事|代表者|社長|会長|CEO|COO|CFO|CTO|院長|学長|園長|校長|所長)\s*[:：]\s*(.+)$",
+            text,
+            flags=re.I,
+        )
+        if m:
+            text = m.group(1).strip()
         # keep only segment before punctuation/newline
         text = re.split(r"[、。\n/|｜,;；:：]", text)[0]
         text = text.strip(" 　:：-‐―－ー'\"/／")
+        # 代表者名として成立しない UI/運用語（営業時間等）は、形だけでは誤爆し続けるため最小限の否定条件を入れる
+        if re.search(r"(?:受付時間|営業時間|定休日|(?:受付|営業).{0,6}時間)\b", text):
+            return None
         # フォーム/検索UI由来の誤抽出を除外
         if re.search(r"(キーワード|検索)", text):
             return None
@@ -1615,11 +1662,14 @@ class CompanyScraper:
         if re.search(r"(所在地|住所|本社|所在地:|住所:)", text) or re.search(r"(所在地|住所|本社|所在地:|住所:)", compact):
             return None
         # 業務/部門名が混入しているケースを除外
-        business_terms = (
-            "建設", "建築", "土木", "工事", "施工", "管理", "品質", "安全", "環境",
-            "技術", "技能", "営業", "企画", "製造", "サービス", "メンテ", "生産", "部", "課", "室"
+        # NOTE: 単独の「部/課/室」は氏名（例: 室田）にも含まれるため、語片ベースではなく
+        # 「〜部/〜課/〜室」「本部」「部長/課長/室長」などの“部門/役職パターン”で除外する。
+        dept_name_re = re.compile(
+            r"(?:営業|企画|管理|品質|安全|環境|技術|技能|製造|サービス|メンテ|生産|開発|総務|経理|人事|法務|広報|購買|物流|運行)"
+            r"(?:本部|部|課|室)"
         )
-        if any(term in text for term in business_terms) or any(term in compact for term in business_terms):
+        dept_role_re = re.compile(r"(?:本部|部|課|室)(?:長|次長|主任|係長|マネージャ|manager|director|ディレクター)", flags=re.I)
+        if dept_name_re.search(text) or dept_role_re.search(text):
             return None
         # 役職併記を除去してから判定（兼社長/兼CEO 等）
         text = re.sub(r"兼.{0,10}$", "", text)
@@ -1666,12 +1716,24 @@ class CompanyScraper:
         if re.fullmatch(r"(取締役|執行役(?:員)?|監査役|役員|部長|課長|主任|係長|担当|マネージャ|manager|director)", text, flags=re.I):
             return None
         # 氏名らしさチェック（1文字姓も許容: 例「関 進」「東 太郎」）
-        if not (NAME_CHUNK_RE.search(text) or KANA_NAME_RE.search(text)):
-            return None
         tokens = [tok for tok in re.split(r"\s+", text) if tok]
-        if len(tokens) > 4:
+        # 1文字ずつに分解される表記ゆれ（例:「喜 納 秀 智」）は結合してから再判定する
+        if len(tokens) >= 3 and all(KANJI_LIKE_RE.fullmatch(tok) for tok in tokens):
+            text = "".join(tokens)
+            tokens = [text]
+        if any(len(tok) > 8 for tok in tokens if KANJI_LIKE_RE.search(tok)):
             return None
-        if any(len(tok) > 8 for tok in tokens if re.search(r"[一-龥]", tok)):
+        # 最終チェック: 人名っぽさ（過剰な単語ブロックではなく、形で弾く）
+        compact = re.sub(r"[\s\u3000]+", "", text)
+        has_kanji = bool(KANJI_LIKE_RE.search(text))
+        has_kana = bool(re.search(r"[ぁ-んァ-ン]", text))
+        if has_kanji:
+            if not (KANJI_NAME_WITH_SEP_RE.fullmatch(text) or KANJI_NAME_COMPACT_RE.match(compact)):
+                return None
+        elif has_kana:
+            if not KANA_NAME_RE.fullmatch(text):
+                return None
+        else:
             return None
         policy_words = (
             "社是",

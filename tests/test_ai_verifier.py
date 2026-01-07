@@ -69,6 +69,17 @@ def test_normalize_amount_formats_and_converts():
     assert _normalize_amount("▲3百万円") == "▲3,000,000円"
     assert _normalize_amount("401,000千円") == "401,000,000円"
 
+def test_description_prompt_requires_industry_when_hint_present():
+    verifier = AIVerifier(model=DummyModel({}))
+    prompt = verifier._build_description_prompt(
+        "dummy text",
+        company_name="株式会社Example",
+        address="東京都中央区1-1-1",
+        industry_hint="IT・ソフトウェア",
+    )
+    assert "業種ヒント" in prompt
+    assert "業種を必ず含める" in prompt
+
 
 @pytest.mark.asyncio
 async def test_judge_official_homepage_parses_json():

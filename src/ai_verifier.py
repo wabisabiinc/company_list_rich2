@@ -440,19 +440,22 @@ class AIVerifier:
 
     def _build_description_prompt(self, text: str, company_name: str = "", address: str = "", industry_hint: str = "") -> str:
         snippet = _shorten_text(text or "", max_len=3500)
+        ih = (industry_hint or "").strip()
+        if ih == "不明":
+            ih = ""
         prompt = (
             "あなたは企業サイトから「何をしているどの会社か」が一目で分かるように要約する専門家です。\n"
             "次の要件を満たす description を JSON のみで返してください（説明文やマークダウンは禁止）。\n"
             "- 日本語1文・80〜160文字\n"
             "- 会社名を必ず含める（先頭推奨）\n"
-            "- 可能なら業種（例: 物流・運送業 / IT・ソフトウェア業 / 製造業 などの大分類）も短く含める\n"
+            "- 業種ヒントが「不明/空」以外で与えられている場合、業種を必ず含める（会社名の直後に「（業種）」推奨）。業種ヒントが無い場合は推測で作らず null。\n"
             "- 事業内容のみ（問い合わせ/採用/アクセス/所在地/電話/URL/メール/代表者情報は除外）\n"
             "- 「当社/弊社」など一人称は使わない\n"
             "ルール: 文章内に必ず次のいずれかの「事業動詞/キーワード」を含める（例: 製造/開発/販売/提供/運営/施工/設計/支援/卸売/小売/仲介/運用/保守/メンテナンス）。根拠が弱い場合は null。\n"
             "{\n"
             '  "description": "〇〇を行う企業です" または null\n'
             "}\n"
-            f"対象企業: {company_name or '不明'} / 入力住所: {address or '不明'} / 業種ヒント: {industry_hint or '不明'}\n"
+            f"対象企業: {company_name or '不明'} / 入力住所: {address or '不明'} / 業種ヒント: {ih or '不明'}\n"
             "禁止: URL, メール, 電話番号, 住所, 募集/採用/問い合わせ/アクセス情報, 記号の羅列。\n"
             f"# 本文テキスト抜粋\n{snippet}\n"
         )
