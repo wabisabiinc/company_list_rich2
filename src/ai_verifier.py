@@ -28,6 +28,7 @@ USE_AI: bool = _getenv_bool("USE_AI", True)
 API_KEY: str = (os.getenv("GEMINI_API_KEY") or "").strip()
 DEFAULT_MODEL: str = (os.getenv("GEMINI_MODEL") or "gemini-2.5-flash-lite").strip()
 AI_CONTEXT_PATH: str = os.getenv("AI_CONTEXT_PATH", "docs/ai_context.md")
+AI_QUALITY_CONTEXT_PATH: str = os.getenv("AI_QUALITY_CONTEXT_PATH", "docs/ai_quality.md")
 AI_DESCRIPTION_MAX_LEN = int(os.getenv("AI_DESCRIPTION_MAX_LEN", "160"))
 AI_DESCRIPTION_MIN_LEN = int(os.getenv("AI_DESCRIPTION_MIN_LEN", "80"))
 # verify_info / judge_official_homepage で使う description の長さ制約（環境変数で強化可能）。
@@ -313,6 +314,8 @@ class AIVerifier:
         # verify_info / judge_official_homepage / generate_description など別タスクに混ぜると、
         # 入出力スキーマの衝突で誤動作しやすいので、用途を限定して使う。
         self.rich_system_prompt = self._load_system_prompt()
+        # 追加の品質ルール（任意）。スキーマを含めない前提で、各プロンプト末尾に添付して使う。
+        self.quality_context = self._load_quality_context()
 
         if model is not None:
             self.model = model
@@ -353,6 +356,35 @@ class AIVerifier:
             log.warning(f"AIVerifier: failed to load system prompt from %s: %s", path, e)
             return None
 
+    def _load_quality_context(self) -> Optional[str]:
+        """
+        追加の品質ルール（任意）を読み込む。
+        - ここに JSON スキーマや出力形式の指示を書きすぎるとタスク間で衝突しやすいので、
+          「混入させないノイズ」「採用基準」などの共通ルールのみを置く想定。
+        """
+        path = AI_QUALITY_CONTEXT_PATH
+        if not path:
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            content = (content or "").strip()
+            if not content:
+                return None
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:8]
+            log.info(f"AIVerifier: loaded quality context from %s (sha256[:8]=%s)", path, digest)
+            # 長すぎるとコスト/誤動作が増えるので上限を掛ける
+            return _shorten_text(content, max_len=1800)
+        except Exception as e:
+            log.warning(f"AIVerifier: failed to load quality context from %s: %s", path, e)
+            return None
+
+    def _with_quality_context(self, prompt: str) -> str:
+        qc = (self.quality_context or "").strip()
+        if not qc:
+            return prompt
+        return f"{prompt}\n# QUALITY_RULES\n{qc}\n"
+
     async def _generate_with_timeout(self, content: list[Any], timeout_sec: float | None = None) -> Any:
         """
         Gemini呼び出しに上限時間を設け、ハングでワーカー全体が止まらないようにする。
@@ -380,7 +412,7 @@ class AIVerifier:
 
     def _build_prompt(self, text: str, company_name: str = "", address: str = "") -> str:
         snippet = _shorten_text(text or "", max_len=3500)
-        return (
+        prompt = (
             "あなたは日本企業の公式Webサイトから「代表電話番号」と「本社/本店所在地住所」を抽出する専門家です。\n"
             "加えて、事業内容だけを1文で要約（description）してください。\n"
             "推測は禁止。確証がない場合は null を返してください。\n"
@@ -404,10 +436,11 @@ class AIVerifier:
             "evidence は必ず入力（本文テキスト/スクショ内テキスト）に存在する原文の短い抜粋のみ。存在しない文言を作らない。\n"
             f"# 本文テキスト抜粋\n{snippet}\n"
         )
+        return self._with_quality_context(prompt)
 
     def _build_description_prompt(self, text: str, company_name: str = "", address: str = "", industry_hint: str = "") -> str:
         snippet = _shorten_text(text or "", max_len=3500)
-        return (
+        prompt = (
             "あなたは企業サイトから「何をしているどの会社か」が一目で分かるように要約する専門家です。\n"
             "次の要件を満たす description を JSON のみで返してください（説明文やマークダウンは禁止）。\n"
             "- 日本語1文・80〜160文字\n"
@@ -423,6 +456,7 @@ class AIVerifier:
             "禁止: URL, メール, 電話番号, 住所, 募集/採用/問い合わせ/アクセス情報, 記号の羅列。\n"
             f"# 本文テキスト抜粋\n{snippet}\n"
         )
+        return self._with_quality_context(prompt)
 
     @staticmethod
     def _validate_description(desc: Optional[str]) -> Optional[str]:
@@ -470,7 +504,7 @@ class AIVerifier:
         docs/ai_context.md は system prompt として別途渡される想定。
         """
         snippet = _shorten_text(payload_json or "", max_len=4200)
-        return (
+        prompt = (
             "以下の JSON は、同一ドメイン内の最大2〜3ページからルール抽出した候補群です。\n"
             "推測は禁止。候補に無い値は返さないでください。迷ったら null。\n"
             "出力は JSON のみ。\n"
@@ -506,6 +540,7 @@ class AIVerifier:
             "- representative_invalid_reason は false のときだけ簡潔に（例: \"looks_like_label\" / \"slogan_fragment\" / \"company_name\" / \"contains_numbers\"）。\n"
             f"# CANDIDATES_JSON\n{snippet}\n"
         )
+        return self._with_quality_context(prompt)
 
     def _normalize_company_fields_result(self, data: Dict[str, Any]) -> Dict[str, Any]:
         phone = _normalize_phone(data.get("phone_number"))

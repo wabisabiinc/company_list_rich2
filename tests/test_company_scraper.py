@@ -55,12 +55,9 @@ async def test_search_company_filters_and_resolves(mock_get, scraper):
     urls = await scraper.search_company("トヨタ自動車株式会社", "愛知県豊田市", num_results=10)
     queries = {call.kwargs["params"]["q"] for call in mock_get.call_args_list}
     allowed_queries = {
-        "トヨタ自動車株式会社 会社概要 公式",
-        "トヨタ自動車株式会社 企業情報 公式",
-        "トヨタ自動車株式会社 会社情報 公式",
-        "トヨタ自動車株式会社 愛知県豊田市 会社概要 公式",
-        "トヨタ自動車株式会社 愛知県豊田市 企業情報 公式",
-        "トヨタ自動車株式会社 愛知県豊田市 会社情報 公式",
+        "トヨタ自動車株式会社 会社概要",
+        "トヨタ自動車株式会社 企業情報",
+        "トヨタ自動車株式会社 会社情報",
     }
     assert queries.issubset(allowed_queries)
     assert allowed_queries & queries

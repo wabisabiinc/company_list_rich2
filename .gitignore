@@ -177,6 +177,10 @@ __marimo__/
 logs/
 *.log
 
+# Local caches / reports (generated outputs; do not commit)
+cache/
+reports/
+
 # Data directory (ignore everything; optionally keep a placeholder with !data/.keep)
 data/**
 !data/.keep

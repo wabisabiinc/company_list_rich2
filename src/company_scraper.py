@@ -1702,41 +1702,16 @@ class CompanyScraper:
 
     def _build_company_queries(self, company_name: str, address: Optional[str]) -> List[str]:
         """
-        会社名に公式+情報系キーワードを付けたクエリを生成する。
+        会社名に情報系キーワードを付けたクエリを生成する。
         """
         base_name = (company_name or "").strip()
         if not base_name:
             return []
-        # 住所は「都道府県+市区町村」程度に圧縮して検索精度を上げる（誤った住所が混ざる場合に備え、住所無しクエリも併用）
-        loc = ""
-        addr_norm = unicodedata.normalize("NFKC", address or "").strip()
-        # フォーム由来ノイズ/補助情報を軽く除去（入力CSVの品質が悪いケース対策）
-        if addr_norm:
-            addr_norm = re.sub(r"[（(]\s*(?:市区町村|自治体)コ[-ー]ド\s*[:：]\s*\d+\s*[)）]", "", addr_norm)
-            addr_norm = re.sub(r"(?:市区町村|自治体)コ[-ー]ド\s*[:：]\s*\d+", "", addr_norm)
-            addr_norm = re.sub(r"\s+", " ", addr_norm).strip()
-        if addr_norm:
-            pref = self._extract_prefecture(addr_norm)
-            city_match = CITY_RE.search(addr_norm)
-            city = city_match.group(1) if city_match else ""
-            if pref and city and city.startswith(pref):
-                loc = city.strip()
-            else:
-                loc = "".join([pref, city]).strip()
-
         base_queries = [
-            f"{base_name} 会社概要 公式",
-            f"{base_name} 企業情報 公式",
-            f"{base_name} 会社情報 公式",
+            f"{base_name} 会社概要",
+            f"{base_name} 企業情報",
+            f"{base_name} 会社情報",
         ]
-        if loc:
-            base_queries.extend(
-                [
-                    f"{base_name} {loc} 会社概要 公式",
-                    f"{base_name} {loc} 企業情報 公式",
-                    f"{base_name} {loc} 会社情報 公式",
-                ]
-            )
         # 末尾/重複を正規化しつつ、順序を維持して重複排除
         seen: set[str] = set()
         ordered: list[str] = []
@@ -3558,7 +3533,7 @@ class CompanyScraper:
 
     async def search_company(self, company_name: str, address: str, num_results: int = 3) -> List[str]:
         """
-        DuckDuckGoで検索し、候補URLを返す（「公式」「会社概要」の2クエリのみ）。
+        DuckDuckGoで検索し、候補URLを返す（会社概要/企業情報/会社情報の固定クエリ）。
         """
         key = (
             unicodedata.normalize("NFKC", company_name or "").strip(),
@@ -3616,15 +3591,6 @@ class CompanyScraper:
 
         queries = _unique_queries(queries)
         candidates = await run_queries(queries)
-        if not candidates:
-            # フォールバック: 社名単独/社名+公式で再検索
-            fallback_queries = []
-            plain_name = unicodedata.normalize("NFKC", company_name or "").strip()
-            if plain_name:
-                fallback_queries.append(plain_name)
-                fallback_queries.append(f"{plain_name} 公式")
-            fallback_queries = _unique_queries(fallback_queries)
-            candidates = await run_queries(fallback_queries) if fallback_queries else []
         if not candidates:
             return []
 
@@ -4893,6 +4859,37 @@ class CompanyScraper:
         label_reps: List[str] = []
         rep_from_label = False
 
+        def _phone_context_tags(context: str) -> list[str]:
+            """
+            電話番号の「部署/本社」優先度を判定するための軽量タグ付け。
+            pick_best_phone 側でスコアリングに利用する。
+            """
+            s = unicodedata.normalize("NFKC", context or "")
+            compact = re.sub(r"[\s\u3000]+", "", s)
+            if not compact:
+                return []
+            tags: list[str] = []
+            # 優先: 本社/代表/管理系
+            if any(k in compact for k in ("本社", "本店", "本部", "本社所在地", "本店所在地")):
+                tags.append("HQ")
+            if any(k in compact for k in ("代表電話", "代表番号", "代表TEL", "代表", "代表取締役")):
+                tags.append("REP")
+            if "総務" in compact:
+                tags.append("SOUMU")
+            if "経理" in compact:
+                tags.append("KEIRI")
+            if any(k in compact for k in ("管理", "管理部", "管理本部")):
+                tags.append("ADMIN")
+
+            # 低優先/避けたい: 拠点/採用/サポート等
+            if any(k in compact for k in ("支店", "営業所", "出張所", "事業所", "工場", "倉庫", "物流センター", "センター", "店舗")):
+                tags.append("BRANCH")
+            if any(k in compact for k in ("採用", "求人", "リクルート", "応募", "エントリー")):
+                tags.append("RECRUIT")
+            if any(k in compact for k in ("サポート", "カスタマー", "コールセンター", "ヘルプデスク")):
+                tags.append("SUPPORT")
+            return tags
+
         def _normalize_label_text(raw: str) -> tuple[str, str]:
             cleaned = unicodedata.normalize("NFKC", raw or "")
             cleaned = cleaned.replace("\u200b", "").strip()
@@ -4958,13 +4955,26 @@ class CompanyScraper:
             cand = _normalize_phone_strict(p.group(0))
             if not cand:
                 continue
-            ctx = (text or "")[max(0, p.start() - 12):p.start()]
+            raw_text = text or ""
+            line_start = raw_text.rfind("\n", 0, p.start())
+            line_start = 0 if line_start < 0 else line_start + 1
+            line_end = raw_text.find("\n", p.end())
+            line_end = len(raw_text) if line_end < 0 else line_end
+            line = raw_text[line_start:line_end]
+            ctx = line[max(0, (p.start() - line_start) - 40) : (p.start() - line_start)]
             fax_hint = bool(re.search(r"(FAX|Fax|fax|ファックス|ﾌｧｯｸｽ|ＦＡＸ)", ctx))
             tel_hint = bool(re.search(r"(TEL|Tel|tel|電話)", ctx))
+            ctx_tags = _phone_context_tags(line)
             if fax_hint and not tel_hint:
+                # 互換のため、素の [FAX] と併記して文脈タグ版も追加する
                 phones.append(f"[FAX]{cand}")
+                if ctx_tags:
+                    phones.append("[TEXT]" + "".join(f"[{t}]" for t in ctx_tags) + f"[FAX]{cand}")
             else:
+                # 既存挙動（タグ無し）を維持しつつ、必要な時だけ文脈タグ版を追加する
                 phones.append(cand)
+                if ctx_tags:
+                    phones.append("[TEXT]" + "".join(f"[{t}]" for t in ctx_tags) + cand)
 
         def _extract_addrs_from_text() -> None:
             added_any = False
@@ -5117,7 +5127,21 @@ class CompanyScraper:
                                 continue
                             cand = _normalize_phone_strict(href.replace("tel:", "", 1))
                             if cand:
-                                phones.append(f"[TELHREF]{cand}")
+                                label_bits: list[str] = []
+                                try:
+                                    label_bits.append(a.get_text(separator=" ", strip=True) or "")
+                                except Exception:
+                                    pass
+                                for attr in ("aria-label", "title"):
+                                    try:
+                                        v = a.get(attr)
+                                    except Exception:
+                                        v = None
+                                    if isinstance(v, str) and v:
+                                        label_bits.append(v)
+                                ctx_tags = _phone_context_tags(" ".join([b for b in label_bits if b]))
+                                prefix = "[TELHREF]" + "".join(f"[{t}]" for t in ctx_tags)
+                                phones.append(f"{prefix}{cand}")
                     except Exception:
                         pass
 
@@ -5131,7 +5155,9 @@ class CompanyScraper:
                                 for p in PHONE_RE.finditer(val):
                                     cand = _normalize_phone_strict(p.group(0))
                                     if cand:
-                                        phones.append(f"[ATTR]{cand}")
+                                        ctx_tags = _phone_context_tags(val)
+                                        prefix = "[ATTR]" + "".join(f"[{t}]" for t in ctx_tags)
+                                        phones.append(f"{prefix}{cand}")
                     except Exception:
                         pass
 
@@ -5140,13 +5166,21 @@ class CompanyScraper:
                             cand = _normalize_phone_strict(p.group(0))
                             if not cand:
                                 continue
-                            ctx = (blob or "")[max(0, p.start() - 12):p.start()]
+                            blob_text = blob or ""
+                            line_start = blob_text.rfind("\n", 0, p.start())
+                            line_start = 0 if line_start < 0 else line_start + 1
+                            line_end = blob_text.find("\n", p.end())
+                            line_end = len(blob_text) if line_end < 0 else line_end
+                            line = blob_text[line_start:line_end]
+                            ctx = line[max(0, (p.start() - line_start) - 40) : (p.start() - line_start)]
                             fax_hint = bool(re.search(r"(FAX|Fax|fax|ファックス|ﾌｧｯｸｽ|ＦＡＸ)", ctx))
                             tel_hint = bool(re.search(r"(TEL|Tel|tel|電話)", ctx))
+                            ctx_tags = _phone_context_tags(line)
+                            prefix = f"[{blob_tag}]" + "".join(f"[{t}]" for t in ctx_tags)
                             if fax_hint and not tel_hint:
-                                phones.append(f"[{blob_tag}][FAX]{cand}")
+                                phones.append(f"{prefix}[FAX]{cand}")
                             else:
-                                phones.append(f"[{blob_tag}]{cand}")
+                                phones.append(f"{prefix}{cand}")
                         for zm in ZIP_RE.finditer(blob or ""):
                             zip_code = f"〒{zm.group(1).replace('〒', '').strip()}-{zm.group(2)}"
                             cursor = zm.end()
@@ -5633,6 +5667,8 @@ class CompanyScraper:
                         fax_part = value_nfkc[fax_pos.start():] if fax_pos else ""
                         def _emit(part: str, is_fax: bool) -> None:
                             nonlocal matched
+                            ctx_tags = _phone_context_tags(f"{label_text} {value_nfkc}")
+                            ctx_prefix = "".join(f"[{t}]" for t in ctx_tags)
                             for p in PHONE_RE.finditer(part or ""):
                                 cand = _normalize_phone_strict(f"{p.group(1)}-{p.group(2)}-{p.group(3)}")
                                 if not cand:
@@ -5640,6 +5676,7 @@ class CompanyScraper:
                                 prefix = ""
                                 if is_table_pair:
                                     prefix += "[TABLE]"
+                                prefix += ctx_prefix
                                 if is_fax:
                                     prefix += "[FAX]"
                                 phones.append(f"{prefix}{cand}")
@@ -5677,6 +5714,22 @@ class CompanyScraper:
                         matched = True
                     elif field == "founded_years":
                         founded_years.append(raw_value if not is_table_pair else f"[TABLE]{raw_value}")
+                        matched = True
+            # 「経理部」「総務部」「本社」等、電話キーワードが無いが値が電話のケースを拾う
+            if not matched:
+                dept_label_hit = bool(re.search(r"(本社|本店|本部|代表|総務|経理|管理)", norm_label))
+                if dept_label_hit and PHONE_RE.search(raw_value):
+                    value_nfkc = unicodedata.normalize("NFKC", raw_value)
+                    fax_pos = re.search(r"(FAX|ファックス|ﾌｧｯｸｽ)", value_nfkc, re.I)
+                    tel_part = value_nfkc[: fax_pos.start()] if fax_pos else value_nfkc
+                    ctx_tags = _phone_context_tags(f"{norm_label} {value_nfkc}")
+                    ctx_prefix = "".join(f"[{t}]" for t in ctx_tags)
+                    for p in PHONE_RE.finditer(tel_part or ""):
+                        cand = _normalize_phone_strict(f"{p.group(1)}-{p.group(2)}-{p.group(3)}")
+                        if not cand:
+                            continue
+                        prefix = ("[TABLE]" if is_table_pair else "[LABEL]") + ctx_prefix
+                        phones.append(f"{prefix}{cand}")
                         matched = True
             if matched:
                 continue

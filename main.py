@@ -1158,18 +1158,23 @@ def _rep_candidate_ok(
         return False, "other_not_profile"
     return False, f"not_profile:{page_type}"
 
+
+def _split_bracket_tags(raw: str) -> tuple[set[str], str]:
+    rest = str(raw or "").strip()
+    tags: list[str] = []
+    while True:
+        m = re.match(r"^\[([A-Z_]+)\]", rest)
+        if not m:
+            break
+        tags.append(m.group(1))
+        rest = rest[m.end() :].lstrip()
+    rest = re.sub(r"^\[[A-Z_]+\]\s*", "", rest)
+    return set(tags), rest.strip()
+
+
 def pick_best_phone(candidates: list[str]) -> str | None:
     def _split_tags(raw: str) -> tuple[set[str], str]:
-        rest = str(raw or "").strip()
-        tags: list[str] = []
-        while True:
-            m = re.match(r"^\[([A-Z_]+)\]", rest)
-            if not m:
-                break
-            tags.append(m.group(1))
-            rest = rest[m.end():].lstrip()
-        rest = re.sub(r"^\[[A-Z_]+\]\s*", "", rest)
-        return set(tags), rest.strip()
+        return _split_bracket_tags(raw)
 
     source_bonus = {
         "TELHREF": 6.0,
@@ -1181,6 +1186,15 @@ def pick_best_phone(candidates: list[str]) -> str | None:
         "HEADER": 1.0,
         "ATTR": 0.5,
         "TEXT": 0.0,
+        # 文脈タグ（CompanyScraper.extract_candidates が付与）
+        "HQ": 4.0,        # 本社/本店/本部
+        "REP": 3.5,       # 代表/代表電話
+        "SOUMU": 3.0,     # 総務
+        "KEIRI": 3.0,     # 経理
+        "ADMIN": 2.0,     # 管理
+        "BRANCH": -2.5,   # 支店/営業所/倉庫/センター等
+        "RECRUIT": -6.0,  # 採用/求人
+        "SUPPORT": -2.0,  # サポート/コールセンター等
     }
 
     # TABLE/LABEL/JSONLD/TELHREF がある場合は HEADER/FOOTER/ATTR 由来を避ける
@@ -1191,10 +1205,12 @@ def pick_best_phone(candidates: list[str]) -> str | None:
             tag_sets.append(tags)
         has_structured = any(bool(t & {"TELHREF", "TABLE", "JSONLD", "LABEL"}) for t in tag_sets)
         if has_structured:
+            priority_ctx = {"HQ", "REP", "SOUMU", "KEIRI", "ADMIN"}
             filtered: list[str] = []
             for cand in candidates or []:
                 tags, _ = _split_tags(str(cand))
-                if tags & {"FOOTER", "HEADER", "ATTR"}:
+                # footer/header/attr はノイズになりやすいが、「本社/代表/管理」等の明確な文脈があれば残す
+                if (tags & {"FOOTER", "HEADER", "ATTR"}) and not (tags & priority_ctx):
                     continue
                 filtered.append(str(cand))
             if filtered:
@@ -1243,6 +1259,99 @@ def pick_best_phone(candidates: list[str]) -> str | None:
         if abs(len(norm_val) - 12) < abs(len(best) - 12):
             best = norm_val
     return best
+
+
+def score_phone_candidate(raw_candidate: str, page_type: str | None = None) -> tuple[str | None, float]:
+    """
+    1つの電話候補（CompanyScraper.extract_candidates の raw 文字列）をスコアリングする。
+    - 返り値: (normalized_phone or None, score)
+    """
+    tags, raw_value = _split_bracket_tags(raw_candidate)
+    is_fax = "FAX" in tags
+    is_tel = "TEL" in tags or "TELHREF" in tags
+    if is_fax and not is_tel:
+        return None, float("-inf")
+    norm = normalize_phone(raw_value)
+    if not norm:
+        return None, float("-inf")
+
+    pt = (page_type or "OTHER").strip().upper()
+    # page_type が弱くても「構造化ソース」または「本社/代表/管理」文脈なら許可する
+    strong_source = bool(tags & {"TELHREF", "TABLE", "JSONLD", "LABEL"})
+    priority_ctx = bool(tags & {"HQ", "REP", "SOUMU", "KEIRI", "ADMIN"})
+    if pt not in {"COMPANY_PROFILE", "ACCESS_CONTACT"} and not (strong_source or priority_ctx):
+        return None, float("-inf")
+
+    source_bonus = {
+        "TELHREF": 6.0,
+        "TABLE": 5.0,
+        "JSONLD": 5.0,
+        "LABEL": 4.0,
+        "TEL": 3.5,
+        "FOOTER": 1.5,
+        "HEADER": 1.0,
+        "ATTR": 0.5,
+        "TEXT": 0.0,
+        # 文脈タグ（CompanyScraper.extract_candidates が付与）
+        "HQ": 4.0,
+        "REP": 3.5,
+        "SOUMU": 3.0,
+        "KEIRI": 3.0,
+        "ADMIN": 2.0,
+        "BRANCH": -2.5,
+        "RECRUIT": -6.0,
+        "SUPPORT": -2.0,
+    }
+    page_type_bonus = {
+        "COMPANY_PROFILE": 2.0,
+        "ACCESS_CONTACT": 1.0,
+        "BASES_LIST": -1.0,
+        "DIRECTORY_DB": -2.0,
+        "OTHER": 0.0,
+    }
+
+    score = page_type_bonus.get(pt, 0.0)
+    for t in tags:
+        score += source_bonus.get(t, 0.0)
+
+    if re.match(r"^(0120|0570)", norm):
+        score -= 4.0
+    score -= abs(len(norm) - 12) * 0.2
+    return norm, score
+
+
+def pick_best_phone_from_entries(entries: list[tuple[str, str, str]]) -> tuple[str | None, str | None]:
+    """
+    複数ページにまたがる電話候補から、最も良い1つを選ぶ。
+    entries: [(raw_candidate, url, page_type)]
+    """
+    best_phone: str | None = None
+    best_url: str | None = None
+    best_score = float("-inf")
+    for raw, url, pt in entries or []:
+        norm, score = score_phone_candidate(raw, pt)
+        if not norm:
+            continue
+        if best_phone is None or score > best_score:
+            best_phone = norm
+            best_url = url
+            best_score = score
+            continue
+        if score < best_score:
+            continue
+        # tie-breakers: prefer non 0120/0570
+        if re.match(r"^(0120|0570)", norm) and not re.match(r"^(0120|0570)", best_phone):
+            continue
+        if re.match(r"^(0120|0570)", best_phone) and not re.match(r"^(0120|0570)", norm):
+            best_phone = norm
+            best_url = url
+            best_score = score
+            continue
+        if abs(len(norm) - 12) < abs(len(best_phone) - 12):
+            best_phone = norm
+            best_url = url
+            best_score = score
+    return best_phone, best_url
 
 def _has_strong_phone_source(candidates: list[str]) -> bool:
     """
@@ -4108,6 +4217,20 @@ async def process():
                     rule_phone = None
                     rule_address = None
                     rule_rep = None
+                    best_rule_phone_score = float("-inf")
+                    best_rule_phone_url = ""
+
+                    def consider_rule_phone(raw_candidates: list[str] | None, url: str, pt: str) -> None:
+                        nonlocal rule_phone, src_phone, best_rule_phone_score, best_rule_phone_url
+                        for raw in raw_candidates or []:
+                            norm, score = score_phone_candidate(str(raw), pt)
+                            if not norm:
+                                continue
+                            if score > best_rule_phone_score:
+                                best_rule_phone_score = score
+                                best_rule_phone_url = url
+                                rule_phone = norm
+                                src_phone = url
 
                     need_listing = not bool(listing_val)
                     need_capital = not bool(capital_val)
@@ -4173,13 +4296,11 @@ async def process():
                         except Exception:
                             pass
                         if cc.get("phone_numbers"):
-                            cand = pick_best_phone(cc["phone_numbers"])
-                            if cand and not rule_phone:
-                                if pt in {"COMPANY_PROFILE", "ACCESS_CONTACT"} or _has_strong_phone_source(cc.get("phone_numbers") or []):
-                                    rule_phone = cand
-                                    src_phone = url
-                                else:
-                                    drop_reasons["phone"] = drop_reasons.get("phone") or f"not_profile:{pt}"
+                            before = best_rule_phone_score
+                            consider_rule_phone(list(cc.get("phone_numbers") or []), url, str(pt))
+                            if best_rule_phone_score == before and not rule_phone:
+                                # 候補はあるが、弱いページタイプ+弱いソースで採用できなかった
+                                drop_reasons["phone"] = drop_reasons.get("phone") or f"not_profile:{pt}"
                         if cc.get("addresses"):
                             cand_addr = pick_best_address(None if ai_official_selected else addr, cc["addresses"])
                             if cand_addr and not rule_address:
@@ -4539,8 +4660,8 @@ async def process():
 
                         # primary_cands は page_type が不明なことがあるため、基本は absorb_doc_data の結果を優先する
                         pt_info = page_type_per_url.get(info_url) or "OTHER"
-                        if phones and not rule_phone and (pt_info in {"COMPANY_PROFILE", "ACCESS_CONTACT"} or _has_strong_phone_source(phones)):
-                            rule_phone = pick_best_phone(phones)
+                        if phones:
+                            consider_rule_phone(list(phones), info_url, str(pt_info))
                         if addrs and not rule_address:
                             cand_addr = pick_best_address(None if ai_official_selected else addr, addrs)
                             if cand_addr:
@@ -5004,30 +5125,25 @@ async def process():
                                     pt = str(item.get("pt") or "OTHER")
                                     cc = item.get("cc") or {}
                                     if need_phone and cc.get("phone_numbers"):
-                                            cand = pick_best_phone(cc["phone_numbers"])
-                                            if cand:
-                                                if pt in {"COMPANY_PROFILE", "ACCESS_CONTACT"} or _has_strong_phone_source(cc.get("phone_numbers") or []):
-                                                    phone = cand
-                                                    phone_source = "rule"
-                                                    src_phone = url
-                                                    need_phone = False
-                                                    log.info("[%s] deep_crawl picked phone=%s url=%s", cid, cand, url)
-                                                else:
-                                                    reason = f"not_profile:{pt}"
-                                                    drop_reasons["phone"] = drop_reasons.get("phone") or reason
-                                                    drop_details_by_url.setdefault(url, {})["phone"] = reason
-                                                    log.info("[%s] deep_crawl rejected phone reason=%s url=%s cand=%s", cid, reason, url, cand)
-                                            else:
-                                                reason = "no_valid_phone"
-                                                drop_reasons["phone"] = drop_reasons.get("phone") or reason
-                                                drop_details_by_url.setdefault(url, {})["phone"] = reason
-                                                log.info(
-                                                    "[%s] deep_crawl rejected phones reason=%s url=%s candidates=%s",
-                                                    cid,
-                                                    reason,
-                                                    url,
-                                                    (cc.get("phone_numbers") or [])[:3],
-                                                )
+                                        before = best_rule_phone_score
+                                        consider_rule_phone(list(cc.get("phone_numbers") or []), url, pt)
+                                        if rule_phone and best_rule_phone_score > before:
+                                            phone = rule_phone
+                                            phone_source = "rule"
+                                            src_phone = best_rule_phone_url or url
+                                            need_phone = False
+                                            log.info("[%s] deep_crawl picked phone=%s url=%s", cid, rule_phone, src_phone)
+                                        elif not rule_phone:
+                                            reason = f"not_profile:{pt}"
+                                            drop_reasons["phone"] = drop_reasons.get("phone") or reason
+                                            drop_details_by_url.setdefault(url, {})["phone"] = reason
+                                            log.info(
+                                                "[%s] deep_crawl rejected phones reason=%s url=%s candidates=%s",
+                                                cid,
+                                                reason,
+                                                url,
+                                                (cc.get("phone_numbers") or [])[:3],
+                                            )
                                     if need_addr and cc.get("addresses"):
                                         cand_addr = pick_best_address(None if ai_official_selected else addr, cc["addresses"])
                                         if cand_addr:
@@ -5568,11 +5684,16 @@ async def process():
                                     if bool(dir_hint.get("is_directory_like")) and int(dir_hint.get("directory_score") or 0) >= DIRECTORY_HARD_REJECT_SCORE:
                                         # phone/address は補完対象として残すが rep_name は見ない
                                         if not phone and data.get("phone_numbers"):
-                                            cand = pick_best_phone(data["phone_numbers"])
-                                            if cand:
-                                                phone = cand
+                                            before = best_rule_phone_score
+                                            consider_rule_phone(
+                                                list(data.get("phone_numbers") or []),
+                                                url,
+                                                page_type_per_url.get(url) or "OTHER",
+                                            )
+                                            if rule_phone and best_rule_phone_score > before:
+                                                phone = rule_phone
                                                 phone_source = "rule"
-                                                src_phone = url
+                                                src_phone = best_rule_phone_url or url
                                         if not found_address and data.get("addresses"):
                                             cand_addr = pick_best_address(addr, data["addresses"])
                                             if cand_addr:
@@ -5583,11 +5704,12 @@ async def process():
                                 except Exception:
                                     pass
                                 if not phone and data.get("phone_numbers"):
-                                    cand = pick_best_phone(data["phone_numbers"])
-                                    if cand:
-                                        phone = cand
+                                    before = best_rule_phone_score
+                                    consider_rule_phone(list(data.get("phone_numbers") or []), url, page_type_per_url.get(url) or "OTHER")
+                                    if rule_phone and best_rule_phone_score > before:
+                                        phone = rule_phone
                                         phone_source = "rule"
-                                        src_phone = url
+                                        src_phone = best_rule_phone_url or url
                                 if not found_address and data.get("addresses"):
                                     cand_addr = pick_best_address(addr, data["addresses"])
                                     if cand_addr:
