@@ -24,10 +24,11 @@ CONTACT_KEYWORDS = (
     "お問合せ",
     "問い合わせ",
     "contact",
+    "contact us",
     "inquiry",
+    "enquiry",
     "toiawase",
     "otoiawase",
-    "support",
     "相談",
     "フォーム",
     "form",
@@ -56,10 +57,20 @@ CONTACT_PATH_HINTS = (
     "/contactus",
     "/contact-us",
     "/inquiry",
+    "/enquiry",
     "/toiawase",
     "/otoiawase",
-    "/form",
-    "/support",
+    "/contact_form",
+    "/service/contact",
+    "/qa/contact",
+    "/company/contact",
+    "/about/contact",
+    "/corp/contact",
+    "/group/contact",
+    "/contact.html",
+    "/contact.php",
+    "/contact.asp",
+    "/contact.aspx",
 )
 REJECT_PATH_HINTS = (
     "/recruit",
@@ -81,6 +92,10 @@ EXTERNAL_FORM_HOSTS = (
     "form-mailer.jp",
     "formzu.net",
     "ssl.formzu.net",
+    "docs.google.com",
+    "tayori.com",
+    "hubspot.com",
+    "salesforce.com",
 )
 JP_2LD_SUFFIXES = (
     "co.jp",
@@ -147,6 +162,13 @@ def _same_reg_domain(host_a: str, host_b: str) -> bool:
     return _registrable_domain(host_a) == _registrable_domain(host_b)
 
 
+def _is_external_form_host(host: str) -> bool:
+    host = (host or "").lower().strip(".")
+    if not host:
+        return False
+    return any(host == base or host.endswith("." + base) for base in EXTERNAL_FORM_HOSTS)
+
+
 def _parse_candidates(base_url: str, html: str, scraper: CompanyScraper) -> List[Dict[str, Any]]:
     if not html:
         return []
@@ -175,7 +197,11 @@ def _parse_candidates(base_url: str, html: str, scraper: CompanyScraper) -> List
                 href,
             ]
         ).lower()
-        if any(k in token for k in CONTACT_KEYWORDS) or any(k in (parsed.path or "").lower() for k in CONTACT_PATH_HINTS):
+        if (
+            any(k in token for k in CONTACT_KEYWORDS)
+            or any(k in (parsed.path or "").lower() for k in CONTACT_PATH_HINTS)
+            or _is_external_form_host(parsed.netloc)
+        ):
             add_candidate(url, token, "anchor")
 
     for url in scraper._find_priority_links(base_url, html, max_links=6, target_types=["contact"]):
@@ -224,7 +250,7 @@ def _score_candidate(
         score -= 30
         reasons.append("recruit_hint")
 
-    if host in EXTERNAL_FORM_HOSTS:
+    if _is_external_form_host(host):
         score += 5
         reasons.append("external_form_host")
 
