@@ -2732,6 +2732,21 @@ async def process():
 
             fatal_error = False
             skip_company_reason = ""
+            drop_reasons: dict[str, str] = {}
+            drop_details_by_url: dict[str, dict[str, str]] = {}
+            page_type_per_url: dict[str, str] = {}
+            provisional_homepage = ""
+            forced_provisional_homepage = ""
+            forced_provisional_reason = ""
+            provisional_info = None
+            provisional_cands: dict[str, Any] = {}
+            provisional_domain_score = 0
+            provisional_address_ok = False
+            provisional_evidence_score = 0
+            provisional_profile_hit = False
+            provisional_host_token = False
+            provisional_name_present = False
+            provisional_ai_hint = False
             try:
                 try:
                     candidate_limit = SEARCH_CANDIDATE_LIMIT
@@ -6062,6 +6077,8 @@ async def process():
                                 company.update(accuracy_payload)
 
                         # ---- homepage保存ポリシー（誤保存を防ぐ最終ゲート） ----
+                        # final_decision 時点の候補は保持してDBに残す（後段のポリシーで落ちても痕跡を残す）
+                        final_homepage_candidate = homepage or ""
                         # 1) provisional_* の弱いものを落とす（既定: 有効）
                         if APPLY_PROVISIONAL_HOMEPAGE_POLICY and homepage:
                             decision = apply_provisional_homepage_policy(
@@ -6093,8 +6110,7 @@ async def process():
                             homepage_official_score = decision.homepage_official_score
                             chosen_domain_score = decision.chosen_domain_score
 
-                        # 2) final_homepage は「候補として最終的に残ったURL」を保持（homepage が空でも残す）
-                        final_homepage_candidate = homepage or ""
+                        # 2) final_homepage は「final_decision 時点の候補URL」を保持（homepage が空でも残す）
 
                         # 3) official と確定できない場合は homepage を空欄にし、候補は provisional_homepage に退避
                         provisional_store = (provisional_homepage or forced_provisional_homepage or "").strip()

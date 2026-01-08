@@ -29,6 +29,7 @@ API_KEY: str = (os.getenv("GEMINI_API_KEY") or "").strip()
 DEFAULT_MODEL: str = (os.getenv("GEMINI_MODEL") or "gemini-2.5-flash-lite").strip()
 AI_CONTEXT_PATH: str = os.getenv("AI_CONTEXT_PATH", "docs/ai_context.md")
 AI_QUALITY_CONTEXT_PATH: str = os.getenv("AI_QUALITY_CONTEXT_PATH", "docs/ai_quality.md")
+AI_CONTACT_FORM_PROMPT_PATH: str = os.getenv("AI_CONTACT_FORM_PROMPT_PATH", "docs/ai_contact_form_prompt.md")
 AI_DESCRIPTION_MAX_LEN = int(os.getenv("AI_DESCRIPTION_MAX_LEN", "160"))
 AI_DESCRIPTION_MIN_LEN = int(os.getenv("AI_DESCRIPTION_MIN_LEN", "80"))
 # verify_info / judge_official_homepage で使う description の長さ制約（環境変数で強化可能）。
@@ -316,6 +317,7 @@ class AIVerifier:
         self.rich_system_prompt = self._load_system_prompt()
         # 追加の品質ルール（任意）。スキーマを含めない前提で、各プロンプト末尾に添付して使う。
         self.quality_context = self._load_quality_context()
+        self.contact_form_prompt = self._load_contact_form_prompt()
 
         if model is not None:
             self.model = model
@@ -377,6 +379,24 @@ class AIVerifier:
             return _shorten_text(content, max_len=1800)
         except Exception as e:
             log.warning(f"AIVerifier: failed to load quality context from %s: %s", path, e)
+            return None
+
+    def _load_contact_form_prompt(self) -> Optional[str]:
+        """
+        docs/ai_contact_form_prompt.md を問い合わせフォーム判定用のプロンプトとして読み込む。
+        """
+        path = AI_CONTACT_FORM_PROMPT_PATH
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            content = (content or "").strip()
+            if not content:
+                return None
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:8]
+            log.info("AIVerifier: loaded contact form prompt from %s (sha256[:8]=%s)", path, digest)
+            return content
+        except Exception as e:
+            log.warning("AIVerifier: failed to load contact form prompt from %s: %s", path, e)
             return None
 
     def _with_quality_context(self, prompt: str) -> str:
@@ -1223,8 +1243,8 @@ class AIVerifier:
             if resp is None:
                 log.warning(f"judge_official_homepage_multi timed out/failed for {company_name} ({url}); retrying text-only.")
                 resp = await self._generate_with_timeout(_build_content(False))
-                if resp is None:
-                    return None
+            if resp is None:
+                return None
             raw = _resp_text(resp)
             parsed = _parse_result(raw)
             if parsed is not None:
@@ -1237,3 +1257,66 @@ class AIVerifier:
             return None
         raw = _resp_text(resp)
         return _parse_result(raw)
+
+    async def judge_contact_form(
+        self,
+        text: str,
+        company_name: str,
+        homepage: str,
+        url: str,
+        *,
+        signals: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        if not self.model or not self.contact_form_prompt:
+            return None
+        snippet = (text or "").strip()
+        if len(snippet) > 3000:
+            snippet = snippet[:3000]
+        prompt = (
+            f"{self.contact_form_prompt}\n\n"
+            "出力は JSON のみ。\n"
+            "企業名/公式HP/候補URL/本文抜粋/追加シグナルを参考に判定する。\n"
+            "必須キー:\n"
+            "{\\\"is_official_contact_form\\\": true/false/\"unsure\", \\\"confidence\\\": 0.0-1.0, \\\"reason\\\": \"簡潔な根拠\"}\n"
+            f"企業名: {company_name}\n"
+            f"公式HP: {homepage}\n"
+            f"候補URL: {url}\n"
+            f"追加シグナル: {signals}\n"
+            f"本文抜粋:\n{snippet}\n"
+        )
+        try:
+            resp = await self._generate_with_timeout([prompt])
+            if resp is None:
+                return None
+            raw = _resp_text(resp)
+            data = _extract_first_json(raw)
+            if not isinstance(data, dict):
+                return None
+            verdict = data.get("is_official_contact_form")
+            confidence_val = data.get("confidence")
+            reason = data.get("reason") if isinstance(data.get("reason"), str) else ""
+            if isinstance(verdict, str):
+                v = verdict.strip().lower()
+                if v in {"true", "yes", "official", "1"}:
+                    verdict_val: str | bool = True
+                elif v in {"false", "no", "0"}:
+                    verdict_val = False
+                else:
+                    verdict_val = "unsure"
+            elif isinstance(verdict, (int, float)):
+                verdict_val = bool(verdict)
+            elif isinstance(verdict, bool):
+                verdict_val = verdict
+            else:
+                verdict_val = "unsure"
+            try:
+                confidence = float(confidence_val) if confidence_val is not None else None
+            except Exception:
+                confidence = None
+            return {
+                "is_official_contact_form": verdict_val,
+                "confidence": confidence,
+                "reason": reason.strip(),
+            }
+        except Exception:
+            return None
