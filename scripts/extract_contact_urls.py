@@ -425,6 +425,7 @@ async def _run(
     csv_path: str,
     force_homepage: bool,
     progress: bool,
+    progress_detail: bool,
     company_timeout_sec: int,
 ) -> None:
     conn = sqlite3.connect(db_path)
@@ -455,7 +456,7 @@ async def _run(
             if not homepage:
                 continue
             if progress:
-                print(f"[{idx}/{total_rows}] id={cid} homepage={homepage}")
+                print(f"[{idx}/{total_rows}] 開始 id={cid} homepage={homepage}")
                 sys.stdout.flush()
 
             async def _process_company() -> Tuple[str, float, str, str, str, float, str]:
@@ -512,6 +513,13 @@ async def _run(
                 ai_reason = ""
 
             checked_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+            if progress_detail:
+                print(
+                    "結果: contact_url=%s score=%.1f source=%s reason=%s ai_verdict=%s ai_conf=%.2f ai_reason=%s"
+                    % (url or "", float(score or 0.0), source or "", reason or "", ai_verdict or "", float(ai_confidence or 0.0), ai_reason or "")
+                )
+                sys.stdout.flush()
+
             if dry_run:
                 print(
                     f"{cid}\t{homepage}\t{url}\t{score:.1f}\t{source}\t{reason}\t{ai_verdict}\t{ai_confidence:.2f}\t{ai_reason}"
@@ -562,6 +570,7 @@ def main() -> None:
     ap.add_argument("--ai", action="store_true", help="Enable AI-based contact form gate")
     ap.add_argument("--ai-min-confidence", type=float, default=AI_MIN_CONFIDENCE_DEFAULT, help="AI confidence threshold")
     ap.add_argument("--progress", action="store_true", help="Print progress per company")
+    ap.add_argument("--progress-detail", action="store_true", help="Print result details per company in Japanese")
     ap.add_argument("--company-timeout-sec", type=int, default=COMPANY_TIMEOUT_SEC_DEFAULT, help="Per-company timeout in seconds")
     args = ap.parse_args()
 
@@ -576,6 +585,7 @@ def main() -> None:
             args.csv,
             args.force_homepage,
             args.progress,
+            args.progress_detail,
             args.company_timeout_sec,
         )
     )
