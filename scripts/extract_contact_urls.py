@@ -2,10 +2,12 @@
 import argparse
 import asyncio
 import datetime as dt
+import re
 import sqlite3
 import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Tuple
+import unicodedata
 from urllib.parse import urljoin, urlparse
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +31,25 @@ CONTACT_KEYWORDS = (
     "相談",
     "フォーム",
     "form",
+)
+GENERAL_INQUIRY_TERMS = (
+    "その他お問い合わせ",
+    "その他のお問い合わせ",
+    "一般お問い合わせ",
+    "一般のお問い合わせ",
+    "お問い合わせ",
+    "問合せ",
+    "問い合わせ",
+    "ご相談",
+    "ご質問",
+    "お問い合わせ内容",
+)
+RECRUIT_TERMS = (
+    "応募",
+    "求人",
+    "採用",
+    "リクルート",
+    "エントリー",
 )
 CONTACT_PATH_HINTS = (
     "/contact",
@@ -217,9 +238,19 @@ def _score_candidate(
 def _score_with_content(scraper: CompanyScraper, url: str, html: str, text: str) -> Tuple[int, List[str]]:
     score = 0
     reasons: List[str] = []
+    has_general_option, recruit_only, email_present = _form_choice_flags(html)
     if html and "<form" in html.lower():
         score += 10
         reasons.append("has_form")
+    if has_general_option:
+        score += 8
+        reasons.append("has_general_inquiry_option")
+    if recruit_only:
+        score -= 30
+        reasons.append("recruit_only_form")
+    if email_present and not (html and "<form" in html.lower()):
+        score += 4
+        reasons.append("email_contact_only")
     if text and any(k in text for k in ("お問い合わせ", "お問合せ", "問い合わせ")):
         score += 6
         reasons.append("text_contact_kw")
@@ -239,6 +270,54 @@ def _homepage_is_contact(scraper: CompanyScraper, url: str, html: str, text: str
     return "<form" in (html or "").lower() or any(k in (text or "") for k in ("お問い合わせ", "お問合せ", "問い合わせ"))
 
 
+def _form_choice_flags(html: str) -> Tuple[bool, bool, bool]:
+    if not html:
+        return False, False, False
+    soup = BeautifulSoup(html, "html.parser")
+    forms = soup.find_all("form")
+    if not forms:
+        return False, False, _email_present(html)
+    has_general = False
+    has_recruit = False
+    for form in forms:
+        tokens: List[str] = []
+        for label in form.find_all("label"):
+            text = label.get_text(" ", strip=True)
+            if text:
+                tokens.append(text)
+        for opt in form.find_all("option"):
+            text = opt.get_text(" ", strip=True)
+            if text:
+                tokens.append(text)
+        for node in form.find_all(["input", "textarea", "select"]):
+            for attr in ("name", "value", "placeholder", "aria-label"):
+                val = node.get(attr)
+                if val:
+                    tokens.append(str(val))
+        blob = _normalize_text(" ".join(tokens))
+        if any(term in blob for term in GENERAL_INQUIRY_TERMS):
+            has_general = True
+        if any(term in blob for term in RECRUIT_TERMS):
+            has_recruit = True
+    recruit_only = has_recruit and not has_general
+    return has_general, recruit_only, _email_present(html)
+
+
+def _email_present(html: str) -> bool:
+    if not html:
+        return False
+    if "mailto:" in html.lower():
+        return True
+    return bool(re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", html))
+
+
+def _normalize_text(text: str) -> str:
+    s = unicodedata.normalize("NFKC", text or "")
+    s = s.replace("　", " ")
+    s = " ".join(s.split())
+    return s
+
+
 def _build_ai_signals(homepage: str, url: str, html: str) -> str:
     base_host = urlparse(homepage).netloc.lower()
     cand_host = urlparse(url).netloc.lower()
@@ -249,6 +328,7 @@ def _build_ai_signals(homepage: str, url: str, html: str) -> str:
     input_count = 0
     action_hosts: List[str] = []
     title = ""
+    general_option, recruit_only, email_present = _form_choice_flags(html)
     if html:
         soup = BeautifulSoup(html, "html.parser")
         if soup.title and soup.title.string:
@@ -271,6 +351,9 @@ def _build_ai_signals(homepage: str, url: str, html: str) -> str:
         f"form_count={form_count}",
         f"input_count={input_count}",
         f"action_hosts={','.join(action_hosts[:3])}",
+        f"general_inquiry_option={str(general_option).lower()}",
+        f"recruit_only={str(recruit_only).lower()}",
+        f"email_present={str(email_present).lower()}",
         f"title={title}",
     ]
     return "; ".join(s for s in signals if s)
@@ -408,6 +491,7 @@ def _ensure_columns(conn: sqlite3.Connection) -> None:
         ("contact_url_ai_verdict", "TEXT"),
         ("contact_url_ai_confidence", "REAL"),
         ("contact_url_ai_reason", "TEXT"),
+        ("contact_url_status", "TEXT"),
     ]
     for name, typ in to_add:
         if name not in cols:
@@ -436,7 +520,7 @@ async def _run(
 
     where = "TRIM(IFNULL(final_homepage,''))<>''"
     if not force:
-        where += " AND (contact_url IS NULL OR TRIM(contact_url)='')"
+        where += " AND (contact_url_status IS NULL OR TRIM(contact_url_status)='')"
     limit_sql = f" LIMIT {limit}" if limit > 0 else ""
     rows = conn.execute(
         f"SELECT id, company_name, final_homepage FROM companies WHERE {where} ORDER BY id{limit_sql}"
@@ -511,6 +595,17 @@ async def _run(
                 ai_verdict = ""
                 ai_confidence = 0.0
                 ai_reason = ""
+                status = "timeout"
+            else:
+                if url:
+                    status = "success"
+                else:
+                    if ai_verdict == "not_official":
+                        status = "ai_not_official"
+                    elif ai_verdict == "unsure":
+                        status = "ai_unsure"
+                    else:
+                        status = "no_contact"
 
             checked_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
             if progress_detail:
@@ -535,7 +630,8 @@ async def _run(
                        contact_url_checked_at=?,
                        contact_url_ai_verdict=?,
                        contact_url_ai_confidence=?,
-                       contact_url_ai_reason=?
+                       contact_url_ai_reason=?,
+                       contact_url_status=?
                  WHERE id=?
                 """,
                 (
@@ -547,6 +643,7 @@ async def _run(
                     ai_verdict or "",
                     float(ai_confidence or 0.0),
                     ai_reason or "",
+                    status,
                     cid,
                 ),
             )
