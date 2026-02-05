@@ -1,5 +1,5 @@
 # src/company_scraper.py
-import re, urllib.parse, json, os, time, logging, ssl
+import re, urllib.parse, json, os, time, logging, ssl, hashlib
 import asyncio
 import unicodedata
 from collections import deque
@@ -335,6 +335,12 @@ FISCAL_RE = re.compile(
     r"(?:決算(?:月|期|日)?|会計年度|会計期)\s*[:：]?\s*([0-9０-９]{1,2}月(?:末)?|[0-9０-９]{1,2}月期|Q[1-4])",
     re.IGNORECASE,
 )
+EMPLOYEE_RE = re.compile(
+    r"(?:約|およそ)?\s*[0-9０-９]{1,6}\s*(?:名|人)\b"
+)
+EMPLOYEE_RANGE_RE = re.compile(
+    r"[0-9０-９]{1,6}\s*(?:-|〜|～|~)\s*[0-9０-９]{1,6}\s*(?:名|人)?"
+)
 LISTING_KEYWORDS = ("非上場", "未上場", "未公開", "非公開", "上場予定なし")
 FOUNDED_RE = re.compile(
     r"[（(]?(?:設立|創業|創立)\s*[:：]?\s*"
@@ -371,6 +377,7 @@ TABLE_LABEL_MAP = {
         "利益", "営業利益", "経常利益", "純利益", "当期純利益", "営業損益", "経常損益", "税引後利益", "純損益", "損益", "損失", "赤字",
         "営業利益（連結）", "経常利益（連結）", "純利益（連結）"
     ),
+    "employees": ("従業員数", "従業員", "社員数", "職員数", "スタッフ数", "人数"),
     "fiscal_months": ("決算月", "決算期", "決算日", "決算", "会計期", "会計年度", "決算期(年)"),
     "founded_years": ("設立", "創業", "創立", "設立年", "創立年", "創業年"),
     "listing": ("上場区分", "上場", "市場", "上場先", "証券コード", "非上場", "未上場", "コード番号"),
@@ -3687,6 +3694,32 @@ class CompanyScraper:
         self.search_cache[key] = list(result)
         return result
 
+    def _normalize_for_fingerprint(self, html: str, text: str) -> str:
+        if html:
+            s = html
+            s = re.sub(r"<!--.*?-->", " ", s, flags=re.DOTALL)
+            s = re.sub(r"<script\b[^>]*>.*?</script>", " ", s, flags=re.DOTALL | re.IGNORECASE)
+            s = re.sub(r"<style\b[^>]*>.*?</style>", " ", s, flags=re.DOTALL | re.IGNORECASE)
+            s = re.sub(r"<noscript\b[^>]*>.*?</noscript>", " ", s, flags=re.DOTALL | re.IGNORECASE)
+            s = re.sub(r"<iframe\b[^>]*>.*?</iframe>", " ", s, flags=re.DOTALL | re.IGNORECASE)
+            s = re.sub(r"\b20\d{2}[/-]\d{1,2}[/-]\d{1,2}\b", " ", s)
+            s = re.sub(r"\b\d{1,2}:\d{2}(?::\d{2})?\b", " ", s)
+            s = re.sub(r"20\d{2}年\d{1,2}月\d{1,2}日", " ", s)
+            s = re.sub(r"\s+", " ", s).strip()
+            return s
+        s = text or ""
+        s = re.sub(r"\b20\d{2}[/-]\d{1,2}[/-]\d{1,2}\b", " ", s)
+        s = re.sub(r"\b\d{1,2}:\d{2}(?::\d{2})?\b", " ", s)
+        s = re.sub(r"20\d{2}年\d{1,2}月\d{1,2}日", " ", s)
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    def compute_homepage_fingerprint(self, html: str, text: str) -> str:
+        normalized = self._normalize_for_fingerprint(html, text)
+        if not normalized:
+            return ""
+        return hashlib.sha256(normalized.encode("utf-8", errors="ignore")).hexdigest()
+
     # ===== ページ取得（HTTP優先＋ブラウザ再利用） =====
     async def _fetch_http_info(
         self,
@@ -5013,6 +5046,13 @@ class CompanyScraper:
                 return self.looks_like_address(cleaned)
             if field in {"capitals", "revenues", "profits"}:
                 return self._is_amount_like(cleaned)
+            if field == "employees":
+                norm = unicodedata.normalize("NFKC", cleaned).replace(",", "").replace("，", "")
+                if EMPLOYEE_RE.search(norm) or EMPLOYEE_RANGE_RE.search(norm):
+                    return True
+                if re.fullmatch(r"[0-9]{1,6}", norm) and not re.search(r"(年|月|日|年度|期)", norm):
+                    return True
+                return False
             if field == "fiscal_months":
                 return bool(FISCAL_RE.search(cleaned))
             if field == "founded_years":
@@ -5149,6 +5189,7 @@ class CompanyScraper:
         capitals: List[str] = []
         revenues: List[str] = []
         profits: List[str] = []
+        employees: List[str] = []
         fiscal_months: List[str] = []
         founded_years: List[str] = []
 
@@ -5783,6 +5824,10 @@ class CompanyScraper:
                         if self._is_amount_like(raw_value):
                             profits.append(raw_value if not is_table_pair else f"[TABLE]{raw_value}")
                             matched = True
+                    elif field == "employees":
+                        if _is_value_for_field("employees", raw_value):
+                            employees.append(raw_value if not is_table_pair else f"[TABLE]{raw_value}")
+                            matched = True
                     elif field == "fiscal_months":
                         fiscal_months.append(raw_value if not is_table_pair else f"[TABLE]{raw_value}")
                         matched = True
@@ -6015,6 +6060,7 @@ class CompanyScraper:
             "capitals": dedupe(capitals),
             "revenues": dedupe(revenues),
             "profits": dedupe(profits),
+            "employees": dedupe(employees),
             "fiscal_months": dedupe(fiscal_months),
             "founded_years": dedupe(founded_years),
         }

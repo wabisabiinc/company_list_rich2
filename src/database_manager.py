@@ -149,6 +149,11 @@ class DatabaseManager:
                 address_source TEXT,
                 extract_confidence REAL,
                 last_checked_at TEXT,
+                homepage_fingerprint TEXT,
+                homepage_content_length INTEGER,
+                homepage_checked_at TEXT,
+                homepage_check_url TEXT,
+                homepage_check_source TEXT,
                 error_code     TEXT
             )
             """
@@ -222,6 +227,21 @@ class DatabaseManager:
         if "last_checked_at" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN last_checked_at TEXT;")
             cols.add("last_checked_at")
+        if "homepage_fingerprint" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN homepage_fingerprint TEXT;")
+            cols.add("homepage_fingerprint")
+        if "homepage_content_length" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN homepage_content_length INTEGER;")
+            cols.add("homepage_content_length")
+        if "homepage_checked_at" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN homepage_checked_at TEXT;")
+            cols.add("homepage_checked_at")
+        if "homepage_check_url" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN homepage_check_url TEXT;")
+            cols.add("homepage_check_url")
+        if "homepage_check_source" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN homepage_check_source TEXT;")
+            cols.add("homepage_check_source")
         if "reference_homepage" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN reference_homepage TEXT;")
             cols.add("reference_homepage")
@@ -355,6 +375,63 @@ class DatabaseManager:
         if "industry" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN industry TEXT;")
             cols.add("industry")
+        if "industry_major_code" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_major_code TEXT;")
+            cols.add("industry_major_code")
+        if "industry_major" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_major TEXT;")
+            cols.add("industry_major")
+        if "industry_middle_code" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_middle_code TEXT;")
+            cols.add("industry_middle_code")
+        if "industry_middle" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_middle TEXT;")
+            cols.add("industry_middle")
+        if "industry_minor_code" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_minor_code TEXT;")
+            cols.add("industry_minor_code")
+        if "industry_minor" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_minor TEXT;")
+            cols.add("industry_minor")
+        if "industry_minor_item_code" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_minor_item_code TEXT;")
+            cols.add("industry_minor_item_code")
+        if "industry_minor_item" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_minor_item TEXT;")
+            cols.add("industry_minor_item")
+        if "industry_class_source" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_class_source TEXT;")
+            cols.add("industry_class_source")
+        if "industry_class_confidence" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_class_confidence REAL;")
+            cols.add("industry_class_confidence")
+        if "contact_url" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN contact_url TEXT;")
+            cols.add("contact_url")
+        if "contact_url_source" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN contact_url_source TEXT;")
+            cols.add("contact_url_source")
+        if "contact_url_score" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN contact_url_score REAL;")
+            cols.add("contact_url_score")
+        if "contact_url_reason" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN contact_url_reason TEXT;")
+            cols.add("contact_url_reason")
+        if "contact_url_checked_at" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN contact_url_checked_at TEXT;")
+            cols.add("contact_url_checked_at")
+        if "contact_url_ai_verdict" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN contact_url_ai_verdict TEXT;")
+            cols.add("contact_url_ai_verdict")
+        if "contact_url_ai_confidence" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN contact_url_ai_confidence REAL;")
+            cols.add("contact_url_ai_confidence")
+        if "contact_url_ai_reason" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN contact_url_ai_reason TEXT;")
+            cols.add("contact_url_ai_reason")
+        if "contact_url_status" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN contact_url_status TEXT;")
+            cols.add("contact_url_status")
         if "business_tags" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN business_tags TEXT;")
             cols.add("business_tags")
@@ -605,7 +682,9 @@ class DatabaseManager:
                                locked_by=?,
                                locked_at=datetime('now')
                          WHERE id=(SELECT id FROM picked)
-                        RETURNING id, company_name, address, employee_count, homepage, phone, found_address, status, corporate_number, corporate_number_norm
+                        RETURNING id, company_name, address, employee_count, homepage, phone, found_address, status, corporate_number, corporate_number_norm,
+                                  final_homepage, homepage_official_flag, homepage_fingerprint, homepage_content_length, homepage_checked_at,
+                                  homepage_check_url, homepage_check_source
                         """,
                         (st, worker_id),
                     ).fetchone()
@@ -635,6 +714,8 @@ class DatabaseManager:
                         row = cur.execute(
                             """
                             SELECT id, company_name, address, employee_count, homepage, phone, found_address, status, corporate_number, corporate_number_norm
+                                 , final_homepage, homepage_official_flag, homepage_fingerprint, homepage_content_length, homepage_checked_at
+                                 , homepage_check_url, homepage_check_source
                               FROM companies
                              WHERE locked_by=? AND status='running'
                              ORDER BY locked_at DESC, id DESC
@@ -1196,6 +1277,11 @@ class DatabaseManager:
         set_value("fiscal_month", _clean_fiscal_month(company.get("fiscal_month")))
         set_value("founded_year", _clean_founded_year(company.get("founded_year")))
         set_value("reference_homepage", company.get("reference_homepage", "") or "")
+        set_value("homepage_fingerprint", company.get("homepage_fingerprint", "") or "")
+        set_value("homepage_content_length", company.get("homepage_content_length"))
+        set_value("homepage_checked_at", company.get("homepage_checked_at", "") or "")
+        set_value("homepage_check_url", company.get("homepage_check_url", "") or "")
+        set_value("homepage_check_source", company.get("homepage_check_source", "") or "")
         set_value("reference_phone", company.get("reference_phone", "") or "")
         set_value("reference_address", company.get("reference_address", "") or "")
         set_value("accuracy_homepage", company.get("accuracy_homepage", "") or "")
@@ -1227,6 +1313,25 @@ class DatabaseManager:
         set_value("pref_match", company.get("pref_match"))
         set_value("city_match", company.get("city_match"))
         set_value("industry", company.get("industry", "") or "")
+        set_value("industry_major_code", company.get("industry_major_code", "") or "")
+        set_value("industry_major", company.get("industry_major", "") or "")
+        set_value("industry_middle_code", company.get("industry_middle_code", "") or "")
+        set_value("industry_middle", company.get("industry_middle", "") or "")
+        set_value("industry_minor_code", company.get("industry_minor_code", "") or "")
+        set_value("industry_minor", company.get("industry_minor", "") or "")
+        set_value("industry_minor_item_code", company.get("industry_minor_item_code", "") or "")
+        set_value("industry_minor_item", company.get("industry_minor_item", "") or "")
+        set_value("industry_class_source", company.get("industry_class_source", "") or "")
+        set_value("industry_class_confidence", company.get("industry_class_confidence"))
+        set_value("contact_url", company.get("contact_url", "") or "")
+        set_value("contact_url_source", company.get("contact_url_source", "") or "")
+        set_value("contact_url_score", company.get("contact_url_score"))
+        set_value("contact_url_reason", company.get("contact_url_reason", "") or "")
+        set_value("contact_url_checked_at", company.get("contact_url_checked_at", "") or "")
+        set_value("contact_url_ai_verdict", company.get("contact_url_ai_verdict", "") or "")
+        set_value("contact_url_ai_confidence", company.get("contact_url_ai_confidence"))
+        set_value("contact_url_ai_reason", company.get("contact_url_ai_reason", "") or "")
+        set_value("contact_url_status", company.get("contact_url_status", "") or "")
         set_value("business_tags", company.get("business_tags", "") or "")
         set_value("license", company.get("license", "") or "")
         set_value("employees", company.get("employees", "") or "")
@@ -1293,6 +1398,57 @@ class DatabaseManager:
             )
 
         self._csv_written_ids.add(cid)
+
+    def save_update_check_result(
+        self,
+        company_id: int,
+        status: str,
+        homepage_fingerprint: str,
+        homepage_content_length: int,
+        homepage_checked_at: str,
+        homepage_check_url: str,
+        homepage_check_source: str,
+        skip_reason: str,
+    ) -> None:
+        cols = self._schema_columns
+        updates: list[str] = []
+        params: list[Any] = []
+
+        def add_value(column: str, value: Any) -> None:
+            if column not in cols:
+                return
+            updates.append(f"{column} = ?")
+            params.append(value)
+
+        add_value("homepage_fingerprint", homepage_fingerprint)
+        add_value("homepage_content_length", homepage_content_length)
+        add_value("homepage_checked_at", homepage_checked_at)
+        add_value("homepage_check_url", homepage_check_url)
+        add_value("homepage_check_source", homepage_check_source)
+        add_value("skip_reason", skip_reason)
+        if "last_checked_at" in cols:
+            updates.append("last_checked_at = datetime('now')")
+        updates.append("status = ?")
+        params.append(status)
+        if "locked_by" in cols:
+            updates.append("locked_by = NULL")
+        if "locked_at" in cols:
+            updates.append("locked_at = NULL")
+
+        where_clause = "id = ?"
+        where_params: list[Any] = [company_id]
+        if self.worker_id:
+            where_clause += " AND (locked_by IS NULL OR locked_by = ?)"
+            where_params.append(self.worker_id)
+
+        sql = f"UPDATE companies SET {', '.join(updates)} WHERE {where_clause}"
+        params.extend(where_params)
+        self.cur.execute(sql, params)
+        if self.cur.rowcount == 0:
+            self.lock_mismatch_count += 1
+            log.warning("update_check skipped (lock mismatch?) id=%s worker=%s", company_id, self.worker_id)
+            return
+        self._commit_with_checkpoint()
 
     def update_status(self, company_id: int, status: str) -> None:
         sql = "UPDATE companies SET status=?, locked_by=NULL, locked_at=NULL WHERE id=?"

@@ -30,6 +30,7 @@ DEFAULT_MODEL: str = (os.getenv("GEMINI_MODEL") or "gemini-2.5-flash-lite").stri
 AI_CONTEXT_PATH: str = os.getenv("AI_CONTEXT_PATH", "docs/ai_context.md")
 AI_QUALITY_CONTEXT_PATH: str = os.getenv("AI_QUALITY_CONTEXT_PATH", "docs/ai_quality.md")
 AI_CONTACT_FORM_PROMPT_PATH: str = os.getenv("AI_CONTACT_FORM_PROMPT_PATH", "docs/ai_contact_form_prompt.md")
+AI_INDUSTRY_PROMPT_PATH: str = os.getenv("AI_INDUSTRY_PROMPT_PATH", "docs/ai_industry_prompt.md")
 AI_DESCRIPTION_MAX_LEN = int(os.getenv("AI_DESCRIPTION_MAX_LEN", "160"))
 AI_DESCRIPTION_MIN_LEN = int(os.getenv("AI_DESCRIPTION_MIN_LEN", "80"))
 # verify_info / judge_official_homepage で使う description の長さ制約（環境変数で強化可能）。
@@ -318,6 +319,7 @@ class AIVerifier:
         # 追加の品質ルール（任意）。スキーマを含めない前提で、各プロンプト末尾に添付して使う。
         self.quality_context = self._load_quality_context()
         self.contact_form_prompt = self._load_contact_form_prompt()
+        self.industry_prompt = self._load_industry_prompt()
 
         if model is not None:
             self.model = model
@@ -397,6 +399,24 @@ class AIVerifier:
             return content
         except Exception as e:
             log.warning("AIVerifier: failed to load contact form prompt from %s: %s", path, e)
+            return None
+
+    def _load_industry_prompt(self) -> Optional[str]:
+        """
+        docs/ai_industry_prompt.md を業種分類用のプロンプトとして読み込む。
+        """
+        path = AI_INDUSTRY_PROMPT_PATH
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            content = (content or "").strip()
+            if not content:
+                return None
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:8]
+            log.info("AIVerifier: loaded industry prompt from %s (sha256[:8]=%s)", path, digest)
+            return content
+        except Exception as e:
+            log.warning("AIVerifier: failed to load industry prompt from %s: %s", path, e)
             return None
 
     def _with_quality_context(self, prompt: str) -> str:
@@ -1318,5 +1338,35 @@ class AIVerifier:
                 "confidence": confidence,
                 "reason": reason.strip(),
             }
+        except Exception:
+            return None
+
+    async def judge_industry(
+        self,
+        text: str,
+        company_name: str,
+        candidates_text: str,
+    ) -> Optional[Dict[str, Any]]:
+        if not self.model or not self.industry_prompt:
+            return None
+        snippet = (text or "").strip()
+        if len(snippet) > 3500:
+            snippet = snippet[:3500]
+        prompt = (
+            f"{self.industry_prompt}\n\n"
+            f"企業名: {company_name or '不明'}\n"
+            "候補一覧:\n"
+            f"{candidates_text or '（候補なし）'}\n\n"
+            f"本文抜粋:\n{snippet}\n"
+        )
+        try:
+            resp = await self._generate_with_timeout([prompt])
+            if resp is None:
+                return None
+            raw = _resp_text(resp)
+            data = _extract_first_json(raw)
+            if not isinstance(data, dict):
+                return None
+            return data
         except Exception:
             return None

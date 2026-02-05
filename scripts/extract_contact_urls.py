@@ -537,6 +537,9 @@ async def _run(
     progress: bool,
     progress_detail: bool,
     company_timeout_sec: int,
+    retry_max: int,
+    status_in: str,
+    reprocess_recommended: bool,
 ) -> None:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -545,7 +548,28 @@ async def _run(
         _update_homepages_from_csv(conn, csv_path, force_homepage)
 
     where = "TRIM(IFNULL(final_homepage,''))<>''"
-    if not force:
+    if reprocess_recommended:
+        reason_like = (
+            "contact_url_ai_reason LIKE '%404%' OR "
+            "contact_url_ai_reason LIKE '%見つかりません%' OR "
+            "contact_url_ai_reason LIKE '%エラー%' OR "
+            "contact_url_ai_reason LIKE '%redirect%' OR "
+            "contact_url_reason LIKE '%404%' OR "
+            "contact_url_reason LIKE '%error%' OR "
+            "contact_url_reason LIKE '%redirect%'"
+        )
+        where += (
+            " AND (contact_url_status IN ('timeout','ai_unsure') "
+            f"OR (contact_url_status='ai_not_official' AND ({reason_like})))"
+        )
+        where += " AND (contact_url IS NULL OR TRIM(contact_url)='')"
+    elif status_in:
+        status_list = [s.strip() for s in status_in.split(",") if s.strip()]
+        if status_list:
+            quoted = ",".join([f"'{s}'" for s in status_list])
+            where += f" AND contact_url_status IN ({quoted})"
+            where += " AND (contact_url IS NULL OR TRIM(contact_url)='')"
+    elif not force:
         where += " AND (contact_url_status IS NULL OR TRIM(contact_url_status)='')"
     limit_sql = f" LIMIT {limit}" if limit > 0 else ""
     rows = conn.execute(
@@ -608,30 +632,37 @@ async def _run(
                         url = ""
                 return url, score, source, reason, ai_verdict, ai_confidence, ai_reason
 
-            try:
-                url, score, source, reason, ai_verdict, ai_confidence, ai_reason = await asyncio.wait_for(
-                    _process_company(),
-                    timeout=max(1, int(company_timeout_sec)),
-                )
-            except asyncio.TimeoutError:
-                url = ""
-                score = 0.0
-                source = "timeout"
-                reason = "company_timeout"
-                ai_verdict = ""
-                ai_confidence = 0.0
-                ai_reason = ""
-                status = "timeout"
-            else:
-                if url:
-                    status = "success"
+            attempt = 0
+            while True:
+                try:
+                    url, score, source, reason, ai_verdict, ai_confidence, ai_reason = await asyncio.wait_for(
+                        _process_company(),
+                        timeout=max(1, int(company_timeout_sec)),
+                    )
+                except asyncio.TimeoutError:
+                    if attempt < retry_max:
+                        attempt += 1
+                        await asyncio.sleep(1)
+                        continue
+                    url = ""
+                    score = 0.0
+                    source = "timeout"
+                    reason = "company_timeout"
+                    ai_verdict = ""
+                    ai_confidence = 0.0
+                    ai_reason = ""
+                    status = "timeout"
                 else:
-                    if ai_verdict == "not_official":
-                        status = "ai_not_official"
-                    elif ai_verdict == "unsure":
-                        status = "ai_unsure"
+                    if url:
+                        status = "success"
                     else:
-                        status = "no_contact"
+                        if ai_verdict == "not_official":
+                            status = "ai_not_official"
+                        elif ai_verdict == "unsure":
+                            status = "ai_unsure"
+                        else:
+                            status = "no_contact"
+                break
 
             checked_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
             if progress_detail:
@@ -695,6 +726,13 @@ def main() -> None:
     ap.add_argument("--progress", action="store_true", help="Print progress per company")
     ap.add_argument("--progress-detail", action="store_true", help="Print result details per company in Japanese")
     ap.add_argument("--company-timeout-sec", type=int, default=COMPANY_TIMEOUT_SEC_DEFAULT, help="Per-company timeout in seconds")
+    ap.add_argument("--retry-max", type=int, default=0, help="Max retry count per company on timeout")
+    ap.add_argument("--status-in", default="", help="Comma-separated contact_url_status values to reprocess")
+    ap.add_argument(
+        "--reprocess-recommended",
+        action="store_true",
+        help="Reprocess timeout/ai_unsure and ai_not_official with 404/redirect/error reasons",
+    )
     args = ap.parse_args()
 
     asyncio.run(
@@ -710,6 +748,9 @@ def main() -> None:
             args.progress,
             args.progress_detail,
             args.company_timeout_sec,
+            args.retry_max,
+            args.status_in,
+            args.reprocess_recommended,
         )
     )
 

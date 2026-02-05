@@ -49,11 +49,51 @@ VS Code のターミナルから自動的に `.venv` を読み込むには、プ
 - 仮想環境を有効化した状態で `python main.py` を実行すると `.env` を読み込んでスクレイピングが進む状態になります。
 - 仮想環境を破棄したくなったら `.venv` フォルダを削除し、再度 `python3 -m venv .venv` からやり直してください。
 
-## 5. 複数台PCで並列に処理する（推奨: DB をコピーして ID 範囲を固定）
+## 5. 自動更新（更新検知で変化がある時だけ再取得）
+
+更新検知は **前回のホームページ内容と差分が無い場合のみスキップ** されます。初回はフィンガープリントが無いので通常どおり取得されます。
+
+### 5-1. まず1回だけ実行（初回のフィンガープリント作成）
+
+```bash
+source .venv/bin/activate
+python main.py
+```
+
+### 5-2. 自動更新用スクリプトを実行（以降はこれだけ）
+
+Linux/WSL:
+
+```bash
+./scripts/run_auto_update.sh
+```
+
+Windows（PowerShell）:
+
+```powershell
+.\scripts\run_auto_update.ps1
+```
+
+### 5-3. 定期実行の例（cron）
+
+毎週月曜の深夜3時に自動更新:
+
+```bash
+0 3 * * 1 cd /home/info_wbisbi_co_jp/projects/company_list_rich && ./scripts/run_auto_update.sh >> logs/auto_update.log 2>&1
+```
+
+### 5-4. 主要な環境変数（必要なら .env で調整）
+
+- `UPDATE_CHECK_ENABLED=true`（更新検知を有効化）
+- `UPDATE_CHECK_FINAL_ONLY=true`（`final_homepage` のみ対象）
+- `UPDATE_CHECK_TIMEOUT_MS=2500`（軽量取得のタイムアウト）
+- `UPDATE_CHECK_ALLOW_SLOW=false`（遅いホストは軽量取得でスキップ）
+
+## 6. 複数台PCで並列に処理する（推奨: DB をコピーして ID 範囲を固定）
 
 SQLite は「同一ファイルを複数PCからネットワーク共有で同時更新」するとロック/破損リスクがあるため、基本は **各PCで `data/companies.db` をローカルに持って処理**し、最後に **成果だけをマージ**する運用を推奨します。
 
-### 5-1. 各PC共通: リポジトリを用意して起動できる状態にする
+### 6-1. 各PC共通: リポジトリを用意して起動できる状態にする
 
 1) リポジトリを取得（例）
 
@@ -80,14 +120,14 @@ cp .env.example .env
 
 `.env` の `GEMINI_API_KEY` を設定してください（運用上は「PC/ユーザーごとに別キー」を推奨。共有すると漏洩時の影響が大きくなります）。必要に応じて `DATABASE_URL` なども調整します。
 
-### 5-2. マスターPC: DB を分配する
+### 6-2. マスターPC: DB を分配する
 
 1) マスター側で最新の `data/companies.db` を確定（取り込み・整形がある場合は先に済ませる）
 2) 各ワーカーPCへ `data/companies.db` をコピーします（例: USB / 社内共有 / `scp` など）
 
 ワーカー側は `company_list_rich/data/companies.db` が存在する状態にしてください。
 
-### 5-3. 分担範囲を決める（ID_MIN / ID_MAX）
+### 6-3. 分担範囲を決める（ID_MIN / ID_MAX）
 
 マスターPCで `companies` の最大IDを確認します。
 
@@ -103,7 +143,7 @@ sqlite3 data/companies.db "select max(id) from companies;"
 
 ※ 実際の `max(id)` に合わせて調整してください。
 
-### 5-4. ワーカーPC: 自分の範囲だけ処理して走らせる
+### 6-4. ワーカーPC: 自分の範囲だけ処理して走らせる
 
 1) venv を有効化
 
@@ -146,7 +186,7 @@ WORKER_ID=pc1 ID_MIN=1 ID_MAX=25000 FETCH_CONCURRENCY=4 \
 tail -f logs/pc1.log
 ```
 
-### 5-5. マスターPC: ワーカーの DB をマージする（処理完了後）
+### 6-5. マスターPC: ワーカーの DB をマージする（処理完了後）
 
 前提: 各PCが **自分の割り当て範囲だけ**を処理し、その範囲が他PCと重複していないこと。
 

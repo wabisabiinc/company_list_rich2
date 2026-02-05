@@ -7,6 +7,7 @@ import json
 import re
 import random
 import time
+import datetime as dt
 import html as html_mod
 import threading
 import unicodedata
@@ -31,6 +32,8 @@ from src.ai_verifier import (
     _normalize_amount as ai_normalize_amount,
 )
 from src.homepage_policy import apply_provisional_homepage_policy
+from src.industry_classifier import IndustryClassifier
+from scripts.extract_contact_urls import _pick_contact_url, _build_ai_signals, AI_MIN_CONFIDENCE_DEFAULT
 from src.reference_checker import ReferenceChecker
 from src.jp_number import normalize_kanji_numbers
 
@@ -154,6 +157,14 @@ AI_VERIFY_MIN_CONFIDENCE = float(os.getenv("AI_VERIFY_MIN_CONFIDENCE", "0.65"))
 # 低confidenceのAI判定は誤爆しやすいので、一定以上のみハードに扱う（それ未満は再評価対象）。
 AI_SKIP_NEGATIVE_FLAG_MIN_CONFIDENCE = float(os.getenv("AI_SKIP_NEGATIVE_FLAG_MIN_CONFIDENCE", "0.85"))
 AI_CLEAR_NEGATIVE_FLAGS = os.getenv("AI_CLEAR_NEGATIVE_FLAGS", "false").lower() == "true"
+INDUSTRY_CLASSIFY_ENABLED = os.getenv("INDUSTRY_CLASSIFY_ENABLED", "true").lower() == "true"
+INDUSTRY_RULE_MIN_SCORE = max(1, int(os.getenv("INDUSTRY_RULE_MIN_SCORE", "2")))
+INDUSTRY_AI_ENABLED = os.getenv("INDUSTRY_AI_ENABLED", "true").lower() == "true"
+INDUSTRY_AI_TOP_N = max(5, int(os.getenv("INDUSTRY_AI_TOP_N", "12")))
+CONTACT_URL_IN_MAIN = os.getenv("CONTACT_URL_IN_MAIN", "true").lower() == "true"
+CONTACT_URL_FORCE = os.getenv("CONTACT_URL_FORCE", "false").lower() == "true"
+CONTACT_URL_AI_ENABLED = os.getenv("CONTACT_URL_AI_ENABLED", "true").lower() == "true"
+CONTACT_URL_AI_MIN_CONFIDENCE = float(os.getenv("CONTACT_URL_AI_MIN_CONFIDENCE", str(AI_MIN_CONFIDENCE_DEFAULT)))
 
 # 暫定URL（provisional_*）を homepage として保存するかどうか。
 # - false の場合でも provisional_homepage/final_homepage には記録する。
@@ -162,6 +173,11 @@ SAVE_PROVISIONAL_HOMEPAGE = os.getenv("SAVE_PROVISIONAL_HOMEPAGE", "false").lowe
 APPLY_PROVISIONAL_HOMEPAGE_POLICY = os.getenv("APPLY_PROVISIONAL_HOMEPAGE_POLICY", "true").lower() == "true"
 # official 判定できない場合、homepage を空欄にする（誤保存を防ぐ。既定: true）
 REQUIRE_OFFICIAL_HOMEPAGE = os.getenv("REQUIRE_OFFICIAL_HOMEPAGE", "true").lower() == "true"
+# 公式サイトの更新チェック（差分が無ければ本クロールをスキップ）
+UPDATE_CHECK_ENABLED = os.getenv("UPDATE_CHECK_ENABLED", "true").lower() == "true"
+UPDATE_CHECK_TIMEOUT_MS = int(os.getenv("UPDATE_CHECK_TIMEOUT_MS", "2500"))
+UPDATE_CHECK_ALLOW_SLOW = os.getenv("UPDATE_CHECK_ALLOW_SLOW", "false").lower() == "true"
+UPDATE_CHECK_FINAL_ONLY = os.getenv("UPDATE_CHECK_FINAL_ONLY", "true").lower() == "true"
 # directory_like を強く疑う場合のハード拒否閾値（既定: 9）
 DIRECTORY_HARD_REJECT_SCORE = int(os.getenv("DIRECTORY_HARD_REJECT_SCORE", "9"))
 DEFAULT_TIME_LIMIT_FETCH_ONLY = TIME_LIMIT_FETCH_ONLY
@@ -205,6 +221,8 @@ if REFERENCE_CSVS:
     except Exception:
         log.exception("Reference data loading failed")
 
+INDUSTRY_CLASSIFIER = IndustryClassifier()
+
 ZIP_CODE_RE = re.compile(r"(\d{3}-\d{4})")
 JAPANESE_RE = re.compile(r"[ぁ-んァ-ン一-龥]")
 MOJIBAKE_LATIN_RE = re.compile(r"[ÃÂãâæçïðñöøûüÿ]")
@@ -222,6 +240,8 @@ ADDRESS_FORM_NOISE_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+EMPLOYEE_VALUE_RE = re.compile(r"(約|およそ)?\s*([0-9０-９]{1,6})\s*(?:名|人)\b")
+EMPLOYEE_RANGE_RE = re.compile(r"([0-9０-９]{1,6})\s*(?:-|〜|～|~)\s*([0-9０-９]{1,6})\s*(?:名|人)?")
 KANJI_TOKEN_RE = re.compile(r"[一-龥]{2,}")
 LISTING_ALLOWED_KEYWORDS = [
     "上場", "未上場", "非上場", "東証", "名証", "札証", "福証", "JASDAQ",
@@ -1616,6 +1636,56 @@ def clean_amount_value(val: str) -> str:
     return text
 
 
+def clean_employee_value(val: str) -> str:
+    raw = unicodedata.normalize("NFKC", (val or "").strip())
+    if not raw:
+        return ""
+    raw = raw.replace(",", "").replace("，", "")
+    range_m = EMPLOYEE_RANGE_RE.search(raw)
+    if range_m:
+        a = range_m.group(1)
+        b = range_m.group(2)
+        if a and b:
+            return f"{a}-{b}名"
+    m = EMPLOYEE_VALUE_RE.search(raw)
+    if m:
+        prefix = m.group(1) or ""
+        num = m.group(2)
+        if num:
+            return f"{prefix}{num}名"
+    if re.fullmatch(r"[0-9]{1,6}", raw) and not re.search(r"(年|月|日|年度|期)", raw):
+        return f"{raw}名"
+    return ""
+
+
+def pick_best_employee(candidates: list[str]) -> str | None:
+    best = None
+    best_score = float("-inf")
+    for cand in candidates or []:
+        if not cand:
+            continue
+        is_table = False
+        value = str(cand)
+        if value.startswith("[TABLE]"):
+            is_table = True
+            value = value.replace("[TABLE]", "", 1)
+        cleaned = clean_employee_value(value)
+        if not cleaned:
+            continue
+        score = 0.0
+        if is_table:
+            score += 3.0
+        if "約" in cleaned:
+            score -= 0.2
+        if "-" in cleaned:
+            score -= 0.3
+        score += min(len(cleaned), 10) * 0.1
+        if score > best_score:
+            best_score = score
+            best = cleaned
+    return best
+
+
 def _truncate_description(text: str) -> str:
     if len(text) <= DESCRIPTION_MAX_LEN:
         return text
@@ -2345,6 +2415,78 @@ def jittered_seconds(base: float, ratio: float) -> float:
     high = base * (1.0 + ratio)
     return random.uniform(low, high)
 
+def _now_utc_str() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+
+def _pick_update_check_url(company: Dict[str, Any]) -> tuple[str, str]:
+    final_homepage = (company.get("final_homepage") or "").strip()
+    if final_homepage:
+        return final_homepage, "final_homepage"
+    if UPDATE_CHECK_FINAL_ONLY:
+        return "", ""
+    homepage = (company.get("homepage") or "").strip()
+    if homepage and int(company.get("homepage_official_flag") or 0) == 1:
+        return homepage, "homepage"
+    return "", ""
+
+async def maybe_skip_if_unchanged(
+    company: Dict[str, Any],
+    scraper: CompanyScraper,
+    manager: DatabaseManager,
+) -> bool:
+    if not UPDATE_CHECK_ENABLED:
+        return False
+    url, url_source = _pick_update_check_url(company)
+    if not url:
+        return False
+    prev_url = (company.get("homepage_check_url") or "").strip()
+    try:
+        info = await scraper._fetch_http_info(  # type: ignore[attr-defined]
+            url,
+            timeout_ms=UPDATE_CHECK_TIMEOUT_MS,
+            allow_slow=UPDATE_CHECK_ALLOW_SLOW,
+        )
+    except Exception:
+        return False
+    html = info.get("html") or ""
+    text = info.get("text") or ""
+    if not (html or text):
+        return False
+    fingerprint = scraper.compute_homepage_fingerprint(html, text)
+    if not fingerprint:
+        return False
+    now_str = _now_utc_str()
+    content_length = len(html or text)
+    prev_fp = (company.get("homepage_fingerprint") or "").strip()
+    if not prev_fp:
+        company["homepage_check_url"] = url
+        company["homepage_checked_at"] = now_str
+        company["homepage_content_length"] = content_length
+        company["homepage_fingerprint"] = fingerprint
+        company["homepage_check_source"] = url_source
+        return False
+    url_matches = (not prev_url) or (prev_url == url)
+    unchanged = bool(url_matches and prev_fp == fingerprint)
+    if not unchanged:
+        company["homepage_check_url"] = url
+        company["homepage_checked_at"] = now_str
+        company["homepage_content_length"] = content_length
+        company["homepage_fingerprint"] = fingerprint
+        company["homepage_check_source"] = url_source
+        return False
+    manager.save_update_check_result(
+        company_id=int(company.get("id") or 0),
+        status="done",
+        homepage_fingerprint=fingerprint,
+        homepage_content_length=content_length,
+        homepage_checked_at=now_str,
+        homepage_check_url=url,
+        homepage_check_source=url_source,
+        skip_reason="homepage_unchanged",
+    )
+    log.info("[skip] homepage unchanged -> done (id=%s url=%s)", company.get("id"), url)
+    return True
+
 # --------------------------------------------------
 # メイン処理（ワーカー）
 # --------------------------------------------------
@@ -2438,6 +2580,10 @@ async def process():
             if should_skip_company(name):
                 log.info("[skip] 法人でない名称のためスキップ: id=%s name=%s", cid, name)
                 manager.update_status(cid, "skipped")
+                continue
+
+            if await maybe_skip_if_unchanged(company, scraper, manager):
+                processed += 1
                 continue
 
             log.info("[%s] %s の処理開始 (worker=%s)", cid, name, WORKER_ID)
@@ -2558,6 +2704,7 @@ async def process():
             revenue_val = clean_amount_value(company.get("revenue") or "")
             profit_val = clean_amount_value(company.get("profit") or "")
             capital_val = clean_amount_value(company.get("capital") or "")
+            employees_val = clean_employee_value(company.get("employees") or "")
             fiscal_val = clean_fiscal_month(company.get("fiscal_month") or "")
             founded_val = clean_founded_year(company.get("founded_year") or "")
             phone_source = company.get("phone_source", "") or "none"
@@ -2599,6 +2746,7 @@ async def process():
                         "revenue": revenue_val or "",
                         "profit": profit_val or "",
                         "capital": capital_val or "",
+                        "employees": employees_val or "",
                         "fiscal_month": fiscal_val or "",
                         "founded_year": founded_val or "",
                         "phone_source": phone_source or "",
@@ -4208,6 +4356,24 @@ async def process():
                     revenue_val = clean_amount_value(company.get("revenue") or "")
                     profit_val = clean_amount_value(company.get("profit") or "")
                     capital_val = clean_amount_value(company.get("capital") or "")
+                    employees_val = clean_employee_value(company.get("employees") or "")
+                    industry_major = (company.get("industry_major") or "").strip()
+                    industry_middle = (company.get("industry_middle") or "").strip()
+                    industry_minor = (company.get("industry_minor") or "").strip()
+                    industry_major_code = ""
+                    industry_middle_code = ""
+                    industry_minor_code = ""
+                    industry_class_source = ""
+                    industry_class_confidence = 0.0
+                    contact_url = (company.get("contact_url") or "").strip()
+                    contact_url_source = (company.get("contact_url_source") or "").strip()
+                    contact_url_score = float(company.get("contact_url_score") or 0.0)
+                    contact_url_reason = (company.get("contact_url_reason") or "").strip()
+                    contact_url_checked_at = (company.get("contact_url_checked_at") or "").strip()
+                    contact_url_ai_verdict = (company.get("contact_url_ai_verdict") or "").strip()
+                    contact_url_ai_confidence = float(company.get("contact_url_ai_confidence") or 0.0)
+                    contact_url_ai_reason = (company.get("contact_url_ai_reason") or "").strip()
+                    contact_url_status = (company.get("contact_url_status") or "").strip()
                     fiscal_val = clean_fiscal_month(company.get("fiscal_month") or "")
                     founded_val = clean_founded_year(company.get("founded_year") or "")
                     phone_source = "none"
@@ -4219,6 +4385,26 @@ async def process():
                     company.setdefault("revenue", revenue_val)
                     company.setdefault("profit", profit_val)
                     company.setdefault("capital", capital_val)
+                    company.setdefault("employees", employees_val)
+                    company.setdefault("industry_major", industry_major)
+                    company.setdefault("industry_middle", industry_middle)
+                    company.setdefault("industry_minor", industry_minor)
+                    company.setdefault("industry_major_code", industry_major_code)
+                    company.setdefault("industry_middle_code", industry_middle_code)
+                    company.setdefault("industry_minor_code", industry_minor_code)
+                    company.setdefault("industry_class_source", industry_class_source)
+                    company.setdefault("industry_class_confidence", industry_class_confidence)
+                    company.setdefault("industry_minor_item_code", "")
+                    company.setdefault("industry_minor_item", "")
+                    company.setdefault("contact_url", contact_url)
+                    company.setdefault("contact_url_source", contact_url_source)
+                    company.setdefault("contact_url_score", contact_url_score)
+                    company.setdefault("contact_url_reason", contact_url_reason)
+                    company.setdefault("contact_url_checked_at", contact_url_checked_at)
+                    company.setdefault("contact_url_ai_verdict", contact_url_ai_verdict)
+                    company.setdefault("contact_url_ai_confidence", contact_url_ai_confidence)
+                    company.setdefault("contact_url_ai_reason", contact_url_ai_reason)
+                    company.setdefault("contact_url_status", contact_url_status)
                     company.setdefault("fiscal_month", fiscal_val)
                     company.setdefault("founded_year", founded_val)
                     src_phone = ""
@@ -4282,6 +4468,7 @@ async def process():
                         nonlocal capital_val, need_capital
                         nonlocal revenue_val, need_revenue
                         nonlocal profit_val, need_profit
+                        nonlocal employees_val
                         nonlocal fiscal_val, need_fiscal
                         nonlocal founded_val, need_founded
                         nonlocal description_val, need_description
@@ -4369,6 +4556,10 @@ async def process():
                             if candidate and (not profit_val or len(candidate) > len(profit_val)):
                                 profit_val = candidate
                                 need_profit = False
+                        if cc.get("employees"):
+                            candidate = pick_best_employee(cc["employees"])
+                            if candidate and not employees_val:
+                                employees_val = candidate
                         if cc.get("fiscal_months"):
                             cleaned_fiscal = clean_fiscal_month(cc["fiscal_months"][0] or "")
                             if cleaned_fiscal and not fiscal_val:
@@ -4670,6 +4861,7 @@ async def process():
                         capitals = cands.get("capitals") or []
                         revenues = cands.get("revenues") or []
                         profits = cands.get("profits") or []
+                        employees = cands.get("employees") or []
                         fiscals = cands.get("fiscal_months") or []
                         founded_years = cands.get("founded_years") or []
 
@@ -4732,6 +4924,10 @@ async def process():
                             candidate = pick_best_amount(profits)
                             if candidate:
                                 profit_val = candidate
+                        if employees and not employees_val:
+                            candidate = pick_best_employee(employees)
+                            if candidate:
+                                employees_val = candidate
                         if fiscals and not fiscal_val:
                             cleaned_fiscal = clean_fiscal_month(fiscals[0] or "")
                             if cleaned_fiscal:
@@ -5966,10 +6162,188 @@ async def process():
                         description_val = clean_description_value(sanitize_text_block(description_val))
                         if description_val and len(description_val) > FINAL_DESCRIPTION_MAX_LEN:
                             description_val = _truncate_final_description(description_val, max_len=FINAL_DESCRIPTION_MAX_LEN)
+
+                        # ---- 業種（大/中/小分類）判定（ルール→AI） ----
+                        if INDUSTRY_CLASSIFY_ENABLED and INDUSTRY_CLASSIFIER.loaded:
+                            blocks = _collect_business_text_blocks(payloads_for_desc)
+                            if description_val:
+                                blocks.append(description_val)
+                            if industry_val:
+                                blocks.append(industry_val)
+                            if business_tags_val:
+                                try:
+                                    if business_tags_val.strip().startswith("["):
+                                        tags = json.loads(business_tags_val)
+                                        if isinstance(tags, list):
+                                            blocks.extend([str(t) for t in tags if t])
+                                    else:
+                                        blocks.append(business_tags_val)
+                                except Exception:
+                                    blocks.append(business_tags_val)
+                            industry_result = INDUSTRY_CLASSIFIER.rule_classify(
+                                blocks,
+                                min_score=INDUSTRY_RULE_MIN_SCORE,
+                            )
+                            if (
+                                (not industry_result)
+                                and INDUSTRY_AI_ENABLED
+                                and verifier is not None
+                                and hasattr(verifier, "judge_industry")
+                                and getattr(verifier, "industry_prompt", None)
+                                and has_time_for_ai()
+                            ):
+                                candidates = INDUSTRY_CLASSIFIER.build_ai_candidates(blocks, top_n=INDUSTRY_AI_TOP_N)
+                                if candidates:
+                                    cand_key_map = {
+                                        (c.get("major_code"), c.get("middle_code"), c.get("minor_code")): c
+                                        for c in candidates
+                                    }
+                                    try:
+                                        ai_res = await asyncio.wait_for(
+                                            verifier.judge_industry(
+                                                text="\\n".join(blocks),
+                                                company_name=name,
+                                                candidates_text=INDUSTRY_CLASSIFIER.format_candidates_text(candidates),
+                                            ),
+                                            timeout=clamp_timeout(ai_call_timeout),
+                                        )
+                                    except Exception:
+                                        ai_res = None
+                                    if isinstance(ai_res, dict):
+                                        maj = str(ai_res.get("major_code") or "").strip()
+                                        mid = str(ai_res.get("middle_code") or "").strip()
+                                        mino = str(ai_res.get("minor_code") or "").strip()
+                                        key = (maj, mid, mino)
+                                        if key in cand_key_map:
+                                            try:
+                                                conf = float(ai_res.get("confidence") or 0.0)
+                                            except Exception:
+                                                conf = 0.0
+                                            conf = max(0.0, min(1.0, conf))
+                                            picked = cand_key_map[key]
+                                            industry_result = {
+                                                "major_code": maj,
+                                                "major_name": picked.get("major_name", ""),
+                                                "middle_code": mid,
+                                                "middle_name": picked.get("middle_name", ""),
+                                                "minor_code": mino,
+                                                "minor_name": picked.get("minor_name", ""),
+                                                "confidence": conf,
+                                                "source": "ai",
+                                            }
+
+                            if industry_result:
+                                # If AI returns detail code, map to minor representative
+                                minor_item_code = ""
+                                minor_item_name = ""
+                                minor_code_raw = str(industry_result.get("minor_code") or "").strip()
+                                if minor_code_raw and minor_code_raw in INDUSTRY_CLASSIFIER.taxonomy.detail_names:
+                                    (
+                                        major_code,
+                                        major_name,
+                                        middle_code,
+                                        middle_name,
+                                        minor_code,
+                                        minor_name,
+                                        detail_code,
+                                        detail_name,
+                                    ) = INDUSTRY_CLASSIFIER.taxonomy.resolve_detail_hierarchy(minor_code_raw)
+                                    if major_name:
+                                        industry_major = major_name
+                                    if middle_name:
+                                        industry_middle = middle_name
+                                    if minor_name:
+                                        industry_minor = minor_name
+                                    if major_code:
+                                        industry_major_code = major_code
+                                    if middle_code:
+                                        industry_middle_code = middle_code
+                                    if minor_code:
+                                        industry_minor_code = minor_code
+                                    minor_item_code = detail_code
+                                    minor_item_name = detail_name
+                                else:
+                                    industry_major = industry_result.get("major_name", "") or industry_major
+                                    industry_middle = industry_result.get("middle_name", "") or industry_middle
+                                    industry_minor = industry_result.get("minor_name", "") or industry_minor
+                                    industry_major_code = industry_result.get("major_code", "") or industry_major_code
+                                    industry_middle_code = industry_result.get("middle_code", "") or industry_middle_code
+                                    industry_minor_code = industry_result.get("minor_code", "") or industry_minor_code
+                                if minor_item_code:
+                                    company["industry_minor_item_code"] = minor_item_code
+                                    company["industry_minor_item"] = minor_item_name
+                                industry_class_source = industry_result.get("source", "") or industry_class_source
+                                try:
+                                    industry_class_confidence = float(industry_result.get("confidence") or industry_class_confidence)
+                                except Exception:
+                                    pass
+
+                        # ---- お問い合わせURL（同一ステップで判定→保存） ----
+                        if CONTACT_URL_IN_MAIN and homepage and (CONTACT_URL_FORCE or not contact_url):
+                            try:
+                                url, score, source, reason = await _pick_contact_url(scraper, homepage)
+                                ai_verdict = ""
+                                ai_conf = 0.0
+                                ai_reason = ""
+                                if url and CONTACT_URL_AI_ENABLED and verifier is not None and verifier.model and verifier.contact_form_prompt:
+                                    try:
+                                        page = await scraper.get_page_info(url, allow_slow=False)
+                                        text = page.get("text", "") or ""
+                                        html = page.get("html", "") or ""
+                                        signals = _build_ai_signals(homepage, url, html)
+                                        ai_result = await verifier.judge_contact_form(
+                                            text=text,
+                                            company_name=name,
+                                            homepage=homepage,
+                                            url=url,
+                                            signals=signals,
+                                        )
+                                    except Exception:
+                                        ai_result = None
+                                    if ai_result:
+                                        verdict_val = ai_result.get("is_official_contact_form")
+                                        ai_conf = float(ai_result.get("confidence") or 0.0)
+                                        ai_reason = str(ai_result.get("reason") or "")
+                                        if verdict_val is True and ai_conf >= CONTACT_URL_AI_MIN_CONFIDENCE:
+                                            ai_verdict = "official"
+                                        elif verdict_val is False:
+                                            ai_verdict = "not_official"
+                                        else:
+                                            ai_verdict = "unsure"
+                                    else:
+                                        ai_verdict = "unsure"
+                                        ai_reason = "ai_no_result"
+
+                                    if ai_verdict != "official":
+                                        reason = f"{reason};ai:{ai_verdict}"
+                                        url = ""
+
+                                if url:
+                                    status = "success"
+                                else:
+                                    if ai_verdict == "not_official":
+                                        status = "ai_not_official"
+                                    elif ai_verdict == "unsure":
+                                        status = "ai_unsure"
+                                    else:
+                                        status = "no_contact"
+
+                                contact_url = url or ""
+                                contact_url_source = source or ""
+                                contact_url_score = float(score or 0.0)
+                                contact_url_reason = reason or ""
+                                contact_url_ai_verdict = ai_verdict or ""
+                                contact_url_ai_confidence = float(ai_conf or 0.0)
+                                contact_url_ai_reason = ai_reason or ""
+                                contact_url_status = status
+                                contact_url_checked_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+                            except Exception:
+                                pass
                         listing_val = clean_listing_value(listing_val)
                         capital_val = ai_normalize_amount(capital_val) or clean_amount_value(capital_val)
                         revenue_val = ai_normalize_amount(revenue_val) or clean_amount_value(revenue_val)
                         profit_val = ai_normalize_amount(profit_val) or clean_amount_value(profit_val)
+                        employees_val = clean_employee_value(employees_val)
                         fiscal_val = clean_fiscal_month(fiscal_val)
                         founded_val = clean_founded_year(founded_val)
                         homepage = clean_homepage_url(homepage)
@@ -6014,11 +6388,29 @@ async def process():
                             "rep_name": rep_name_val,
                             "description": description_val,
                             "industry": industry_val,
+                            "industry_major_code": industry_major_code,
+                            "industry_major": industry_major,
+                            "industry_middle_code": industry_middle_code,
+                            "industry_middle": industry_middle,
+                            "industry_minor_code": industry_minor_code,
+                            "industry_minor": industry_minor,
+                            "industry_class_source": industry_class_source,
+                            "industry_class_confidence": industry_class_confidence,
+                            "contact_url": contact_url,
+                            "contact_url_source": contact_url_source,
+                            "contact_url_score": contact_url_score,
+                            "contact_url_reason": contact_url_reason,
+                            "contact_url_checked_at": contact_url_checked_at,
+                            "contact_url_ai_verdict": contact_url_ai_verdict,
+                            "contact_url_ai_confidence": contact_url_ai_confidence,
+                            "contact_url_ai_reason": contact_url_ai_reason,
+                            "contact_url_status": contact_url_status,
                             "business_tags": business_tags_val,
                             "listing": listing_val,
                             "revenue": revenue_val,
                             "profit": profit_val,
                             "capital": capital_val,
+                            "employees": employees_val,
                             "fiscal_month": fiscal_val,
                             "founded_year": founded_val,
                             "phone_source": phone_source,
