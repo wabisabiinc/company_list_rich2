@@ -6079,12 +6079,8 @@ async def process():
                                 ai_used = 1
                                 if not ai_model:
                                     ai_model = AI_MODEL_NAME or ""
-                                industry_hint = (company.get("industry") or "").strip()
-                                if not industry_hint:
-                                    inferred, _ = infer_industry_and_business_tags(blocks)
-                                    industry_hint = inferred or ""
                                 generated = await asyncio.wait_for(
-                                    verifier.generate_description(desc_text, shot, name, addr_raw, industry_hint=industry_hint),
+                                    verifier.generate_description(desc_text, shot, name, addr_raw, industry_hint=""),
                                     timeout=clamp_timeout(ai_call_timeout),
                                 )
                                 apply_ai_description(generated)
@@ -6119,12 +6115,8 @@ async def process():
                                 except Exception:
                                     shot = b""
                                 prev_desc = description_val
-                                industry_hint = (company.get("industry") or "").strip()
-                                if not industry_hint:
-                                    inferred, _ = infer_industry_and_business_tags(blocks)
-                                    industry_hint = inferred or ""
                                 generated = await asyncio.wait_for(
-                                    verifier.generate_description(desc_text, shot, name, addr_raw, industry_hint=industry_hint),
+                                    verifier.generate_description(desc_text, shot, name, addr_raw, industry_hint=""),
                                     timeout=clamp_timeout(ai_call_timeout),
                                 )
                                 apply_ai_description(generated)
@@ -6157,8 +6149,7 @@ async def process():
                                     business_tags_val = ""
                             elif not business_tags_val:
                                 business_tags_val = ""
-                        # description は「何をしているどの会社か」が分かる形に整形（会社名/業種を補う）
-                        description_val = _ensure_name_industry_in_description(description_val, name, industry_val)
+                        # description を整形（業種の付与はAI判定後に実施）
                         description_val = clean_description_value(sanitize_text_block(description_val))
                         if description_val and len(description_val) > FINAL_DESCRIPTION_MAX_LEN:
                             description_val = _truncate_final_description(description_val, max_len=FINAL_DESCRIPTION_MAX_LEN)
@@ -6168,8 +6159,6 @@ async def process():
                             blocks = _collect_business_text_blocks(payloads_for_desc)
                             if description_val:
                                 blocks.append(description_val)
-                            if industry_val:
-                                blocks.append(industry_val)
                             if name:
                                 blocks.append(name)
                             if business_tags_val:
@@ -6191,12 +6180,23 @@ async def process():
                                     score_map.get(k)
                                     for k in ("major_scores", "middle_scores", "minor_scores", "detail_scores")
                                 )
-                            if (
-                                INDUSTRY_AI_ENABLED
-                                and verifier is not None
+                            # AI業種判定は description + 取得情報 を使う
+                            ai_text_parts = []
+                            if description_val:
+                                ai_text_parts.append(description_val)
+                            for b in blocks:
+                                if not b:
+                                    continue
+                                if description_val and b == description_val:
+                                    continue
+                                ai_text_parts.append(b)
+                            ai_text = "\\n".join(ai_text_parts) if ai_text_parts else "\\n".join(blocks)
+                            ai_available = (
+                                verifier is not None
                                 and hasattr(verifier, "judge_industry")
                                 and getattr(verifier, "industry_prompt", None)
-                            ):
+                            )
+                            if ai_available:
                                 async def _pick_ai_candidate(
                                     level: str,
                                     candidates: list[dict[str, str]],
@@ -6217,7 +6217,7 @@ async def process():
                                     try:
                                         ai_res = await asyncio.wait_for(
                                             verifier.judge_industry(
-                                                text="\\n".join(blocks),
+                                                text=ai_text,
                                                 company_name=name,
                                                 candidates_text=INDUSTRY_CLASSIFIER.format_candidates_text(candidates),
                                             ),
@@ -6333,7 +6333,7 @@ async def process():
                                         "source": "ai",
                                     }
 
-                            if not industry_result_ai:
+                            if (not industry_result_ai) and (not ai_available):
                                 if _has_scores(scores):
                                     major_candidates = INDUSTRY_CLASSIFIER.build_level_candidates(
                                         "major",
@@ -6465,6 +6465,11 @@ async def process():
                                 if not company.get("industry_minor_item"):
                                     company["industry_minor_item_code"] = ""
                                     company["industry_minor_item"] = "不明"
+
+                        # description は「何をしているどの会社か」が分かる形に整形（業種は含めない）
+                        description_val = clean_description_value(sanitize_text_block(description_val))
+                        if description_val and len(description_val) > FINAL_DESCRIPTION_MAX_LEN:
+                            description_val = _truncate_final_description(description_val, max_len=FINAL_DESCRIPTION_MAX_LEN)
 
                         # ---- お問い合わせURL（同一ステップで判定→保存） ----
                         if CONTACT_URL_IN_MAIN and homepage and (CONTACT_URL_FORCE or not contact_url):
