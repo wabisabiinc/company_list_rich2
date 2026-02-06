@@ -7,7 +7,6 @@ import json
 import os
 import sqlite3
 import sys
-import unicodedata
 from typing import Any
 
 try:
@@ -20,11 +19,6 @@ sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 from src.ai_verifier import AIVerifier, AI_ENABLED, GEN_IMPORT_ERROR
 from src.industry_classifier import IndustryClassifier
-
-
-def _normalize(text: str) -> str:
-    s = unicodedata.normalize("NFKC", text or "")
-    return "".join(s.split())
 
 
 def _iter_blocks(
@@ -53,130 +47,6 @@ def _iter_blocks(
         except Exception:
             blocks.append(business_tags)
     return [b for b in blocks if b]
-
-
-def _fallback_candidates(cls: IndustryClassifier, text: str, limit: int) -> list[dict[str, str]]:
-    norm = _normalize(text)
-    if not norm:
-        return []
-    taxonomy = cls.taxonomy
-    matched_minors: set[str] = set()
-    matched_middles: set[str] = set()
-    matched_majors: set[str] = set()
-
-    for code, name in taxonomy.minor_names.items():
-        if _normalize(name) in norm or norm in _normalize(name):
-            matched_minors.add(code)
-    for code, name in taxonomy.middle_names.items():
-        if _normalize(name) in norm or norm in _normalize(name):
-            matched_middles.add(code)
-    for code, name in taxonomy.major_names.items():
-        if _normalize(name) in norm or norm in _normalize(name):
-            matched_majors.add(code)
-
-    # expand middle/major to minors
-    for minor_code, middle_code in taxonomy.minor_to_middle.items():
-        if middle_code in matched_middles:
-            matched_minors.add(minor_code)
-    for middle_code, major_code in taxonomy.middle_to_major.items():
-        if major_code in matched_majors:
-            for minor_code, mid in taxonomy.minor_to_middle.items():
-                if mid == middle_code:
-                    matched_minors.add(minor_code)
-
-    out: list[dict[str, str]] = []
-    for minor_code in list(matched_minors)[: max(1, limit)]:
-        major_code, major_name, middle_code, middle_name, minor_code, minor_name = taxonomy.resolve_hierarchy(minor_code)
-        if not (major_code and middle_code and minor_code):
-            continue
-        out.append(
-            {
-                "major_code": major_code,
-                "major_name": major_name,
-                "middle_code": middle_code,
-                "middle_name": middle_name,
-                "minor_code": minor_code,
-                "minor_name": minor_name,
-            }
-        )
-    return out
-
-
-def _build_candidates_from_industry_name(
-    cls: IndustryClassifier,
-    industry_text: str,
-    top_n: int,
-) -> list[dict[str, str]]:
-    norm = _normalize(industry_text)
-    if not norm:
-        return []
-    # split tokens by common separators
-    seps = "・,、/()（）-〜～~"
-    tokens: list[str] = []
-    buf = ""
-    for ch in norm:
-        if ch in seps:
-            if buf:
-                tokens.append(buf)
-                buf = ""
-        else:
-            buf += ch
-    if buf:
-        tokens.append(buf)
-    tokens = [t for t in tokens if len(t) >= 2]
-
-    use_detail = bool(cls.taxonomy.detail_names)
-    scores: list[tuple[int, str]] = []
-    source = cls.taxonomy.detail_names if use_detail else cls.taxonomy.minor_names
-    for code, name in source.items():
-        name_norm = _normalize(name)
-        score = 0
-        if not name_norm:
-            continue
-        if norm in name_norm or name_norm in norm:
-            score += 5
-        for tok in tokens:
-            if tok in name_norm:
-                score += 1
-        if score > 0:
-            scores.append((score, minor_code))
-    if not scores:
-        return []
-
-    scores.sort(key=lambda x: (-x[0], x[1]))
-    out: list[dict[str, str]] = []
-    for _, code in scores[: max(1, top_n)]:
-        if use_detail:
-            major_code, major_name, middle_code, middle_name, minor_code, minor_name, detail_code, detail_name = (
-                cls.taxonomy.resolve_detail_hierarchy(code)
-            )
-            if not (major_code and middle_code and detail_code):
-                continue
-            out.append(
-                {
-                    "major_code": major_code,
-                    "major_name": major_name,
-                    "middle_code": middle_code,
-                    "middle_name": middle_name,
-                    "minor_code": detail_code,
-                    "minor_name": detail_name,
-                }
-            )
-        else:
-            major_code, major_name, middle_code, middle_name, minor_code, minor_name = cls.taxonomy.resolve_hierarchy(code)
-            if not (major_code and middle_code and minor_code):
-                continue
-            out.append(
-                {
-                    "major_code": major_code,
-                    "major_name": major_name,
-                    "middle_code": middle_code,
-                    "middle_name": middle_name,
-                    "minor_code": minor_code,
-                    "minor_name": minor_name,
-                }
-            )
-    return out
 
 
 async def _run(args: argparse.Namespace) -> int:
@@ -221,6 +91,41 @@ async def _run(args: argparse.Namespace) -> int:
     total = len(rows)
     print(f"target rows: {total}")
 
+    async def _pick_ai_candidate(
+        company_name: str,
+        text: str,
+        candidates: list[dict[str, str]],
+        level: str,
+        major_code: str = "",
+        middle_code: str = "",
+    ) -> tuple[dict[str, str] | None, dict[str, Any] | None]:
+        if not candidates:
+            return None, None
+        if level == "major":
+            cand_key_map = {c.get("major_code"): c for c in candidates}
+        elif level == "middle":
+            cand_key_map = {(c.get("major_code"), c.get("middle_code")): c for c in candidates}
+        else:
+            cand_key_map = {(c.get("major_code"), c.get("middle_code"), c.get("minor_code")): c for c in candidates}
+
+        ai_res = await verifier.judge_industry(
+            text=text,
+            company_name=company_name or "",
+            candidates_text=cls.format_candidates_text(candidates),
+        )
+        if not isinstance(ai_res, dict):
+            return None, None
+        maj = str(ai_res.get("major_code") or "").strip() or major_code
+        mid = str(ai_res.get("middle_code") or "").strip() or middle_code
+        mino = str(ai_res.get("minor_code") or "").strip()
+        if level == "major":
+            key = maj
+        elif level == "middle":
+            key = (maj, mid)
+        else:
+            key = (maj, mid, mino)
+        return cand_key_map.get(key), ai_res
+
     updated = 0
     for cid, company_name, industry, description, business_tags in rows:
         blocks = _iter_blocks(
@@ -230,32 +135,85 @@ async def _run(args: argparse.Namespace) -> int:
             business_tags or "",
         )
         text = "\n".join(blocks)
-        # Prefer matching by confirmed industry name (ignore codes)
-        candidates = _build_candidates_from_industry_name(cls, industry or "", top_n=args.top_n)
-        if not candidates:
-            candidates = cls.build_ai_candidates(blocks, top_n=args.top_n)
-        if not candidates:
-            candidates = _fallback_candidates(cls, text, limit=max(args.top_n, 20))
-        if not candidates:
+        scores = cls.score_levels(blocks)
+        major_candidates = cls.build_level_candidates("major", scores, top_n=args.top_n)
+        if not major_candidates:
+            continue
+        picked_major, _ = await _pick_ai_candidate(
+            company_name or "",
+            text,
+            major_candidates,
+            "major",
+        )
+        if not picked_major:
+            continue
+        major_code_val = picked_major.get("major_code", "")
+
+        middle_candidates = cls.build_level_candidates("middle", scores, top_n=args.top_n, major_code=major_code_val)
+        if not middle_candidates:
+            continue
+        picked_middle, _ = await _pick_ai_candidate(
+            company_name or "",
+            text,
+            middle_candidates,
+            "middle",
+            major_code=major_code_val,
+        )
+        if not picked_middle:
+            continue
+        middle_code_val = picked_middle.get("middle_code", "")
+
+        minor_candidates = cls.build_level_candidates(
+            "minor",
+            scores,
+            top_n=args.top_n,
+            major_code=major_code_val,
+            middle_code=middle_code_val,
+        )
+        if not minor_candidates:
+            continue
+        picked_minor, minor_ai_res = await _pick_ai_candidate(
+            company_name or "",
+            text,
+            minor_candidates,
+            "minor",
+            major_code=major_code_val,
+            middle_code=middle_code_val,
+        )
+        if not picked_minor or not isinstance(minor_ai_res, dict):
             continue
 
-        ai_res = await verifier.judge_industry(
-            text=text,
-            company_name=company_name or "",
-            candidates_text=cls.format_candidates_text(candidates),
-        )
-        if not isinstance(ai_res, dict):
-            continue
-        maj = str(ai_res.get("major_code") or "").strip()
-        mid = str(ai_res.get("middle_code") or "").strip()
-        mino = str(ai_res.get("minor_code") or "").strip()
-        conf = float(ai_res.get("confidence") or 0.0)
+        final_candidate = picked_minor
+        final_ai_res = minor_ai_res
+        if scores.get("use_detail"):
+            detail_candidates = cls.build_level_candidates(
+                "detail",
+                scores,
+                top_n=args.top_n,
+                major_code=major_code_val,
+                middle_code=middle_code_val,
+                minor_code=picked_minor.get("minor_code", ""),
+            )
+            if detail_candidates:
+                picked_detail, detail_ai_res = await _pick_ai_candidate(
+                    company_name or "",
+                    text,
+                    detail_candidates,
+                    "detail",
+                    major_code=major_code_val,
+                    middle_code=middle_code_val,
+                )
+                if picked_detail and isinstance(detail_ai_res, dict):
+                    final_candidate = picked_detail
+                    final_ai_res = detail_ai_res
+
+        conf = float(final_ai_res.get("confidence") or 0.0)
         if conf < args.min_confidence:
             continue
-
-        # validate candidate exists
-        key = {(c.get("major_code"), c.get("middle_code"), c.get("minor_code")) for c in candidates}
-        if (maj, mid, mino) not in key:
+        maj = str(final_ai_res.get("major_code") or "").strip()
+        mid = str(final_ai_res.get("middle_code") or "").strip()
+        mino = str(final_ai_res.get("minor_code") or "").strip()
+        if not (maj and mid and mino):
             continue
 
         # resolve names (detail code -> minor representative)
@@ -271,6 +229,10 @@ async def _run(args: argparse.Namespace) -> int:
             major_code, major_name, middle_code, middle_name, minor_code, minor_name = cls.taxonomy.resolve_hierarchy(mino)
         if not (major_code and middle_code and minor_code):
             continue
+        if not minor_item_code and minor_code and minor_name:
+            # Fallback: populate minor_item with the resolved minor.
+            minor_item_code = minor_code
+            minor_item_name = minor_name
 
         cur.execute(
             """

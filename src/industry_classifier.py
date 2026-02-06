@@ -354,6 +354,216 @@ class IndustryClassifier:
         self.taxonomy = JSICTaxonomy(self.csv_path)
         self.loaded = self.taxonomy.load()
 
+    def score_levels(self, text_blocks: list[str]) -> dict[str, Any]:
+        if not self.loaded:
+            return {
+                "use_detail": False,
+                "detail_scores": {},
+                "minor_scores": {},
+                "middle_scores": {},
+                "major_scores": {},
+            }
+        text = "\n".join([t for t in text_blocks if t])
+        if not text:
+            return {
+                "use_detail": False,
+                "detail_scores": {},
+                "minor_scores": {},
+                "middle_scores": {},
+                "major_scores": {},
+            }
+
+        use_detail = bool(self.taxonomy.detail_names)
+        detail_scores: dict[str, int] = {}
+        if use_detail:
+            detail_scores = self.taxonomy.score_details(text)
+        minor_scores: dict[str, int]
+        if use_detail:
+            minor_scores = {}
+            for detail_code, score in detail_scores.items():
+                minor_code = self.taxonomy.detail_to_minor.get(detail_code, "")
+                if not minor_code:
+                    continue
+                minor_scores[minor_code] = minor_scores.get(minor_code, 0) + score
+        else:
+            minor_scores = self.taxonomy.score_minors(text)
+
+        middle_scores: dict[str, int] = {}
+        for minor_code, score in minor_scores.items():
+            middle_code = self.taxonomy.minor_to_middle.get(minor_code, "")
+            if not middle_code:
+                continue
+            middle_scores[middle_code] = middle_scores.get(middle_code, 0) + score
+
+        major_scores: dict[str, int] = {}
+        for middle_code, score in middle_scores.items():
+            major_code = self.taxonomy.middle_to_major.get(middle_code, "")
+            if not major_code:
+                continue
+            major_scores[major_code] = major_scores.get(major_code, 0) + score
+
+        norm_text = self.taxonomy._normalize(text)
+        tokens = set()
+        for m in re.finditer(r"[一-龥ぁ-んァ-ンA-Za-z0-9]{2,}", norm_text):
+            tok = m.group(0)
+            if tok in _GENERIC_TOKENS:
+                continue
+            tokens.add(tok)
+
+        def boost_scores(scores: dict[str, int], name_map: dict[str, str], base_boost: int = 3) -> None:
+            if not norm_text:
+                return
+            for code, name in name_map.items():
+                name_norm = self.taxonomy._normalize(name)
+                if not name_norm:
+                    continue
+                boost = 0
+                if name_norm in norm_text or norm_text in name_norm:
+                    boost += base_boost
+                else:
+                    for tok in tokens:
+                        if tok in name_norm:
+                            boost += 1
+                if boost > 0:
+                    scores[code] = scores.get(code, 0) + boost
+
+        boost_scores(major_scores, self.taxonomy.major_names)
+        boost_scores(middle_scores, self.taxonomy.middle_names)
+        boost_scores(minor_scores, self.taxonomy.minor_names)
+        if use_detail:
+            boost_scores(detail_scores, self.taxonomy.detail_names)
+
+        return {
+            "use_detail": use_detail,
+            "detail_scores": detail_scores,
+            "minor_scores": minor_scores,
+            "middle_scores": middle_scores,
+            "major_scores": major_scores,
+        }
+
+    def build_level_candidates(
+        self,
+        level: str,
+        scores: dict[str, Any],
+        top_n: int = 12,
+        major_code: str = "",
+        middle_code: str = "",
+        minor_code: str = "",
+    ) -> list[dict[str, str]]:
+        if not self.loaded:
+            return []
+        if level not in {"major", "middle", "minor", "detail"}:
+            return []
+        if not scores:
+            return []
+
+        if level == "major":
+            score_map = scores.get("major_scores") or {}
+            candidates = []
+            for code, score in score_map.items():
+                name = self.taxonomy.major_names.get(code, "")
+                if not name:
+                    continue
+                candidates.append(
+                    {
+                        "major_code": code,
+                        "major_name": name,
+                        "middle_code": "",
+                        "middle_name": "",
+                        "minor_code": "",
+                        "minor_name": "",
+                        "_score": score,
+                    }
+                )
+        elif level == "middle":
+            score_map = scores.get("middle_scores") or {}
+            candidates = []
+            for code, score in score_map.items():
+                if major_code and self.taxonomy.middle_to_major.get(code) != major_code:
+                    continue
+                name = self.taxonomy.middle_names.get(code, "")
+                maj_code = self.taxonomy.middle_to_major.get(code, "") or major_code
+                maj_name = self.taxonomy.major_names.get(maj_code, "")
+                if not (name and maj_code and maj_name):
+                    continue
+                candidates.append(
+                    {
+                        "major_code": maj_code,
+                        "major_name": maj_name,
+                        "middle_code": code,
+                        "middle_name": name,
+                        "minor_code": "",
+                        "minor_name": "",
+                        "_score": score,
+                    }
+                )
+        elif level == "minor":
+            score_map = scores.get("minor_scores") or {}
+            candidates = []
+            for code, score in score_map.items():
+                mid = self.taxonomy.minor_to_middle.get(code, "")
+                if middle_code and mid != middle_code:
+                    continue
+                maj = self.taxonomy.middle_to_major.get(mid, "")
+                if major_code and maj != major_code:
+                    continue
+                major_code_val, major_name, middle_code_val, middle_name, minor_code_val, minor_name = (
+                    self.taxonomy.resolve_hierarchy(code)
+                )
+                if not (major_code_val and middle_code_val and minor_code_val):
+                    continue
+                candidates.append(
+                    {
+                        "major_code": major_code_val,
+                        "major_name": major_name,
+                        "middle_code": middle_code_val,
+                        "middle_name": middle_name,
+                        "minor_code": minor_code_val,
+                        "minor_name": minor_name,
+                        "_score": score,
+                    }
+                )
+        else:
+            score_map = scores.get("detail_scores") or {}
+            candidates = []
+            for code, score in score_map.items():
+                min_code = self.taxonomy.detail_to_minor.get(code, "")
+                if minor_code and min_code != minor_code:
+                    continue
+                if middle_code:
+                    mid = self.taxonomy.detail_to_middle.get(code, "") or self.taxonomy.minor_to_middle.get(min_code, "")
+                    if mid != middle_code:
+                        continue
+                if major_code:
+                    maj = self.taxonomy.detail_to_major.get(code, "")
+                    if not maj:
+                        mid = self.taxonomy.detail_to_middle.get(code, "") or self.taxonomy.minor_to_middle.get(min_code, "")
+                        maj = self.taxonomy.middle_to_major.get(mid, "")
+                    if maj != major_code:
+                        continue
+                major_code_val, major_name, middle_code_val, middle_name, minor_code_val, minor_name, detail_code, detail_name = (
+                    self.taxonomy.resolve_detail_hierarchy(code)
+                )
+                if not (major_code_val and middle_code_val and detail_code):
+                    continue
+                candidates.append(
+                    {
+                        "major_code": major_code_val,
+                        "major_name": major_name,
+                        "middle_code": middle_code_val,
+                        "middle_name": middle_name,
+                        "minor_code": detail_code,
+                        "minor_name": detail_name,
+                        "_score": score,
+                    }
+                )
+
+        candidates.sort(key=lambda x: (-(int(x.get("_score") or 0)), x.get("minor_code", ""), x.get("middle_code", ""), x.get("major_code", "")))
+        out = candidates[: max(1, top_n)]
+        for c in out:
+            c.pop("_score", None)
+        return out
+
     def rule_classify(self, text_blocks: list[str], min_score: int = 2) -> Optional[dict[str, Any]]:
         if not self.loaded:
             return None
@@ -389,6 +599,79 @@ class IndustryClassifier:
         sorted_codes = sorted(scores.items(), key=lambda x: (-x[1], x[0]))[: max(1, top_n)]
         out: list[dict[str, str]] = []
         for code, _ in sorted_codes:
+            if use_detail:
+                major_code, major_name, middle_code, middle_name, minor_code, minor_name, detail_code, detail_name = (
+                    self.taxonomy.resolve_detail_hierarchy(code)
+                )
+                if not (major_code and middle_code and detail_code):
+                    continue
+                out.append(
+                    {
+                        "major_code": major_code,
+                        "major_name": major_name,
+                        "middle_code": middle_code,
+                        "middle_name": middle_name,
+                        "minor_code": detail_code,
+                        "minor_name": detail_name,
+                    }
+                )
+            else:
+                major_code, major_name, middle_code, middle_name, minor_code, minor_name = self.taxonomy.resolve_hierarchy(code)
+                if not (major_code and middle_code and minor_code):
+                    continue
+                out.append(
+                    {
+                        "major_code": major_code,
+                        "major_name": major_name,
+                        "middle_code": middle_code,
+                        "middle_name": middle_name,
+                        "minor_code": minor_code,
+                        "minor_name": minor_name,
+                    }
+                )
+        return out
+
+    def build_candidates_from_industry_name(self, industry_text: str, top_n: int = 12) -> list[dict[str, str]]:
+        if not self.loaded:
+            return []
+        norm = self.taxonomy._normalize(industry_text)
+        if not norm:
+            return []
+        seps = "・,、/()（）-〜～~"
+        tokens: list[str] = []
+        buf = ""
+        for ch in norm:
+            if ch in seps:
+                if buf:
+                    tokens.append(buf)
+                    buf = ""
+            else:
+                buf += ch
+        if buf:
+            tokens.append(buf)
+        tokens = [t for t in tokens if len(t) >= 2]
+
+        use_detail = bool(self.taxonomy.detail_names)
+        source = self.taxonomy.detail_names if use_detail else self.taxonomy.minor_names
+        scores: list[tuple[int, str]] = []
+        for code, name in source.items():
+            name_norm = self.taxonomy._normalize(name)
+            score = 0
+            if not name_norm:
+                continue
+            if norm in name_norm or name_norm in norm:
+                score += 5
+            for tok in tokens:
+                if tok in name_norm:
+                    score += 1
+            if score > 0:
+                scores.append((score, code))
+        if not scores:
+            return []
+
+        scores.sort(key=lambda x: (-x[0], x[1]))
+        out: list[dict[str, str]] = []
+        for _, code in scores[: max(1, top_n)]:
             if use_detail:
                 major_code, major_name, middle_code, middle_name, minor_code, minor_name, detail_code, detail_name = (
                     self.taxonomy.resolve_detail_hierarchy(code)
