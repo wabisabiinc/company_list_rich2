@@ -10,6 +10,7 @@ from typing import Any, Iterable, Optional
 log = logging.getLogger(__name__)
 
 DEFAULT_JSIC_CSV_PATH = os.getenv("JSIC_CSV_PATH", "docs/industry_select.csv")
+DEFAULT_JSIC_JSON_PATH = os.getenv("JSIC_JSON_PATH", "docs/industry_select.json")
 
 _GENERIC_TOKENS = {
     "事業", "業", "サービス", "製品", "商品", "販売", "製造", "提供", "運営", "管理",
@@ -28,8 +29,9 @@ class IndustryEntry:
 
 
 class JSICTaxonomy:
-    def __init__(self, csv_path: str) -> None:
+    def __init__(self, csv_path: str, json_path: Optional[str] = None) -> None:
         self.csv_path = csv_path
+        self.json_path = json_path
         self.entries: list[IndustryEntry] = []
         self.major_names: dict[str, str] = {}
         self.middle_names: dict[str, str] = {}
@@ -45,6 +47,10 @@ class JSICTaxonomy:
         self._token_index: dict[str, set[str]] = {}
 
     def load(self) -> bool:
+        if self.json_path and os.path.exists(self.json_path):
+            if self._load_from_json(self.json_path):
+                self._build_token_index()
+                return True
         if not self.csv_path or not os.path.exists(self.csv_path):
             log.warning("JSIC taxonomy CSV not found: %s", self.csv_path)
             return False
@@ -99,6 +105,73 @@ class JSICTaxonomy:
             self.entries.append(entry)
 
         self._build_token_index()
+        return True
+
+    def _load_from_json(self, path: str) -> bool:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return False
+        if not isinstance(data, dict):
+            return False
+        major_names = data.get("major_names")
+        middle_names = data.get("middle_names")
+        minor_names = data.get("minor_names")
+        detail_names = data.get("detail_names")
+        minor_to_middle = data.get("minor_to_middle")
+        middle_to_major = data.get("middle_to_major")
+        detail_to_minor = data.get("detail_to_minor")
+        entries = data.get("entries")
+        if not isinstance(major_names, dict) or not isinstance(middle_names, dict) or not isinstance(minor_names, dict):
+            return False
+        self.major_names = {str(k): str(v) for k, v in major_names.items()}
+        self.middle_names = {str(k): str(v) for k, v in (middle_names or {}).items()}
+        self.minor_names = {str(k): str(v) for k, v in (minor_names or {}).items()}
+        self.detail_names = {str(k): str(v) for k, v in (detail_names or {}).items()}
+        self.minor_to_middle = {str(k): str(v) for k, v in (minor_to_middle or {}).items()}
+        self.middle_to_major = {str(k): str(v) for k, v in (middle_to_major or {}).items()}
+        self.detail_to_minor = {str(k): str(v) for k, v in (detail_to_minor or {}).items()}
+        self._minor_names_norm = {k: self._normalize(v) for k, v in self.minor_names.items()}
+        self._detail_names_norm = {k: self._normalize(v) for k, v in self.detail_names.items()}
+        self.entries = []
+        if isinstance(entries, list) and entries:
+            for e in entries:
+                if not isinstance(e, dict):
+                    continue
+                level = str(e.get("level") or "")
+                code = str(e.get("code") or "")
+                name = str(e.get("name") or "")
+                major_code = str(e.get("major_code") or "")
+                middle_code = str(e.get("middle_code") or "")
+                minor_code = str(e.get("minor_code") or "")
+                if not (level and code and name):
+                    continue
+                self.entries.append(
+                    IndustryEntry(
+                        level=level,
+                        code=code,
+                        name=name,
+                        major_code=major_code,
+                        middle_code=middle_code,
+                        minor_code=minor_code,
+                    )
+                )
+        else:
+            for code, name in self.major_names.items():
+                self.entries.append(IndustryEntry("major", code, name, code, "", ""))
+            for code, name in self.middle_names.items():
+                major_code = self.middle_to_major.get(code, "")
+                self.entries.append(IndustryEntry("middle", code, name, major_code, code, ""))
+            for code, name in self.minor_names.items():
+                middle_code = self.minor_to_middle.get(code, "")
+                major_code = self.middle_to_major.get(middle_code, "") if middle_code else ""
+                self.entries.append(IndustryEntry("minor", code, name, major_code, middle_code, code))
+            for code, name in self.detail_names.items():
+                minor_code = self.detail_to_minor.get(code, "")
+                middle_code = self.minor_to_middle.get(minor_code, "") if minor_code else ""
+                major_code = self.middle_to_major.get(middle_code, "") if middle_code else ""
+                self.entries.append(IndustryEntry("detail", code, name, major_code, middle_code, minor_code))
         return True
 
     @staticmethod
@@ -351,7 +424,7 @@ class JSICTaxonomy:
 class IndustryClassifier:
     def __init__(self, csv_path: str | None = None) -> None:
         self.csv_path = csv_path or DEFAULT_JSIC_CSV_PATH
-        self.taxonomy = JSICTaxonomy(self.csv_path)
+        self.taxonomy = JSICTaxonomy(self.csv_path, DEFAULT_JSIC_JSON_PATH)
         self.loaded = self.taxonomy.load()
 
     def score_levels(self, text_blocks: list[str]) -> dict[str, Any]:
