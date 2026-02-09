@@ -3268,7 +3268,9 @@ class CompanyScraper:
             headless=self.headless,
             args=[
                 "--no-sandbox",
+                "--disable-setuid-sandbox",  # sandbox無しで起動（制限環境での立ち上げ失敗を防ぐ）
                 "--disable-dev-shm-usage",  # /dev/shm不足でのクラッシュ回避
+                "--single-process",  # 制限コンテナでのfork失敗対策
             ],
         )
         self.context = await self.browser.new_context(

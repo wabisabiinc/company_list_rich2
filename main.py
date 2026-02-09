@@ -152,15 +152,31 @@ LONG_TIME_LIMIT_FETCH_ONLY = float(os.getenv("LONG_TIME_LIMIT_FETCH_ONLY", os.ge
 LONG_TIME_LIMIT_WITH_OFFICIAL = float(os.getenv("LONG_TIME_LIMIT_WITH_OFFICIAL", os.getenv("TIME_LIMIT_WITH_OFFICIAL", "45")))
 LONG_TIME_LIMIT_DEEP = float(os.getenv("LONG_TIME_LIMIT_DEEP", os.getenv("TIME_LIMIT_DEEP", "60")))
 AI_MIN_REMAINING_SEC = float(os.getenv("AI_MIN_REMAINING_SEC", "2.5"))
-AI_VERIFY_MIN_CONFIDENCE = float(os.getenv("AI_VERIFY_MIN_CONFIDENCE", "0.65"))
+AI_VERIFY_MIN_CONFIDENCE = float(os.getenv("AI_VERIFY_MIN_CONFIDENCE", "0.60"))
 # url_flags に保存された「AI非公式」判定を、候補URL取得前に強制スキップするための閾値。
 # 低confidenceのAI判定は誤爆しやすいので、一定以上のみハードに扱う（それ未満は再評価対象）。
 AI_SKIP_NEGATIVE_FLAG_MIN_CONFIDENCE = float(os.getenv("AI_SKIP_NEGATIVE_FLAG_MIN_CONFIDENCE", "0.85"))
 AI_CLEAR_NEGATIVE_FLAGS = os.getenv("AI_CLEAR_NEGATIVE_FLAGS", "false").lower() == "true"
 INDUSTRY_CLASSIFY_ENABLED = os.getenv("INDUSTRY_CLASSIFY_ENABLED", "true").lower() == "true"
+INDUSTRY_CLASSIFY_AFTER_HOMEPAGE = os.getenv("INDUSTRY_CLASSIFY_AFTER_HOMEPAGE", "true").lower() == "true"
 INDUSTRY_RULE_MIN_SCORE = max(1, int(os.getenv("INDUSTRY_RULE_MIN_SCORE", "2")))
 INDUSTRY_AI_ENABLED = os.getenv("INDUSTRY_AI_ENABLED", "true").lower() == "true"
 INDUSTRY_AI_TOP_N = max(5, int(os.getenv("INDUSTRY_AI_TOP_N", "12")))
+INDUSTRY_AI_MIN_CONFIDENCE = float(os.getenv("INDUSTRY_AI_MIN_CONFIDENCE", "0.50"))
+INDUSTRY_MINOR_DIRECT_MAX_CANDIDATES = max(20, int(os.getenv("INDUSTRY_MINOR_DIRECT_MAX_CANDIDATES", "60")))
+INDUSTRY_DETAIL_MIN_CONFIDENCE = float(os.getenv("INDUSTRY_DETAIL_MIN_CONFIDENCE", "0.72"))
+INDUSTRY_DETAIL_MIN_EVIDENCE_CHARS = max(0, int(os.getenv("INDUSTRY_DETAIL_MIN_EVIDENCE_CHARS", "200")))
+INDUSTRY_FORCE_CLASSIFY = os.getenv("INDUSTRY_FORCE_CLASSIFY", "false").lower() == "true"
+INDUSTRY_FORCE_DEFAULT_MINOR_CODES = [
+    s.strip()
+    for s in os.getenv("INDUSTRY_FORCE_DEFAULT_MINOR_CODES", "9599,9299,9999").split(",")
+    if s.strip()
+]
+INDUSTRY_REQUIRE_AI = os.getenv("INDUSTRY_REQUIRE_AI", "true").lower() == "true"
+INDUSTRY_RULE_FALLBACK_ENABLED = os.getenv("INDUSTRY_RULE_FALLBACK_ENABLED", "false").lower() == "true"
+INDUSTRY_RULE_FALLBACK_MIN_SCORE = max(1, int(os.getenv("INDUSTRY_RULE_FALLBACK_MIN_SCORE", "5")))
+INDUSTRY_RULE_FALLBACK_MARGIN = max(1, int(os.getenv("INDUSTRY_RULE_FALLBACK_MARGIN", "2")))
+INDUSTRY_NAME_LOOKUP_ENABLED = os.getenv("INDUSTRY_NAME_LOOKUP_ENABLED", "true").lower() == "true"
 CONTACT_URL_IN_MAIN = os.getenv("CONTACT_URL_IN_MAIN", "true").lower() == "true"
 CONTACT_URL_FORCE = os.getenv("CONTACT_URL_FORCE", "false").lower() == "true"
 CONTACT_URL_AI_ENABLED = os.getenv("CONTACT_URL_AI_ENABLED", "true").lower() == "true"
@@ -2591,6 +2607,29 @@ async def process():
             started_at = time.monotonic()
             timed_out = False
             company_has_corp = any(suffix in name for suffix in CompanyScraper.CORP_SUFFIXES)
+
+            # デフォルトを先に用意しておく（途中でタイムアウト/例外が起きても未定義にならないようにする）
+            industry_val = ""
+            industry_hint_val = ""
+            business_tags_val = ""
+            industry_major = ""
+            industry_middle = ""
+            industry_minor = ""
+            industry_major_code = ""
+            industry_middle_code = ""
+            industry_minor_code = ""
+            industry_class_source = ""
+            industry_class_confidence = 0.0
+            contact_url = ""
+            contact_url_source = ""
+            contact_url_score = 0.0
+            contact_url_reason = ""
+            contact_url_checked_at = ""
+            contact_url_ai_verdict = ""
+            contact_url_ai_confidence = 0.0
+            contact_url_ai_reason = ""
+            contact_url_status = ""
+            payloads_for_desc: list[dict[str, Any]] = []
             hard_timeout_candidates = [t for t in (GLOBAL_HARD_TIMEOUT_SEC, COMPANY_HARD_TIMEOUT_SEC, TIME_LIMIT_SEC) if t > 0]
             hard_timeout_sec = min(hard_timeout_candidates) if hard_timeout_candidates else 60.0
             if ABSOLUTE_COMPANY_DEADLINE_SEC > 0:
@@ -6027,20 +6066,37 @@ async def process():
                             description_val = clean_description_value(company.get("description") or "")
 
                         # ---- description品質統一（追加AI呼び出し無し） ----
-                        payloads_for_desc: list[dict[str, Any]] = []
+                        payloads_for_desc = []
                         try:
                             if info_dict:
-                                payloads_for_desc.append(info_dict)
+                                info_payload = dict(info_dict)
+                                if info_url and not info_payload.get("url"):
+                                    info_payload["url"] = info_url
+                                payloads_for_desc.append(info_payload)
                         except Exception:
                             pass
                         try:
-                            payloads_for_desc.extend(list((priority_docs or {}).values())[:6])
-                        except Exception:
-                            pass
-                        try:
-                            for _, d in list((related or {}).items())[:6]:
+                            for u, d in list((priority_docs or {}).items())[:6]:
                                 if isinstance(d, dict):
-                                    payloads_for_desc.append({"text": d.get("text", "") or "", "html": d.get("html", "") or ""})
+                                    payloads_for_desc.append(
+                                        {
+                                            "url": u,
+                                            "text": d.get("text", "") or "",
+                                            "html": d.get("html", "") or "",
+                                        }
+                                    )
+                        except Exception:
+                            pass
+                        try:
+                            for u, d in list((related or {}).items())[:6]:
+                                if isinstance(d, dict):
+                                    payloads_for_desc.append(
+                                        {
+                                            "url": u,
+                                            "text": d.get("text", "") or "",
+                                            "html": d.get("html", "") or "",
+                                        }
+                                    )
                         except Exception:
                             pass
 
@@ -6129,8 +6185,9 @@ async def process():
                         if description_val and len(description_val) > FINAL_DESCRIPTION_MAX_LEN:
                             description_val = _truncate_final_description(description_val, max_len=FINAL_DESCRIPTION_MAX_LEN)
 
-                        # ---- 業種/タグを毎回推定して格納（追加AI呼び出し無し） ----
+                        # ---- 業種/タグを推定（推定値はヒントとして使い、最終保存は分類結果に限定） ----
                         industry_val = (company.get("industry") or "").strip()
+                        industry_hint_val = industry_val
                         business_tags_val = (company.get("business_tags") or "").strip()
                         if INFER_INDUSTRY_ALWAYS:
                             blocks = _collect_business_text_blocks(payloads_for_desc)
@@ -6138,10 +6195,9 @@ async def process():
                                 blocks.append(description_val)
                             inferred_industry, inferred_tags = infer_industry_and_business_tags(blocks)
                             if inferred_industry:
-                                # 推定できた場合は毎回更新（既存があっても上書き）
-                                industry_val = inferred_industry[:60]
-                            elif not industry_val:
-                                industry_val = "不明"
+                                industry_hint_val = inferred_industry[:60]
+                            elif not industry_hint_val:
+                                industry_hint_val = "不明"
                             if inferred_tags:
                                 try:
                                     business_tags_val = json.dumps(inferred_tags[:5], ensure_ascii=False)
@@ -6149,13 +6205,13 @@ async def process():
                                     business_tags_val = ""
                             elif not business_tags_val:
                                 business_tags_val = ""
-                        # description を整形（業種の付与はAI判定後に実施）
+                        # description を整形（業種の付与は分類後に実施）
                         description_val = clean_description_value(sanitize_text_block(description_val))
                         if description_val and len(description_val) > FINAL_DESCRIPTION_MAX_LEN:
                             description_val = _truncate_final_description(description_val, max_len=FINAL_DESCRIPTION_MAX_LEN)
 
-                        # ---- 業種（AI判定を必ず通す） ----
-                        if INDUSTRY_CLASSIFY_ENABLED and INDUSTRY_CLASSIFIER.loaded:
+                        # ---- 業種（AI優先・ruleは厳格フォールバック） ----
+                        if (not INDUSTRY_CLASSIFY_AFTER_HOMEPAGE) and INDUSTRY_CLASSIFY_ENABLED and INDUSTRY_CLASSIFIER.loaded:
                             blocks = _collect_business_text_blocks(payloads_for_desc)
                             if description_val:
                                 blocks.append(description_val)
@@ -6171,16 +6227,114 @@ async def process():
                                         blocks.append(business_tags_val)
                                 except Exception:
                                     blocks.append(business_tags_val)
-                            industry_result_rule = None
+                            license_val = (company.get("license") or "").strip()
+                            if license_val:
+                                blocks.append(f"許認可: {license_val}"[:400])
+                            desc_ev = (company.get("description_evidence") or "").strip()
+                            if desc_ev:
+                                blocks.append(f"根拠: {desc_ev}"[:400])
+
+                            scores = INDUSTRY_CLASSIFIER.score_levels(blocks)
                             industry_result_ai = None
                             ai_industry_val = ""
-                            scores = INDUSTRY_CLASSIFIER.score_levels(blocks)
-                            def _has_scores(score_map: dict[str, Any]) -> bool:
-                                return any(
-                                    score_map.get(k)
-                                    for k in ("major_scores", "middle_scores", "minor_scores", "detail_scores")
+                            ai_attempted = False
+                            ai_available = (
+                                INDUSTRY_AI_ENABLED
+                                and verifier is not None
+                                and hasattr(verifier, "judge_industry")
+                                and getattr(verifier, "industry_prompt", None)
+                            )
+
+                            def _top_and_margin(score_map: dict[str, Any]) -> tuple[int, int]:
+                                if not isinstance(score_map, dict) or not score_map:
+                                    return 0, 0
+                                vals: list[int] = []
+                                for v in score_map.values():
+                                    try:
+                                        vals.append(int(v))
+                                    except Exception:
+                                        continue
+                                if not vals:
+                                    return 0, 0
+                                vals.sort(reverse=True)
+                                top = vals[0]
+                                second = vals[1] if len(vals) > 1 else 0
+                                return top, max(0, top - second)
+
+                            def _ai_accepts(
+                                ai_res: dict[str, Any],
+                                final_candidate: dict[str, str],
+                            ) -> bool:
+                                try:
+                                    conf = float(ai_res.get("confidence") or 0.0)
+                                except Exception:
+                                    conf = 0.0
+                                if conf < INDUSTRY_AI_MIN_CONFIDENCE:
+                                    return False
+                                if str(ai_res.get("human_review") or "").strip().lower() in {"true", "1", "yes"}:
+                                    return False
+                                regulated_majors = {
+                                    "医療，福祉",
+                                    "建設業",
+                                    "金融業，保険業",
+                                }
+                                major_name = (final_candidate.get("major_name") or "").strip()
+                                if major_name in regulated_majors:
+                                    facts = ai_res.get("facts")
+                                    license_info = ""
+                                    if isinstance(facts, dict):
+                                        license_info = str(
+                                            facts.get("licenses")
+                                            or facts.get("license")
+                                            or facts.get("license_or_registration")
+                                            or ""
+                                        ).strip()
+                                    if not license_info:
+                                        return False
+                                return True
+
+                            def _build_classification_candidates(score_map: dict[str, Any]) -> list[dict[str, str]]:
+                                use_detail = bool(score_map.get("use_detail"))
+                                level = "detail" if use_detail else "minor"
+                                candidates = INDUSTRY_CLASSIFIER.build_level_candidates(
+                                    level,
+                                    score_map,
+                                    top_n=INDUSTRY_AI_TOP_N,
                                 )
-                            # AI業種判定は description + 取得情報 を使う
+                                if (not candidates) and use_detail:
+                                    candidates = INDUSTRY_CLASSIFIER.build_level_candidates(
+                                        "minor",
+                                        score_map,
+                                        top_n=INDUSTRY_AI_TOP_N,
+                                    )
+                                return candidates
+
+                            def _match_ai_candidate(
+                                ai_res: dict[str, Any],
+                                candidates: list[dict[str, str]],
+                            ) -> dict[str, str] | None:
+                                if not candidates:
+                                    return None
+                                maj = str(ai_res.get("major_code") or "").strip()
+                                mid = str(ai_res.get("middle_code") or "").strip()
+                                mino = str(ai_res.get("minor_code") or "").strip()
+                                if maj or mid or mino:
+                                    for c in candidates:
+                                        if mino and c.get("minor_code") != mino:
+                                            continue
+                                        if mid and c.get("middle_code") != mid:
+                                            continue
+                                        if maj and c.get("major_code") != maj:
+                                            continue
+                                        return c
+                                ai_minor_name = str(ai_res.get("minor_name") or "").strip()
+                                if ai_minor_name:
+                                    norm_ai_minor = INDUSTRY_CLASSIFIER.taxonomy._normalize(ai_minor_name)
+                                    for c in candidates:
+                                        if INDUSTRY_CLASSIFIER.taxonomy._normalize(c.get("minor_name", "")) == norm_ai_minor:
+                                            return c
+                                return None
+
                             ai_text_parts = []
                             if description_val:
                                 ai_text_parts.append(description_val)
@@ -6190,226 +6344,92 @@ async def process():
                                 if description_val and b == description_val:
                                     continue
                                 ai_text_parts.append(b)
-                            ai_text = "\\n".join(ai_text_parts) if ai_text_parts else "\\n".join(blocks)
-                            ai_available = (
-                                verifier is not None
-                                and hasattr(verifier, "judge_industry")
-                                and getattr(verifier, "industry_prompt", None)
-                            )
-                            if ai_available:
-                                async def _pick_ai_candidate(
-                                    level: str,
-                                    candidates: list[dict[str, str]],
-                                    major_code: str = "",
-                                    middle_code: str = "",
-                                ) -> tuple[dict[str, str] | None, dict[str, Any] | None]:
-                                    if not candidates:
-                                        return None, None
-                                    if level == "major":
-                                        cand_key_map = {c.get("major_code"): c for c in candidates}
-                                    elif level == "middle":
-                                        cand_key_map = {(c.get("major_code"), c.get("middle_code")): c for c in candidates}
-                                    else:
-                                        cand_key_map = {
-                                            (c.get("major_code"), c.get("middle_code"), c.get("minor_code")): c
-                                            for c in candidates
+                            ai_text = "\n".join(ai_text_parts) if ai_text_parts else "\n".join(blocks)
+                            class_candidates = _build_classification_candidates(scores)
+
+                            if ai_available and class_candidates and has_time_for_ai():
+                                ai_attempted = True
+                                try:
+                                    ai_res = await asyncio.wait_for(
+                                        verifier.judge_industry(
+                                            text=ai_text,
+                                            company_name=name,
+                                            candidates_text=INDUSTRY_CLASSIFIER.format_candidates_text(class_candidates),
+                                        ),
+                                        timeout=min(clamp_timeout(ai_call_timeout), 30.0),
+                                    )
+                                except Exception:
+                                    ai_res = None
+                                if isinstance(ai_res, dict):
+                                    matched = _match_ai_candidate(ai_res, class_candidates)
+                                    if matched and _ai_accepts(ai_res, matched):
+                                        ai_industry_val = str(ai_res.get("industry") or "").strip()
+                                        try:
+                                            conf = float(ai_res.get("confidence") or 0.0)
+                                        except Exception:
+                                            conf = 0.0
+                                        conf = max(0.0, min(1.0, conf))
+                                        industry_result_ai = {
+                                            "major_code": matched.get("major_code", ""),
+                                            "major_name": matched.get("major_name", ""),
+                                            "middle_code": matched.get("middle_code", ""),
+                                            "middle_name": matched.get("middle_name", ""),
+                                            "minor_code": matched.get("minor_code", ""),
+                                            "minor_name": matched.get("minor_name", ""),
+                                            "confidence": conf,
+                                            "source": "ai",
                                         }
-                                    try:
-                                        ai_res = await asyncio.wait_for(
-                                            verifier.judge_industry(
-                                                text=ai_text,
-                                                company_name=name,
-                                                candidates_text=INDUSTRY_CLASSIFIER.format_candidates_text(candidates),
-                                            ),
-                                            timeout=min(clamp_timeout(ai_call_timeout), 30.0),
-                                        )
-                                    except Exception:
-                                        ai_res = None
-                                    if not isinstance(ai_res, dict):
-                                        return None, None
-                                    maj = str(ai_res.get("major_code") or "").strip() or major_code
-                                    mid = str(ai_res.get("middle_code") or "").strip() or middle_code
-                                    mino = str(ai_res.get("minor_code") or "").strip()
-                                    if level == "major":
-                                        key = maj
-                                    elif level == "middle":
-                                        key = (maj, mid)
-                                    else:
-                                        key = (maj, mid, mino)
-                                    return cand_key_map.get(key), ai_res
 
-                                major_candidates = INDUSTRY_CLASSIFIER.build_level_candidates(
-                                    "major",
-                                    scores,
-                                    top_n=INDUSTRY_AI_TOP_N,
-                                )
-                                picked_major, _ = await _pick_ai_candidate("major", major_candidates)
-                                if not picked_major and major_candidates:
-                                    picked_major = major_candidates[0]
-
-                                picked_middle = None
-                                if picked_major:
-                                    major_code_val = picked_major.get("major_code", "")
-                                    middle_candidates = INDUSTRY_CLASSIFIER.build_level_candidates(
-                                        "middle",
-                                        scores,
-                                        top_n=INDUSTRY_AI_TOP_N,
-                                        major_code=major_code_val,
+                            industry_result = industry_result_ai
+                            allow_rule_fallback = (
+                                INDUSTRY_RULE_FALLBACK_ENABLED
+                                and ((not INDUSTRY_REQUIRE_AI) or ai_attempted or (not ai_available))
+                            )
+                            if not industry_result and allow_rule_fallback:
+                                try:
+                                    rule_min_score = max(INDUSTRY_RULE_MIN_SCORE, INDUSTRY_RULE_FALLBACK_MIN_SCORE)
+                                    rule_res = INDUSTRY_CLASSIFIER.rule_classify(
+                                        blocks,
+                                        min_score=rule_min_score,
                                     )
-                                    picked_middle, _ = await _pick_ai_candidate(
-                                        "middle",
-                                        middle_candidates,
-                                        major_code=major_code_val,
-                                    )
-                                    if not picked_middle and middle_candidates:
-                                        picked_middle = middle_candidates[0]
+                                except Exception:
+                                    rule_res = None
+                                if rule_res:
+                                    top_minor, margin_minor = _top_and_margin(scores.get("minor_scores") or {})
+                                    if (
+                                        top_minor >= INDUSTRY_RULE_FALLBACK_MIN_SCORE
+                                        and margin_minor >= INDUSTRY_RULE_FALLBACK_MARGIN
+                                    ):
+                                        rule_res["source"] = "rule_strict"
+                                        industry_result = rule_res
 
-                                picked_minor = None
-                                minor_ai_res = None
-                                if picked_major and picked_middle:
-                                    major_code_val = picked_major.get("major_code", "")
-                                    middle_code_val = picked_middle.get("middle_code", "")
-                                    minor_candidates = INDUSTRY_CLASSIFIER.build_level_candidates(
-                                        "minor",
-                                        scores,
-                                        top_n=INDUSTRY_AI_TOP_N,
-                                        major_code=major_code_val,
-                                        middle_code=middle_code_val,
-                                    )
-                                    picked_minor, minor_ai_res = await _pick_ai_candidate(
-                                        "minor",
-                                        minor_candidates,
-                                        major_code=major_code_val,
-                                        middle_code=middle_code_val,
-                                    )
-                                    if not picked_minor and minor_candidates:
-                                        picked_minor = minor_candidates[0]
-
-                                final_candidate = None
-                                final_ai_res = None
-                                if picked_minor:
-                                    final_candidate = picked_minor
-                                    final_ai_res = minor_ai_res
-
-                                    if scores.get("use_detail"):
-                                        major_code_val = picked_minor.get("major_code", "")
-                                        middle_code_val = picked_minor.get("middle_code", "")
-                                        minor_code_val = picked_minor.get("minor_code", "")
-                                        detail_candidates = INDUSTRY_CLASSIFIER.build_level_candidates(
-                                            "detail",
-                                            scores,
-                                            top_n=INDUSTRY_AI_TOP_N,
-                                            major_code=major_code_val,
-                                            middle_code=middle_code_val,
-                                            minor_code=minor_code_val,
-                                        )
-                                        picked_detail, detail_ai_res = await _pick_ai_candidate(
-                                            "detail",
-                                            detail_candidates,
-                                            major_code=major_code_val,
-                                            middle_code=middle_code_val,
-                                        )
-                                        if not picked_detail and detail_candidates:
-                                            picked_detail = detail_candidates[0]
-                                        if picked_detail:
-                                            final_candidate = picked_detail
-                                            final_ai_res = detail_ai_res
-
-                                if final_candidate and isinstance(final_ai_res, dict):
-                                    ai_industry_val = str(final_ai_res.get("industry") or "").strip()
-                                    try:
-                                        conf = float(final_ai_res.get("confidence") or 0.0)
-                                    except Exception:
-                                        conf = 0.0
-                                    conf = max(0.0, min(1.0, conf))
-                                    industry_result_ai = {
-                                        "major_code": final_candidate.get("major_code", ""),
-                                        "major_name": final_candidate.get("major_name", ""),
-                                        "middle_code": final_candidate.get("middle_code", ""),
-                                        "middle_name": final_candidate.get("middle_name", ""),
-                                        "minor_code": final_candidate.get("minor_code", ""),
-                                        "minor_name": final_candidate.get("minor_name", ""),
-                                        "confidence": conf,
-                                        "source": "ai",
+                            lookup_name = ai_industry_val or industry_hint_val or industry_val
+                            if (not industry_result) and INDUSTRY_NAME_LOOKUP_ENABLED and lookup_name:
+                                try:
+                                    exact_candidate = INDUSTRY_CLASSIFIER.resolve_exact_candidate_from_name(lookup_name)
+                                except Exception:
+                                    exact_candidate = None
+                                if exact_candidate:
+                                    industry_result = {
+                                        "major_code": exact_candidate.get("major_code", ""),
+                                        "major_name": exact_candidate.get("major_name", ""),
+                                        "middle_code": exact_candidate.get("middle_code", ""),
+                                        "middle_name": exact_candidate.get("middle_name", ""),
+                                        "minor_code": exact_candidate.get("minor_code", ""),
+                                        "minor_name": exact_candidate.get("minor_name", ""),
+                                        "confidence": 0.7,
+                                        "source": "name_exact",
                                     }
 
-                            if (not industry_result_ai) and (not ai_available):
-                                if _has_scores(scores):
-                                    major_candidates = INDUSTRY_CLASSIFIER.build_level_candidates(
-                                        "major",
-                                        scores,
-                                        top_n=1,
-                                    )
-                                    picked_major = major_candidates[0] if major_candidates else None
-
-                                    picked_middle = None
-                                    if picked_major:
-                                        major_code_val = picked_major.get("major_code", "")
-                                        middle_candidates = INDUSTRY_CLASSIFIER.build_level_candidates(
-                                            "middle",
-                                            scores,
-                                            top_n=1,
-                                            major_code=major_code_val,
-                                        )
-                                        picked_middle = middle_candidates[0] if middle_candidates else None
-
-                                    picked_minor = None
-                                    if picked_major and picked_middle:
-                                        major_code_val = picked_major.get("major_code", "")
-                                        middle_code_val = picked_middle.get("middle_code", "")
-                                        minor_candidates = INDUSTRY_CLASSIFIER.build_level_candidates(
-                                            "minor",
-                                            scores,
-                                            top_n=1,
-                                            major_code=major_code_val,
-                                            middle_code=middle_code_val,
-                                        )
-                                        picked_minor = minor_candidates[0] if minor_candidates else None
-
-                                    final_candidate = None
-                                    final_level = "minor"
-                                    if picked_minor:
-                                        final_candidate = picked_minor
-                                        if scores.get("use_detail"):
-                                            major_code_val = picked_minor.get("major_code", "")
-                                            middle_code_val = picked_minor.get("middle_code", "")
-                                            minor_code_val = picked_minor.get("minor_code", "")
-                                            detail_candidates = INDUSTRY_CLASSIFIER.build_level_candidates(
-                                                "detail",
-                                                scores,
-                                                top_n=1,
-                                                major_code=major_code_val,
-                                                middle_code=middle_code_val,
-                                                minor_code=minor_code_val,
-                                            )
-                                            if detail_candidates:
-                                                final_candidate = detail_candidates[0]
-                                                final_level = "detail"
-
-                                    if final_candidate:
-                                        score_map = scores.get("detail_scores") if final_level == "detail" else scores.get("minor_scores")
-                                        score_val = 0
-                                        if isinstance(score_map, dict):
-                                            score_val = int(score_map.get(final_candidate.get("minor_code", ""), 0))
-                                        conf = min(1.0, 0.5 + 0.1 * score_val)
-                                        industry_result_rule = {
-                                            "major_code": final_candidate.get("major_code", ""),
-                                            "major_name": final_candidate.get("major_name", ""),
-                                            "middle_code": final_candidate.get("middle_code", ""),
-                                            "middle_name": final_candidate.get("middle_name", ""),
-                                            "minor_code": final_candidate.get("minor_code", ""),
-                                            "minor_name": final_candidate.get("minor_name", ""),
-                                            "confidence": conf,
-                                            "source": "rule",
-                                        }
-                                if not industry_result_rule:
-                                    industry_result_rule = INDUSTRY_CLASSIFIER.rule_classify(
-                                        blocks,
-                                        min_score=INDUSTRY_RULE_MIN_SCORE,
-                                    )
-                            industry_result = industry_result_ai or industry_result_rule
-                            if ai_industry_val:
-                                industry_val = ai_industry_val[:60]
+                            final_industry_name = ""
+                            if industry_result:
+                                final_industry_name = (
+                                    industry_result.get("minor_name")
+                                    or industry_result.get("middle_name")
+                                    or industry_result.get("major_name")
+                                    or ""
+                                )
+                            industry_val = (final_industry_name[:60] if final_industry_name else "不明")
 
                             if industry_result:
                                 # If AI returns detail code, map to minor representative
@@ -6461,7 +6481,9 @@ async def process():
                                 except Exception:
                                     pass
                             else:
-                                # Unknown: keep fields empty but mark minor_item as "不明"
+                                if not industry_class_source:
+                                    industry_class_source = "unclassified"
+                                industry_class_confidence = 0.0
                                 if not company.get("industry_minor_item"):
                                     company["industry_minor_item_code"] = ""
                                     company["industry_minor_item"] = "不明"
@@ -6749,6 +6771,863 @@ async def process():
                         company["alt_homepage"] = alt_homepage
                         company["alt_homepage_type"] = alt_homepage_type
                         company["final_homepage"] = final_homepage_candidate
+
+                        # ---- 業種（final_homepage確定後に最終判定） ----
+                        if INDUSTRY_CLASSIFY_AFTER_HOMEPAGE and INDUSTRY_CLASSIFY_ENABLED and INDUSTRY_CLASSIFIER.loaded:
+                            target_urls = [
+                                official_homepage,
+                                final_homepage_candidate,
+                                alt_homepage,
+                                company.get("reference_homepage") or "",
+                            ]
+
+                            def _normalized_host(url_val: str) -> str:
+                                try:
+                                    host_val = (urlparse(url_val).netloc or "").lower().split(":")[0]
+                                except Exception:
+                                    host_val = ""
+                                if host_val.startswith("www."):
+                                    host_val = host_val[4:]
+                                return host_val
+
+                            def _top_and_margin(score_map: dict[str, Any]) -> tuple[int, int]:
+                                if not isinstance(score_map, dict) or not score_map:
+                                    return 0, 0
+                                vals: list[int] = []
+                                for v in score_map.values():
+                                    try:
+                                        vals.append(int(v))
+                                    except Exception:
+                                        continue
+                                if not vals:
+                                    return 0, 0
+                                vals.sort(reverse=True)
+                                top = vals[0]
+                                second = vals[1] if len(vals) > 1 else 0
+                                return top, max(0, top - second)
+
+                            target_hosts = {_normalized_host(u) for u in target_urls if isinstance(u, str) and u.strip()}
+                            target_hosts = {h for h in target_hosts if h}
+
+                            payloads_for_industry: list[dict[str, Any]] = []
+                            for p in payloads_for_desc:
+                                if not isinstance(p, dict):
+                                    continue
+                                p_url = str(p.get("url") or "").strip()
+                                p_host = _normalized_host(p_url) if p_url else ""
+                                if target_hosts:
+                                    if p_host and p_host in target_hosts:
+                                        payloads_for_industry.append(p)
+                                else:
+                                    payloads_for_industry.append(p)
+                            if not payloads_for_industry:
+                                payloads_for_industry = [p for p in payloads_for_desc if isinstance(p, dict)]
+
+                            # 業種判定は「会社概要系ページ」を優先し、description / business_tags を主材料にする。
+                            profile_payloads: list[dict[str, Any]] = []
+                            non_profile_payloads: list[dict[str, Any]] = []
+                            for p in payloads_for_industry:
+                                p_url = str((p or {}).get("url") or "").strip()
+                                pt = str((page_type_per_url or {}).get(p_url) or "")
+                                if (pt == "COMPANY_PROFILE") or _is_profile_like_url(p_url):
+                                    profile_payloads.append(p)
+                                else:
+                                    non_profile_payloads.append(p)
+
+                            primary_payloads = profile_payloads if profile_payloads else payloads_for_industry
+                            primary_blocks = _collect_business_text_blocks(primary_payloads)
+                            secondary_blocks = _collect_business_text_blocks(non_profile_payloads) if profile_payloads else []
+                            same_host_evidence_chars = sum(len(b) for b in primary_blocks if isinstance(b, str))
+
+                            parsed_business_tags: list[str] = []
+                            if business_tags_val:
+                                try:
+                                    if business_tags_val.strip().startswith("["):
+                                        tags = json.loads(business_tags_val)
+                                        if isinstance(tags, list):
+                                            parsed_business_tags = [str(t).strip() for t in tags if str(t).strip()]
+                                    else:
+                                        parsed_business_tags = [business_tags_val.strip()]
+                                except Exception:
+                                    parsed_business_tags = [business_tags_val.strip()]
+
+                            industry_blocks: list[str] = []
+                            if description_val:
+                                industry_blocks.append(description_val)
+                            if parsed_business_tags:
+                                industry_blocks.extend(parsed_business_tags)
+                            industry_blocks.extend(primary_blocks)
+                            # 会社概要系の材料が薄い場合のみ、他ページの情報を限定的に補助利用する。
+                            if secondary_blocks and same_host_evidence_chars < 220:
+                                industry_blocks.extend(secondary_blocks[:3])
+                            if name:
+                                industry_blocks.append(name)
+                            if industry_hint_val:
+                                industry_blocks.append(industry_hint_val)
+                            if (not parsed_business_tags) and business_tags_val:
+                                industry_blocks.append(business_tags_val)
+                            license_val = (company.get("license") or "").strip()
+                            if license_val:
+                                industry_blocks.append(f"許認可: {license_val}"[:400])
+                            desc_ev = (company.get("description_evidence") or "").strip()
+                            if desc_ev:
+                                industry_blocks.append(f"根拠: {desc_ev}"[:400])
+
+                            dedup_industry_blocks: list[str] = []
+                            seen_industry_blocks: set[str] = set()
+                            for block in industry_blocks:
+                                bb = (block or "").strip()
+                                if not bb or bb in seen_industry_blocks:
+                                    continue
+                                seen_industry_blocks.add(bb)
+                                dedup_industry_blocks.append(bb)
+                            industry_blocks = dedup_industry_blocks[:20]
+
+                            # description/tags は判定スコアにもう一段反映して優先度を高める。
+                            score_blocks = list(industry_blocks)
+                            if description_val:
+                                score_blocks.append(description_val)
+                            if parsed_business_tags:
+                                score_blocks.extend(parsed_business_tags)
+
+                            scores = INDUSTRY_CLASSIFIER.score_levels(score_blocks)
+                            use_detail = bool(scores.get("use_detail"))
+                            industry_result_post: dict[str, Any] | None = None
+                            detail_result_post: dict[str, Any] | None = None
+                            ai_industry_name = ""
+                            ai_attempted = False
+                            ai_available = (
+                                INDUSTRY_AI_ENABLED
+                                and verifier is not None
+                                and hasattr(verifier, "judge_industry")
+                                and getattr(verifier, "industry_prompt", None)
+                            )
+                            ai_text = "\n".join([b for b in score_blocks if b])
+
+                            def _ai_confidence(ai_res: dict[str, Any]) -> float:
+                                try:
+                                    conf = float(ai_res.get("confidence") or 0.0)
+                                except Exception:
+                                    conf = 0.0
+                                return max(0.0, min(1.0, conf))
+
+                            def _match_candidate(
+                                ai_res: dict[str, Any],
+                                candidates: list[dict[str, str]],
+                                level: str,
+                            ) -> dict[str, str] | None:
+                                if not candidates:
+                                    return None
+
+                                maj = str(ai_res.get("major_code") or "").strip()
+                                mid = str(ai_res.get("middle_code") or "").strip()
+                                mino = str(ai_res.get("minor_code") or "").strip()
+                                has_codes = bool(maj or mid or mino)
+                                if has_codes:
+                                    for cand in candidates:
+                                        if maj and cand.get("major_code") != maj:
+                                            continue
+                                        if level in {"middle", "minor", "detail"} and mid and cand.get("middle_code") != mid:
+                                            continue
+                                        if level in {"minor", "detail"} and mino and cand.get("minor_code") != mino:
+                                            continue
+                                        return cand
+
+                                if level == "major":
+                                    ai_name = str(ai_res.get("major_name") or ai_res.get("industry") or "").strip()
+                                    if ai_name:
+                                        norm_name = INDUSTRY_CLASSIFIER.taxonomy._normalize(ai_name)
+                                        for cand in candidates:
+                                            if INDUSTRY_CLASSIFIER.taxonomy._normalize(cand.get("major_name", "")) == norm_name:
+                                                return cand
+                                elif level == "middle":
+                                    ai_name = str(ai_res.get("middle_name") or "").strip()
+                                    if ai_name:
+                                        norm_name = INDUSTRY_CLASSIFIER.taxonomy._normalize(ai_name)
+                                        for cand in candidates:
+                                            if INDUSTRY_CLASSIFIER.taxonomy._normalize(cand.get("middle_name", "")) == norm_name:
+                                                return cand
+                                else:
+                                    ai_name = str(ai_res.get("minor_name") or "").strip()
+                                    if ai_name:
+                                        norm_name = INDUSTRY_CLASSIFIER.taxonomy._normalize(ai_name)
+                                        for cand in candidates:
+                                            if INDUSTRY_CLASSIFIER.taxonomy._normalize(cand.get("minor_name", "")) == norm_name:
+                                                return cand
+                                return None
+
+                            def _ai_accepts(
+                                ai_res: dict[str, Any],
+                                matched: dict[str, str],
+                                *,
+                                min_confidence: float,
+                            ) -> bool:
+                                if _ai_confidence(ai_res) < min_confidence:
+                                    return False
+                                if str(ai_res.get("human_review") or "").strip().lower() in {"true", "1", "yes"}:
+                                    return False
+                                regulated_majors = {"医療，福祉", "建設業", "金融業，保険業"}
+                                major_name = (matched.get("major_name") or "").strip()
+                                if major_name in regulated_majors:
+                                    facts = ai_res.get("facts")
+                                    license_info = ""
+                                    if isinstance(facts, dict):
+                                        license_info = str(
+                                            facts.get("licenses")
+                                            or facts.get("license")
+                                            or facts.get("license_or_registration")
+                                            or ""
+                                        ).strip()
+                                    if not license_info:
+                                        return False
+                                return True
+
+                            async def _judge_stage(
+                                level: str,
+                                candidates: list[dict[str, str]],
+                                *,
+                                min_confidence: float,
+                            ) -> tuple[dict[str, str] | None, dict[str, Any] | None]:
+                                nonlocal ai_attempted
+                                if not (ai_available and candidates and has_time_for_ai()):
+                                    return None, None
+                                ai_attempted = True
+                                try:
+                                    ai_res = await asyncio.wait_for(
+                                        verifier.judge_industry(
+                                            text=ai_text,
+                                            company_name=name,
+                                            candidates_text=INDUSTRY_CLASSIFIER.format_candidates_text(candidates),
+                                        ),
+                                        timeout=min(clamp_timeout(ai_call_timeout), 30.0),
+                                    )
+                                except Exception:
+                                    return None, None
+                                if not isinstance(ai_res, dict):
+                                    return None, None
+                                matched = _match_candidate(ai_res, candidates, level)
+                                if not matched:
+                                    return None, ai_res
+                                if not _ai_accepts(ai_res, matched, min_confidence=min_confidence):
+                                    return None, ai_res
+                                return matched, ai_res
+
+                            major_candidates = INDUSTRY_CLASSIFIER.build_level_candidates(
+                                "major",
+                                scores,
+                                top_n=max(INDUSTRY_AI_TOP_N, 10),
+                            )
+                            if (not major_candidates) and industry_hint_val:
+                                hint_candidates = INDUSTRY_CLASSIFIER.build_candidates_from_industry_name(
+                                    industry_hint_val,
+                                    top_n=max(INDUSTRY_AI_TOP_N, 24),
+                                )
+                                major_map: dict[str, dict[str, str]] = {}
+                                for cand in hint_candidates:
+                                    maj = str(cand.get("major_code") or "").strip()
+                                    if not maj:
+                                        continue
+                                    if maj in major_map:
+                                        continue
+                                    major_map[maj] = {
+                                        "major_code": maj,
+                                        "major_name": str(cand.get("major_name") or ""),
+                                        "middle_code": "",
+                                        "middle_name": "",
+                                        "minor_code": "",
+                                        "minor_name": "",
+                                    }
+                                major_candidates = list(major_map.values())[: max(INDUSTRY_AI_TOP_N, 10)]
+
+                            # === Multi-signal補強: ホームページ本文 + description + business_tags + 社名を一括評価し、
+                            # 多角・商社・レンタル系シグナルが出たら関連大分類を候補に追加する。
+                            def _add_major_candidate_by_name(major_name: str) -> None:
+                                if not major_name:
+                                    return
+                                code = ""
+                                for c, n in INDUSTRY_CLASSIFIER.taxonomy.major_names.items():
+                                    if n == major_name:
+                                        code = c
+                                        break
+                                if not code:
+                                    return
+                                if any(str(cand.get("major_code") or "") == code for cand in major_candidates):
+                                    return
+                                major_candidates.append(
+                                    {
+                                        "major_code": code,
+                                        "major_name": major_name,
+                                        "middle_code": "",
+                                        "middle_name": "",
+                                        "minor_code": "",
+                                        "minor_name": "",
+                                    }
+                                )
+
+                            multi_text = "\n".join([b for b in industry_blocks if b]).strip()
+                            norm_text = unicodedata.normalize("NFKC", multi_text).lower()
+
+                            wholesale_kws = (
+                                "商社",
+                                "卸",
+                                "卸売",
+                                "流通",
+                                "仕入",
+                                "代理店",
+                                "販社",
+                                "ディーラー",
+                                "再販",
+                                "販売店",
+                                "買取",
+                                "リユース",
+                                "リサイクル",
+                                "中古",
+                            )
+                            rental_kws = (
+                                "レンタル",
+                                "リース",
+                                "賃貸",
+                                "サブリース",
+                                "物品賃貸",
+                                "貸し",
+                                "貸付",
+                                "レンタカー",
+                                "レンタルオフィス",
+                                "レンタルスペース",
+                            )
+                            holding_kws = (
+                                "ホールディングス",
+                                "holding",
+                                "holdings",
+                                "hd",
+                                "持株",
+                            )
+
+                            def _hit(keywords: tuple[str, ...]) -> bool:
+                                return any(kw and kw.lower() in norm_text for kw in keywords)
+
+                            if _hit(wholesale_kws):
+                                _add_major_candidate_by_name("卸売業，小売業")
+                            if _hit(rental_kws) or _hit(holding_kws):
+                                _add_major_candidate_by_name("不動産業，物品賃貸業")
+
+                            picked_major, _major_ai_res = await _judge_stage(
+                                "major",
+                                major_candidates,
+                                min_confidence=INDUSTRY_AI_MIN_CONFIDENCE,
+                            )
+                            picked_minor: dict[str, str] | None = None
+                            minor_ai_res: dict[str, Any] | None = None
+                            picked_middle: dict[str, str] | None = None
+
+                            if picked_major:
+                                major_code_val = str(picked_major.get("major_code") or "")
+                                full_minor_candidates = INDUSTRY_CLASSIFIER.build_level_candidates(
+                                    "minor",
+                                    scores,
+                                    top_n=2000,
+                                    major_code=major_code_val,
+                                )
+                                if (not full_minor_candidates) and industry_hint_val:
+                                    hint_minor = INDUSTRY_CLASSIFIER.build_candidates_from_industry_name(
+                                        industry_hint_val,
+                                        top_n=300,
+                                    )
+                                    dedup_minor: dict[str, dict[str, str]] = {}
+                                    for cand in hint_minor:
+                                        if str(cand.get("major_code") or "") != major_code_val:
+                                            continue
+                                        min_code = str(cand.get("minor_code") or "")
+                                        if not min_code or min_code in dedup_minor:
+                                            continue
+                                        dedup_minor[min_code] = cand
+                                    full_minor_candidates = list(dedup_minor.values())
+
+                                if full_minor_candidates:
+                                    if len(full_minor_candidates) <= INDUSTRY_MINOR_DIRECT_MAX_CANDIDATES:
+                                        direct_minor_candidates = full_minor_candidates[: max(INDUSTRY_AI_TOP_N, len(full_minor_candidates))]
+                                        picked_minor, minor_ai_res = await _judge_stage(
+                                            "minor",
+                                            direct_minor_candidates,
+                                            min_confidence=INDUSTRY_AI_MIN_CONFIDENCE,
+                                        )
+                                    else:
+                                        middle_candidates = INDUSTRY_CLASSIFIER.build_level_candidates(
+                                            "middle",
+                                            scores,
+                                            top_n=max(INDUSTRY_AI_TOP_N, 12),
+                                            major_code=major_code_val,
+                                        )
+                                        picked_middle, _middle_ai_res = await _judge_stage(
+                                            "middle",
+                                            middle_candidates,
+                                            min_confidence=INDUSTRY_AI_MIN_CONFIDENCE,
+                                        )
+                                        if picked_middle:
+                                            middle_code_val = str(picked_middle.get("middle_code") or "")
+                                            scoped_minor_candidates = INDUSTRY_CLASSIFIER.build_level_candidates(
+                                                "minor",
+                                                scores,
+                                                top_n=max(INDUSTRY_AI_TOP_N, 30),
+                                                major_code=major_code_val,
+                                                middle_code=middle_code_val,
+                                            )
+                                            if not scoped_minor_candidates:
+                                                scoped_minor_candidates = [
+                                                    cand
+                                                    for cand in full_minor_candidates
+                                                    if str(cand.get("middle_code") or "") == middle_code_val
+                                                ][: max(INDUSTRY_AI_TOP_N, 30)]
+                                            picked_minor, minor_ai_res = await _judge_stage(
+                                                "minor",
+                                                scoped_minor_candidates,
+                                                min_confidence=INDUSTRY_AI_MIN_CONFIDENCE,
+                                            )
+                                        if not picked_minor:
+                                            fallback_minor_candidates = full_minor_candidates[: max(INDUSTRY_AI_TOP_N, 30)]
+                                            picked_minor, minor_ai_res = await _judge_stage(
+                                                "minor",
+                                                fallback_minor_candidates,
+                                                min_confidence=INDUSTRY_AI_MIN_CONFIDENCE,
+                                            )
+
+                            if picked_minor and isinstance(minor_ai_res, dict):
+                                ai_industry_name = str(minor_ai_res.get("industry") or "").strip()
+                                industry_result_post = {
+                                    "major_code": str(picked_minor.get("major_code") or ""),
+                                    "major_name": str(picked_minor.get("major_name") or ""),
+                                    "middle_code": str(picked_minor.get("middle_code") or ""),
+                                    "middle_name": str(picked_minor.get("middle_name") or ""),
+                                    "minor_code": str(picked_minor.get("minor_code") or ""),
+                                    "minor_name": str(picked_minor.get("minor_name") or ""),
+                                    "confidence": _ai_confidence(minor_ai_res),
+                                    "source": "ai_final_homepage",
+                                }
+
+                                if use_detail and same_host_evidence_chars >= INDUSTRY_DETAIL_MIN_EVIDENCE_CHARS:
+                                    detail_candidates = INDUSTRY_CLASSIFIER.build_level_candidates(
+                                        "detail",
+                                        scores,
+                                        top_n=max(INDUSTRY_AI_TOP_N, 20),
+                                        major_code=str(picked_minor.get("major_code") or ""),
+                                        middle_code=str(picked_minor.get("middle_code") or ""),
+                                        minor_code=str(picked_minor.get("minor_code") or ""),
+                                    )
+                                    picked_detail, detail_ai_res = await _judge_stage(
+                                        "detail",
+                                        detail_candidates,
+                                        min_confidence=INDUSTRY_DETAIL_MIN_CONFIDENCE,
+                                    )
+                                    if picked_detail and isinstance(detail_ai_res, dict):
+                                        detail_result_post = {
+                                            "major_code": str(picked_detail.get("major_code") or ""),
+                                            "major_name": str(picked_detail.get("major_name") or ""),
+                                            "middle_code": str(picked_detail.get("middle_code") or ""),
+                                            "middle_name": str(picked_detail.get("middle_name") or ""),
+                                            "minor_code": str(picked_detail.get("minor_code") or ""),
+                                            "minor_name": str(picked_detail.get("minor_name") or ""),
+                                            "confidence": _ai_confidence(detail_ai_res),
+                                            "source": "ai_detail_optional",
+                                        }
+
+                            allow_rule_fallback = (
+                                INDUSTRY_RULE_FALLBACK_ENABLED
+                                and ((not INDUSTRY_REQUIRE_AI) or ai_attempted or (not ai_available))
+                            )
+                            if (not industry_result_post) and allow_rule_fallback:
+                                try:
+                                    rule_min = max(INDUSTRY_RULE_MIN_SCORE, INDUSTRY_RULE_FALLBACK_MIN_SCORE)
+                                    rule_res = INDUSTRY_CLASSIFIER.rule_classify(industry_blocks, min_score=rule_min)
+                                except Exception:
+                                    rule_res = None
+                                if rule_res:
+                                    top_minor, margin_minor = _top_and_margin(scores.get("minor_scores") or {})
+                                    if top_minor >= INDUSTRY_RULE_FALLBACK_MIN_SCORE and margin_minor >= INDUSTRY_RULE_FALLBACK_MARGIN:
+                                        rule_res["source"] = "rule_strict_post"
+                                        industry_result_post = rule_res
+
+                            if (not industry_result_post) and INDUSTRY_NAME_LOOKUP_ENABLED:
+                                lookup_name = ai_industry_name or industry_hint_val or industry_val
+                                try:
+                                    exact_candidate = INDUSTRY_CLASSIFIER.resolve_exact_candidate_from_name(lookup_name)
+                                except Exception:
+                                    exact_candidate = None
+                                if exact_candidate:
+                                    industry_result_post = {
+                                        "major_code": exact_candidate.get("major_code", ""),
+                                        "major_name": exact_candidate.get("major_name", ""),
+                                        "middle_code": exact_candidate.get("middle_code", ""),
+                                        "middle_name": exact_candidate.get("middle_name", ""),
+                                        "minor_code": exact_candidate.get("minor_code", ""),
+                                        "minor_name": exact_candidate.get("minor_name", ""),
+                                        "confidence": 0.7,
+                                        "source": "name_exact_post",
+                                    }
+
+                            # 低信頼なら tags を強いヒントにして再AI判定（精度補強）
+                            if (
+                                industry_result_post
+                                and business_tags_val
+                                and ai_available
+                                and has_time_for_ai()
+                                and float(industry_result_post.get("confidence") or 0.0) < 0.7
+                            ):
+                                tag_list: list[str] = []
+                                try:
+                                    if business_tags_val.strip().startswith("["):
+                                        maybe = json.loads(business_tags_val)
+                                        if isinstance(maybe, list):
+                                            tag_list = [str(t).strip() for t in maybe if str(t).strip()]
+                                    else:
+                                        tag_list = [business_tags_val.strip()]
+                                except Exception:
+                                    tag_list = [business_tags_val.strip()]
+
+                                if tag_list:
+                                    cand_map: dict[str, dict[str, str]] = {}
+                                    for tag in tag_list:
+                                        for cand in INDUSTRY_CLASSIFIER.build_candidates_from_industry_name(
+                                            tag, top_n=max(INDUSTRY_AI_TOP_N, 120)
+                                        ):
+                                            key = (
+                                                str(cand.get("minor_code") or "")
+                                                or str(cand.get("middle_code") or "")
+                                                or str(cand.get("major_code") or "")
+                                            )
+                                            if not key or key in cand_map:
+                                                continue
+                                            cand_map[key] = cand
+                                    tag_candidates = list(cand_map.values())[: max(INDUSTRY_AI_TOP_N, 120)]
+                                    if tag_candidates:
+                                        ai_attempted = True
+                                        try:
+                                            ai_res_tag = await asyncio.wait_for(
+                                                verifier.judge_industry(
+                                                    text=ai_text,
+                                                    company_name=name,
+                                                    candidates_text=INDUSTRY_CLASSIFIER.format_candidates_text(tag_candidates),
+                                                ),
+                                                timeout=min(clamp_timeout(ai_call_timeout), 20.0),
+                                            )
+                                        except Exception:
+                                            ai_res_tag = None
+                                        if isinstance(ai_res_tag, dict):
+                                            matched_tag = _match_candidate(ai_res_tag, tag_candidates, "minor")
+                                            new_conf = max(0.2, _ai_confidence(ai_res_tag)) if matched_tag else 0.0
+                                            cur_conf = float(industry_result_post.get("confidence") or 0.0)
+                                            if matched_tag and (new_conf >= cur_conf or cur_conf < INDUSTRY_AI_MIN_CONFIDENCE):
+                                                industry_result_post = {
+                                                    "major_code": str(matched_tag.get("major_code") or ""),
+                                                    "major_name": str(matched_tag.get("major_name") or ""),
+                                                    "middle_code": str(matched_tag.get("middle_code") or ""),
+                                                    "middle_name": str(matched_tag.get("middle_name") or ""),
+                                                    "minor_code": str(matched_tag.get("minor_code") or ""),
+                                                    "minor_name": str(matched_tag.get("minor_name") or ""),
+                                                    "confidence": new_conf,
+                                                    "source": "ai_business_tags_retry",
+                                                }
+                                                ai_industry_name = str(ai_res_tag.get("industry") or ai_industry_name)
+
+                            # business_tags を強いヒントにして追加AI判定（最小限の再呼び出し）
+                            if (not industry_result_post) and ai_available and has_time_for_ai() and business_tags_val:
+                                tag_list: list[str] = []
+                                try:
+                                    if business_tags_val.strip().startswith("["):
+                                        maybe = json.loads(business_tags_val)
+                                        if isinstance(maybe, list):
+                                            tag_list = [str(t).strip() for t in maybe if str(t).strip()]
+                                    else:
+                                        tag_list = [business_tags_val.strip()]
+                                except Exception:
+                                    tag_list = [business_tags_val.strip()]
+
+                                if tag_list:
+                                    cand_map: dict[str, dict[str, str]] = {}
+                                    for tag in tag_list:
+                                        for cand in INDUSTRY_CLASSIFIER.build_candidates_from_industry_name(
+                                            tag, top_n=max(INDUSTRY_AI_TOP_N, 120)
+                                        ):
+                                            key = (
+                                                str(cand.get("minor_code") or "")
+                                                or str(cand.get("middle_code") or "")
+                                                or str(cand.get("major_code") or "")
+                                            )
+                                            if not key or key in cand_map:
+                                                continue
+                                            cand_map[key] = cand
+                                    tag_candidates = list(cand_map.values())[: max(INDUSTRY_AI_TOP_N, 120)]
+                                    if tag_candidates:
+                                        ai_attempted = True
+                                        try:
+                                            ai_res_tag = await asyncio.wait_for(
+                                                verifier.judge_industry(
+                                                    text=ai_text,
+                                                    company_name=name,
+                                                    candidates_text=INDUSTRY_CLASSIFIER.format_candidates_text(tag_candidates),
+                                                ),
+                                                timeout=min(clamp_timeout(ai_call_timeout), 20.0),
+                                            )
+                                        except Exception:
+                                            ai_res_tag = None
+                                        if isinstance(ai_res_tag, dict):
+                                            matched_tag = _match_candidate(ai_res_tag, tag_candidates, "minor")
+                                            if matched_tag:
+                                                industry_result_post = {
+                                                    "major_code": str(matched_tag.get("major_code") or ""),
+                                                    "major_name": str(matched_tag.get("major_name") or ""),
+                                                    "middle_code": str(matched_tag.get("middle_code") or ""),
+                                                    "middle_name": str(matched_tag.get("middle_name") or ""),
+                                                    "minor_code": str(matched_tag.get("minor_code") or ""),
+                                                    "minor_name": str(matched_tag.get("minor_name") or ""),
+                                                    "confidence": max(0.2, _ai_confidence(ai_res_tag)),
+                                                    "source": "ai_business_tags",
+                                                }
+                                                ai_industry_name = str(ai_res_tag.get("industry") or ai_industry_name)
+
+                            if (not industry_result_post) and INDUSTRY_FORCE_CLASSIFY:
+                                taxonomy = INDUSTRY_CLASSIFIER.taxonomy
+
+                                def _candidate_from_code(code_val: str) -> dict[str, Any] | None:
+                                    code = str(code_val or "").strip()
+                                    if not code:
+                                        return None
+                                    if code in taxonomy.minor_names:
+                                        (
+                                            major_code,
+                                            major_name,
+                                            middle_code,
+                                            middle_name,
+                                            minor_code,
+                                            minor_name,
+                                        ) = taxonomy.resolve_hierarchy(code)
+                                        if not (major_code and middle_code and minor_code):
+                                            return None
+                                        return {
+                                            "major_code": major_code,
+                                            "major_name": major_name,
+                                            "middle_code": middle_code,
+                                            "middle_name": middle_name,
+                                            "minor_code": minor_code,
+                                            "minor_name": minor_name,
+                                        }
+                                    if code in taxonomy.detail_names:
+                                        (
+                                            major_code,
+                                            major_name,
+                                            middle_code,
+                                            middle_name,
+                                            _minor_code,
+                                            _minor_name,
+                                            detail_code,
+                                            detail_name,
+                                        ) = taxonomy.resolve_detail_hierarchy(code)
+                                        if not (major_code and middle_code and detail_code):
+                                            return None
+                                        return {
+                                            "major_code": major_code,
+                                            "major_name": major_name,
+                                            "middle_code": middle_code,
+                                            "middle_name": middle_name,
+                                            "minor_code": detail_code,
+                                            "minor_name": detail_name,
+                                        }
+                                    return None
+
+                                forced_candidate: dict[str, Any] | None = None
+                                forced_confidence = 0.35
+                                minor_scores_map = scores.get("minor_scores") or {}
+                                if isinstance(minor_scores_map, dict) and minor_scores_map:
+                                    best_minor_code = ""
+                                    best_minor_score = -1
+                                    for code_key, score_val in minor_scores_map.items():
+                                        try:
+                                            score_num = int(score_val)
+                                        except Exception:
+                                            continue
+                                        if score_num > best_minor_score:
+                                            best_minor_code = str(code_key or "")
+                                            best_minor_score = score_num
+                                    if best_minor_code:
+                                        forced_candidate = _candidate_from_code(best_minor_code)
+                                        if forced_candidate:
+                                            forced_confidence = 0.45
+
+                                if (not forced_candidate) and ai_available and has_time_for_ai():
+                                    forced_candidates = INDUSTRY_CLASSIFIER.build_level_candidates(
+                                        "minor",
+                                        scores,
+                                        top_n=max(INDUSTRY_AI_TOP_N, 120),
+                                    )
+                                    if (not forced_candidates) and industry_hint_val:
+                                        forced_candidates = INDUSTRY_CLASSIFIER.build_candidates_from_industry_name(
+                                            industry_hint_val,
+                                            top_n=max(INDUSTRY_AI_TOP_N, 120),
+                                        )
+                                    if forced_candidates:
+                                        ai_attempted = True
+                                        try:
+                                            ai_res_force = await asyncio.wait_for(
+                                                verifier.judge_industry(
+                                                    text=ai_text,
+                                                    company_name=name,
+                                                    candidates_text=INDUSTRY_CLASSIFIER.format_candidates_text(forced_candidates),
+                                                ),
+                                                timeout=min(clamp_timeout(ai_call_timeout), 30.0),
+                                            )
+                                        except Exception:
+                                            ai_res_force = None
+                                        if isinstance(ai_res_force, dict):
+                                            matched_force = _match_candidate(ai_res_force, forced_candidates, "minor")
+                                            if matched_force:
+                                                forced_candidate = matched_force
+                                                forced_confidence = max(0.2, _ai_confidence(ai_res_force))
+                                                ai_industry_name = str(ai_res_force.get("industry") or ai_industry_name)
+                                    if (not forced_candidate) and forced_candidates:
+                                        forced_candidate = forced_candidates[0]
+                                        forced_confidence = 0.25
+
+                                if not forced_candidate:
+                                    for code in INDUSTRY_FORCE_DEFAULT_MINOR_CODES:
+                                        forced_candidate = _candidate_from_code(code)
+                                        if forced_candidate:
+                                            forced_confidence = 0.2
+                                            break
+
+                                    if not forced_candidate:
+                                        for code in sorted(taxonomy.minor_names.keys()):
+                                            forced_candidate = _candidate_from_code(code)
+                                            if forced_candidate:
+                                                forced_confidence = 0.1
+                                                break
+
+                                if forced_candidate:
+                                    industry_result_post = {
+                                        "major_code": str(forced_candidate.get("major_code") or ""),
+                                        "major_name": str(forced_candidate.get("major_name") or ""),
+                                        "middle_code": str(forced_candidate.get("middle_code") or ""),
+                                        "middle_name": str(forced_candidate.get("middle_name") or ""),
+                                        "minor_code": str(forced_candidate.get("minor_code") or ""),
+                                        "minor_name": str(forced_candidate.get("minor_name") or ""),
+                                        "confidence": forced_confidence,
+                                        "source": "forced_post",
+                                    }
+
+                            if industry_result_post:
+                                minor_item_code = ""
+                                minor_item_name = ""
+                                minor_code_raw = str(industry_result_post.get("minor_code") or "").strip()
+                                if minor_code_raw and minor_code_raw in INDUSTRY_CLASSIFIER.taxonomy.detail_names:
+                                    (
+                                        major_code,
+                                        major_name,
+                                        middle_code,
+                                        middle_name,
+                                        minor_code,
+                                        minor_name,
+                                        detail_code,
+                                        detail_name,
+                                    ) = INDUSTRY_CLASSIFIER.taxonomy.resolve_detail_hierarchy(minor_code_raw)
+                                    if major_name:
+                                        industry_major = major_name
+                                    if middle_name:
+                                        industry_middle = middle_name
+                                    if minor_name:
+                                        industry_minor = minor_name
+                                    if major_code:
+                                        industry_major_code = major_code
+                                    if middle_code:
+                                        industry_middle_code = middle_code
+                                    if minor_code:
+                                        industry_minor_code = minor_code
+                                    minor_item_code = detail_code
+                                    minor_item_name = detail_name
+                                else:
+                                    industry_major = industry_result_post.get("major_name", "") or industry_major
+                                    industry_middle = industry_result_post.get("middle_name", "") or industry_middle
+                                    industry_minor = industry_result_post.get("minor_name", "") or industry_minor
+                                    industry_major_code = industry_result_post.get("major_code", "") or industry_major_code
+                                    industry_middle_code = industry_result_post.get("middle_code", "") or industry_middle_code
+                                    industry_minor_code = industry_result_post.get("minor_code", "") or industry_minor_code
+
+                                if detail_result_post and not minor_item_code:
+                                    detail_code_raw = str(detail_result_post.get("minor_code") or "").strip()
+                                    if detail_code_raw and detail_code_raw in INDUSTRY_CLASSIFIER.taxonomy.detail_names:
+                                        (
+                                            _d_major_code,
+                                            _d_major_name,
+                                            _d_middle_code,
+                                            _d_middle_name,
+                                            d_minor_code,
+                                            _d_minor_name,
+                                            d_detail_code,
+                                            d_detail_name,
+                                        ) = INDUSTRY_CLASSIFIER.taxonomy.resolve_detail_hierarchy(detail_code_raw)
+                                        if d_minor_code and d_minor_code == industry_minor_code:
+                                            minor_item_code = d_detail_code
+                                            minor_item_name = d_detail_name
+
+                                if minor_item_code:
+                                    company["industry_minor_item_code"] = minor_item_code
+                                    company["industry_minor_item"] = minor_item_name
+                                elif industry_minor_code and industry_minor:
+                                    company["industry_minor_item_code"] = industry_minor_code
+                                    company["industry_minor_item"] = industry_minor
+
+                                industry_class_source = industry_result_post.get("source", "") or industry_class_source
+                                try:
+                                    industry_class_confidence = float(
+                                        industry_result_post.get("confidence") or industry_class_confidence
+                                    )
+                                except Exception:
+                                    pass
+                                industry_val = (
+                                    industry_minor
+                                    or industry_result_post.get("middle_name")
+                                    or industry_result_post.get("major_name")
+                                    or industry_val
+                                )
+                            else:
+                                # ここまでで決まらなければ無理に埋めず、レビュー対象に回す
+                                industry_major_code = industry_major_code or ""
+                                industry_major = industry_major or ""
+                                industry_middle_code = industry_middle_code or ""
+                                industry_middle = industry_middle or ""
+                                industry_minor_code = ""
+                                industry_minor = ""
+                                company["industry_minor_item_code"] = ""
+                                company["industry_minor_item"] = ""
+                                industry_val = industry_val or "不明"
+                                industry_class_source = industry_class_source or "unclassified"
+                                industry_class_confidence = 0.0
+                                if company.get("status") in (None, "", "pending", "done"):
+                                    company["status"] = "review"
+
+                            company["industry"] = (industry_val or "不明")[:60]
+                            company["industry_major_code"] = industry_major_code or ""
+                            company["industry_major"] = industry_major or ""
+                            company["industry_middle_code"] = industry_middle_code or ""
+                            company["industry_middle"] = industry_middle or ""
+                            company["industry_minor_code"] = industry_minor_code or ""
+                            company["industry_minor"] = industry_minor or ""
+                            # タグが未生成なら、最終ブロックからローカル推定で埋める（2パス目での判定精度向上用）
+                            if (not business_tags_val) and INFER_INDUSTRY_ALWAYS:
+                                try:
+                                    _inf_ind, inferred_tags2 = infer_industry_and_business_tags(industry_blocks)
+                                    if inferred_tags2:
+                                        business_tags_val = json.dumps(inferred_tags2[:5], ensure_ascii=False)
+                                except Exception:
+                                    pass
+                            minor_item_now = str(company.get("industry_minor_item") or "").strip()
+                            if (not minor_item_now) or minor_item_now == "不明":
+                                if industry_minor:
+                                    company["industry_minor_item_code"] = industry_minor_code or ""
+                                    company["industry_minor_item"] = industry_minor
+                                else:
+                                    company["industry_minor_item_code"] = company.get("industry_minor_item_code") or ""
+                                    company["industry_minor_item"] = (industry_val or "分類不能の産業")[:60]
+                            company["industry_class_source"] = industry_class_source or "unclassified"
+                            company["industry_class_confidence"] = float(industry_class_confidence or 0.0)
+                            company["business_tags"] = business_tags_val
 
                         if not homepage:
                             top3_urls = list(urls or [])[:3]

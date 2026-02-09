@@ -47,65 +47,85 @@ class JSICTaxonomy:
         self._token_index: dict[str, set[str]] = {}
 
     def load(self) -> bool:
-        if self.json_path and os.path.exists(self.json_path):
-            if self._load_from_json(self.json_path):
+        prefer_json = os.getenv("JSIC_PREFER_JSON", "false").lower() == "true"
+
+        def _load_from_csv() -> bool:
+            if not self.csv_path or not os.path.exists(self.csv_path):
+                return False
+            rows = self._read_rows(self.csv_path)
+            if not rows:
+                log.warning("JSIC taxonomy CSV empty: %s", self.csv_path)
+                return False
+
+            # Prefer structured JSIC CSV with explicit major/middle/minor/detail columns.
+            if self._looks_like_industry_select(rows):
+                self._load_from_industry_select(rows)
                 self._build_token_index()
                 return True
-        if not self.csv_path or not os.path.exists(self.csv_path):
-            log.warning("JSIC taxonomy CSV not found: %s", self.csv_path)
-            return False
-        rows = self._read_rows(self.csv_path)
-        if not rows:
-            log.warning("JSIC taxonomy CSV empty: %s", self.csv_path)
-            return False
 
-        # Prefer structured JSIC CSV with explicit major/middle/minor/detail columns.
-        if self._looks_like_industry_select(rows):
-            self._load_from_industry_select(rows)
+            current_major = ""
+            current_middle = ""
+            current_minor = ""
+            for row in rows:
+                code, name = self._extract_code_name(row)
+                if not code or not name:
+                    continue
+                level = self._infer_level(code)
+                if level == "major":
+                    current_major = code
+                    current_middle = ""
+                    current_minor = ""
+                    self.major_names[code] = name
+                elif level == "middle":
+                    current_middle = code
+                    current_minor = ""
+                    if current_major:
+                        self.middle_to_major[current_middle] = current_major
+                    self.middle_names[code] = name
+                elif level == "minor":
+                    current_minor = code
+                    if current_middle:
+                        self.minor_to_middle[current_minor] = current_middle
+                    self.minor_names[code] = name
+                    self._minor_names_norm[code] = self._normalize(name)
+                else:
+                    # detail or unknown; skip storing as selectable
+                    continue
+
+                entry = IndustryEntry(
+                    level=level,
+                    code=code,
+                    name=name,
+                    major_code=current_major,
+                    middle_code=current_middle,
+                    minor_code=current_minor,
+                )
+                self.entries.append(entry)
+
             self._build_token_index()
             return True
 
-        current_major = ""
-        current_middle = ""
-        current_minor = ""
-        for row in rows:
-            code, name = self._extract_code_name(row)
-            if not code or not name:
-                continue
-            level = self._infer_level(code)
-            if level == "major":
-                current_major = code
-                current_middle = ""
-                current_minor = ""
-                self.major_names[code] = name
-            elif level == "middle":
-                current_middle = code
-                current_minor = ""
-                if current_major:
-                    self.middle_to_major[current_middle] = current_major
-                self.middle_names[code] = name
-            elif level == "minor":
-                current_minor = code
-                if current_middle:
-                    self.minor_to_middle[current_minor] = current_middle
-                self.minor_names[code] = name
-                self._minor_names_norm[code] = self._normalize(name)
-            else:
-                # detail or unknown; skip storing as selectable
-                continue
+        def _load_from_json_wrapper() -> bool:
+            if self.json_path and os.path.exists(self.json_path):
+                if self._load_from_json(self.json_path):
+                    self._build_token_index()
+                    return True
+            return False
 
-            entry = IndustryEntry(
-                level=level,
-                code=code,
-                name=name,
-                major_code=current_major,
-                middle_code=current_middle,
-                minor_code=current_minor,
-            )
-            self.entries.append(entry)
+        # デフォルトではCSV優先。JSIC_PREFER_JSON=true のときのみJSONを優先する。
+        if prefer_json:
+            if _load_from_json_wrapper():
+                return True
+            if _load_from_csv():
+                return True
+        else:
+            if _load_from_csv():
+                return True
+            if _load_from_json_wrapper():
+                return True
 
-        self._build_token_index()
-        return True
+        log.warning("JSIC taxonomy not loaded. CSV=%s JSON=%s", self.csv_path, self.json_path)
+        return False
 
     def _load_from_json(self, path: str) -> bool:
         try:
@@ -776,6 +796,54 @@ class IndustryClassifier:
                     }
                 )
         return out
+
+    def resolve_exact_candidate_from_name(self, industry_text: str) -> Optional[dict[str, str]]:
+        if not self.loaded:
+            return None
+        norm = self.taxonomy._normalize(industry_text)
+        if not norm:
+            return None
+
+        # detail -> minor hierarchy
+        for code, name in self.taxonomy.detail_names.items():
+            if self.taxonomy._normalize(name) != norm:
+                continue
+            (
+                major_code,
+                major_name,
+                middle_code,
+                middle_name,
+                _minor_code,
+                _minor_name,
+                detail_code,
+                detail_name,
+            ) = self.taxonomy.resolve_detail_hierarchy(code)
+            if not (major_code and middle_code and detail_code):
+                continue
+            return {
+                "major_code": major_code,
+                "major_name": major_name,
+                "middle_code": middle_code,
+                "middle_name": middle_name,
+                "minor_code": detail_code,
+                "minor_name": detail_name,
+            }
+
+        for code, name in self.taxonomy.minor_names.items():
+            if self.taxonomy._normalize(name) != norm:
+                continue
+            major_code, major_name, middle_code, middle_name, minor_code, minor_name = self.taxonomy.resolve_hierarchy(code)
+            if not (major_code and middle_code and minor_code):
+                continue
+            return {
+                "major_code": major_code,
+                "major_name": major_name,
+                "middle_code": middle_code,
+                "middle_name": middle_name,
+                "minor_code": minor_code,
+                "minor_name": minor_name,
+            }
+        return None
 
     def format_candidates_text(self, candidates: list[dict[str, str]]) -> str:
         lines = []
