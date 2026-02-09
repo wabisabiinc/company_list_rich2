@@ -2100,7 +2100,8 @@ def infer_industry_and_business_tags(text_blocks: list[str]) -> tuple[str, list[
 
     best_industry = max(industry_scores.items(), key=lambda x: x[1])[0]
     best_score = industry_scores.get(best_industry, 0)
-    if best_score < 4:
+    # しきい値をやや緩め、弱いシグナルでもヒントを返す
+    if best_score < 3:
         return ("", [])
 
     # タグは上位から最大5件
@@ -6399,27 +6400,6 @@ async def process():
                                         }
 
                             industry_result = industry_result_ai
-                            allow_rule_fallback = (
-                                INDUSTRY_RULE_FALLBACK_ENABLED
-                                and ((not INDUSTRY_REQUIRE_AI) or ai_attempted or (not ai_available))
-                            )
-                            if not industry_result and allow_rule_fallback:
-                                try:
-                                    rule_min_score = max(INDUSTRY_RULE_MIN_SCORE, INDUSTRY_RULE_FALLBACK_MIN_SCORE)
-                                    rule_res = INDUSTRY_CLASSIFIER.rule_classify(
-                                        blocks,
-                                        min_score=rule_min_score,
-                                    )
-                                except Exception:
-                                    rule_res = None
-                                if rule_res:
-                                    top_minor, margin_minor = _top_and_margin(scores.get("minor_scores") or {})
-                                    if (
-                                        top_minor >= INDUSTRY_RULE_FALLBACK_MIN_SCORE
-                                        and margin_minor >= INDUSTRY_RULE_FALLBACK_MARGIN
-                                    ):
-                                        rule_res["source"] = "rule_strict"
-                                        industry_result = rule_res
 
                             lookup_name = ai_industry_val or industry_hint_val or industry_val
                             if (not industry_result) and INDUSTRY_NAME_LOOKUP_ENABLED and lookup_name:
@@ -6875,9 +6855,10 @@ async def process():
                             if parsed_business_tags:
                                 industry_blocks.extend(parsed_business_tags)
                             industry_blocks.extend(primary_blocks)
-                            # 会社概要系の材料が薄い場合のみ、他ページの情報を限定的に補助利用する。
-                            if secondary_blocks and same_host_evidence_chars < 220:
-                                industry_blocks.extend(secondary_blocks[:3])
+                            # 会社概要系の材料が薄い場合のみ、他ページを少量補助利用する。
+                            # 閾値を下げ、補助件数も2件に抑えて過剰なノイズを防ぎつつ本文量を確保。
+                            if secondary_blocks and same_host_evidence_chars < 180:
+                                industry_blocks.extend(secondary_blocks[:2])
                             if name:
                                 industry_blocks.append(name)
                             if industry_hint_val:
@@ -7190,22 +7171,6 @@ async def process():
                                             "confidence": _ai_confidence(detail_ai_res),
                                             "source": "ai_detail_optional",
                                         }
-
-                            allow_rule_fallback = (
-                                INDUSTRY_RULE_FALLBACK_ENABLED
-                                and ((not INDUSTRY_REQUIRE_AI) or ai_attempted or (not ai_available))
-                            )
-                            if (not industry_result_post) and allow_rule_fallback:
-                                try:
-                                    rule_min = max(INDUSTRY_RULE_MIN_SCORE, INDUSTRY_RULE_FALLBACK_MIN_SCORE)
-                                    rule_res = INDUSTRY_CLASSIFIER.rule_classify(industry_blocks, min_score=rule_min)
-                                except Exception:
-                                    rule_res = None
-                                if rule_res:
-                                    top_minor, margin_minor = _top_and_margin(scores.get("minor_scores") or {})
-                                    if top_minor >= INDUSTRY_RULE_FALLBACK_MIN_SCORE and margin_minor >= INDUSTRY_RULE_FALLBACK_MARGIN:
-                                        rule_res["source"] = "rule_strict_post"
-                                        industry_result_post = rule_res
 
                             if (not industry_result_post) and INDUSTRY_NAME_LOOKUP_ENABLED:
                                 lookup_name = ai_industry_name or industry_hint_val or industry_val

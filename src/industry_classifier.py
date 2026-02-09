@@ -472,12 +472,16 @@ class IndustryClassifier:
             detail_scores = self.taxonomy.score_details(text)
         minor_scores: dict[str, int]
         if use_detail:
+            # 通常は細分類スコアを小分類に集計する。
+            # ただし細分類に全くヒットしない場合は、小分類スコアを直接計算して落ちないようにする。
             minor_scores = {}
             for detail_code, score in detail_scores.items():
                 minor_code = self.taxonomy.detail_to_minor.get(detail_code, "")
                 if not minor_code:
                     continue
                 minor_scores[minor_code] = minor_scores.get(minor_code, 0) + score
+            if not minor_scores:
+                minor_scores = self.taxonomy.score_minors(text)
         else:
             minor_scores = self.taxonomy.score_minors(text)
 
