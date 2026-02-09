@@ -1355,6 +1355,9 @@ class AIVerifier:
         prompt = (
             f"{self.industry_prompt}\n\n"
             f"企業名: {company_name or '不明'}\n"
+            "補足:\n"
+            "- 本文中の [PRIORITY_DESCRIPTION] と [PRIORITY_TAG] は高優先度の根拠。\n"
+            "- ただし最終判断は本文全体の収益源/提供価値との整合で行う。\n"
             "候補一覧:\n"
             f"{candidates_text or '（候補なし）'}\n\n"
             f"本文抜粋:\n{snippet}\n"

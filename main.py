@@ -6100,9 +6100,21 @@ async def process():
                         except Exception:
                             pass
 
+                        profile_payloads_for_desc: list[dict[str, Any]] = []
+                        for p in payloads_for_desc:
+                            if not isinstance(p, dict):
+                                continue
+                            p_url = str(p.get("url") or "").strip()
+                            pt = str((page_type_per_url or {}).get(p_url) or "")
+                            if (pt == "COMPANY_PROFILE") or _is_profile_like_url(p_url):
+                                profile_payloads_for_desc.append(p)
+                        payloads_for_desc_priority = profile_payloads_for_desc if profile_payloads_for_desc else payloads_for_desc
+
                         # 80〜160字（既定）に寄せる。短すぎ/長すぎの場合は既取得テキストから再構成する。
                         if (not description_val) or (len(description_val) < FINAL_DESCRIPTION_MIN_LEN) or (len(description_val) > FINAL_DESCRIPTION_MAX_LEN):
-                            rebuilt = build_final_description_from_payloads(payloads_for_desc)
+                            rebuilt = build_final_description_from_payloads(payloads_for_desc_priority)
+                            if (not rebuilt) and (payloads_for_desc_priority is not payloads_for_desc):
+                                rebuilt = build_final_description_from_payloads(payloads_for_desc)
                             if rebuilt and (
                                 (not description_val)
                                 or (len(description_val) < FINAL_DESCRIPTION_MIN_LEN)
@@ -6120,7 +6132,9 @@ async def process():
                             and remaining_time_budget() > 0.3
                         ):
                             try:
-                                blocks = _collect_business_text_blocks(payloads_for_desc)
+                                blocks = _collect_business_text_blocks(payloads_for_desc_priority)
+                                if (not blocks) and (payloads_for_desc_priority is not payloads_for_desc):
+                                    blocks = _collect_business_text_blocks(payloads_for_desc)
                                 if not blocks and info_dict:
                                     blocks.append(info_dict.get("text", "") or "")
                                 desc_text = build_ai_text_payload(*blocks)
@@ -6151,7 +6165,6 @@ async def process():
                             and verifier is not None
                             and (not timed_out)
                             and has_time_for_ai()
-                            and (not ai_desc_attempted)
                             and (
                                 (not description_val)
                                 or (len(description_val) < FINAL_DESCRIPTION_MIN_LEN)
@@ -6159,7 +6172,9 @@ async def process():
                             )
                         ):
                             try:
-                                blocks = _collect_business_text_blocks(payloads_for_desc)
+                                blocks = _collect_business_text_blocks(payloads_for_desc_priority)
+                                if (not blocks) and (payloads_for_desc_priority is not payloads_for_desc):
+                                    blocks = _collect_business_text_blocks(payloads_for_desc)
                                 if not blocks and info_dict:
                                     blocks.append(info_dict.get("text", "") or "")
                                 desc_text = build_ai_text_payload(*blocks)
@@ -6186,11 +6201,14 @@ async def process():
                             description_val = _truncate_final_description(description_val, max_len=FINAL_DESCRIPTION_MAX_LEN)
 
                         # ---- 業種/タグを推定（推定値はヒントとして使い、最終保存は分類結果に限定） ----
-                        industry_val = (company.get("industry") or "").strip()
-                        industry_hint_val = industry_val
+                        # 業種判定で既存値を自己参照すると誤分類が自己強化されるため、毎回空から判定する。
+                        industry_val = ""
+                        industry_hint_val = ""
                         business_tags_val = (company.get("business_tags") or "").strip()
                         if INFER_INDUSTRY_ALWAYS:
-                            blocks = _collect_business_text_blocks(payloads_for_desc)
+                            blocks = _collect_business_text_blocks(payloads_for_desc_priority)
+                            if (not blocks) and (payloads_for_desc_priority is not payloads_for_desc):
+                                blocks = _collect_business_text_blocks(payloads_for_desc)
                             if description_val:
                                 blocks.append(description_val)
                             inferred_industry, inferred_tags = infer_industry_and_business_tags(blocks)
@@ -6902,7 +6920,22 @@ async def process():
                                 and hasattr(verifier, "judge_industry")
                                 and getattr(verifier, "industry_prompt", None)
                             )
-                            ai_text = "\n".join([b for b in score_blocks if b])
+                            ai_text_blocks: list[str] = []
+                            if description_val:
+                                ai_text_blocks.append(f"[PRIORITY_DESCRIPTION]{description_val}")
+                            for tag in parsed_business_tags:
+                                ai_text_blocks.append(f"[PRIORITY_TAG]{tag}")
+                            ai_text_blocks.extend([b for b in score_blocks if b])
+                            # 重複を抑えて、優先入力を先頭に保つ
+                            ai_text_dedup: list[str] = []
+                            ai_text_seen: set[str] = set()
+                            for block in ai_text_blocks:
+                                bb = (block or "").strip()
+                                if not bb or bb in ai_text_seen:
+                                    continue
+                                ai_text_seen.add(bb)
+                                ai_text_dedup.append(bb)
+                            ai_text = "\n".join(ai_text_dedup)
 
                             def _ai_confidence(ai_res: dict[str, Any]) -> float:
                                 try:
@@ -7038,78 +7071,6 @@ async def process():
                                         "minor_name": "",
                                     }
                                 major_candidates = list(major_map.values())[: max(INDUSTRY_AI_TOP_N, 10)]
-
-                            # === Multi-signal補強: ホームページ本文 + description + business_tags + 社名を一括評価し、
-                            # 多角・商社・レンタル系シグナルが出たら関連大分類を候補に追加する。
-                            def _add_major_candidate_by_name(major_name: str) -> None:
-                                if not major_name:
-                                    return
-                                code = ""
-                                for c, n in INDUSTRY_CLASSIFIER.taxonomy.major_names.items():
-                                    if n == major_name:
-                                        code = c
-                                        break
-                                if not code:
-                                    return
-                                if any(str(cand.get("major_code") or "") == code for cand in major_candidates):
-                                    return
-                                major_candidates.append(
-                                    {
-                                        "major_code": code,
-                                        "major_name": major_name,
-                                        "middle_code": "",
-                                        "middle_name": "",
-                                        "minor_code": "",
-                                        "minor_name": "",
-                                    }
-                                )
-
-                            multi_text = "\n".join([b for b in industry_blocks if b]).strip()
-                            norm_text = unicodedata.normalize("NFKC", multi_text).lower()
-
-                            wholesale_kws = (
-                                "商社",
-                                "卸",
-                                "卸売",
-                                "流通",
-                                "仕入",
-                                "代理店",
-                                "販社",
-                                "ディーラー",
-                                "再販",
-                                "販売店",
-                                "買取",
-                                "リユース",
-                                "リサイクル",
-                                "中古",
-                            )
-                            rental_kws = (
-                                "レンタル",
-                                "リース",
-                                "賃貸",
-                                "サブリース",
-                                "物品賃貸",
-                                "貸し",
-                                "貸付",
-                                "レンタカー",
-                                "レンタルオフィス",
-                                "レンタルスペース",
-                            )
-                            holding_kws = (
-                                "ホールディングス",
-                                "holding",
-                                "holdings",
-                                "hd",
-                                "持株",
-                            )
-
-                            def _hit(keywords: tuple[str, ...]) -> bool:
-                                return any(kw and kw.lower() in norm_text for kw in keywords)
-
-                            if _hit(wholesale_kws):
-                                _add_major_candidate_by_name("卸売業，小売業")
-                            if _hit(rental_kws) or _hit(holding_kws):
-                                _add_major_candidate_by_name("不動産業，物品賃貸業")
 
                             picked_major, _major_ai_res = await _judge_stage(
                                 "major",
@@ -7604,11 +7565,11 @@ async def process():
 
                             company["industry"] = (industry_val or "不明")[:60]
                             company["industry_major_code"] = industry_major_code or ""
-                            company["industry_major"] = industry_major or ""
+                            company["industry_major"] = industry_major or "不明"
                             company["industry_middle_code"] = industry_middle_code or ""
-                            company["industry_middle"] = industry_middle or ""
+                            company["industry_middle"] = industry_middle or "不明"
                             company["industry_minor_code"] = industry_minor_code or ""
-                            company["industry_minor"] = industry_minor or ""
+                            company["industry_minor"] = industry_minor or "不明"
                             # タグが未生成なら、最終ブロックからローカル推定で埋める（2パス目での判定精度向上用）
                             if (not business_tags_val) and INFER_INDUSTRY_ALWAYS:
                                 try:
