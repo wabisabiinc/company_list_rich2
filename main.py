@@ -6858,27 +6858,30 @@ async def process():
                                     parsed_business_tags = [business_tags_val.strip()]
 
                             industry_blocks: list[str] = []
+                            # 1) 会社概要系本文を最優先
+                            industry_blocks.extend(primary_blocks)
+                            # 2) description
                             if description_val:
                                 industry_blocks.append(description_val)
-                            if parsed_business_tags:
-                                industry_blocks.extend(parsed_business_tags)
-                            industry_blocks.extend(primary_blocks)
-                            # 会社概要系の材料が薄い場合のみ、他ページを少量補助利用する。
-                            # 閾値を下げ、補助件数も2件に抑えて過剰なノイズを防ぎつつ本文量を確保。
+                            # 3) 会社概要が薄いときだけサブページを少量補助
                             if secondary_blocks and same_host_evidence_chars < 180:
                                 industry_blocks.extend(secondary_blocks[:2])
+                            # 4) 名前・ヒントなど
                             if name:
                                 industry_blocks.append(name)
                             if industry_hint_val:
                                 industry_blocks.append(industry_hint_val)
-                            if (not parsed_business_tags) and business_tags_val:
-                                industry_blocks.append(business_tags_val)
                             license_val = (company.get("license") or "").strip()
                             if license_val:
                                 industry_blocks.append(f"許認可: {license_val}"[:400])
                             desc_ev = (company.get("description_evidence") or "").strip()
                             if desc_ev:
                                 industry_blocks.append(f"根拠: {desc_ev}"[:400])
+                            # 5) business_tags は補助として最後に加える
+                            if parsed_business_tags:
+                                industry_blocks.extend(parsed_business_tags)
+                            elif business_tags_val:
+                                industry_blocks.append(business_tags_val)
 
                             dedup_industry_blocks: list[str] = []
                             seen_industry_blocks: set[str] = set()
@@ -6890,12 +6893,12 @@ async def process():
                                 dedup_industry_blocks.append(bb)
                             industry_blocks = dedup_industry_blocks[:20]
 
-                            # description/tags は判定スコアにもう一段反映して優先度を高める。
+                            # スコア計算も本文→descriptionを優先。タグは industry_blocks 経由で含まれる。
                             score_blocks = list(industry_blocks)
+                            if primary_blocks:
+                                score_blocks.extend(primary_blocks)
                             if description_val:
                                 score_blocks.append(description_val)
-                            if parsed_business_tags:
-                                score_blocks.extend(parsed_business_tags)
 
                             scores = INDUSTRY_CLASSIFIER.score_levels(score_blocks)
                             use_detail = bool(scores.get("use_detail"))
