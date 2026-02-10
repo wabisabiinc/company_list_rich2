@@ -17,6 +17,24 @@ _GENERIC_TOKENS = {
     "開発", "加工", "設計", "施工", "保守", "メンテナンス", "関連", "その他", "附随",
 }
 
+# 短い略称・カタカナ英語をJSIC小分類コードに補助マッピング
+# ※最終決定はAI側が行うため、ここでは候補スコアを加点するのみ
+_ALIAS_TO_MINOR = {
+    "IT": ["392"], "ＩＴ": ["392"], "システム": ["392"], "ソフトウェア": ["392"], "SAAS": ["392"], "ＳＡＡＳ": ["392"], "DX": ["392"], "ＤＸ": ["392"], "クラウド": ["392"],
+    "WEB": ["401"], "ＷＥＢ": ["401"], "EC": ["401"], "ＥＣ": ["401"], "ＥＣサイト": ["401"],
+    "マーケ": ["731"], "マーケティング": ["731"], "広告": ["731"], "PR": ["731"], "ＰＲ": ["731"],
+    "コンサル": ["728"], "コンサルティング": ["728"],
+    "物流": ["441"], "運送": ["441"], "配送": ["441"], "倉庫": ["470"],
+    "派遣": ["912"], "人材": ["912"], "紹介": ["911"],
+    "介護": ["854"], "福祉": ["854"],
+    "医療": ["831"], "病院": ["831"],
+    "飲食": ["761"], "レストラン": ["761"], "カフェ": ["761"],
+    "不動産": ["681"], "賃貸": ["681"], "仲介": ["681"],
+    "建設": ["062"], "工事": ["062"], "施工": ["062"], "設備": ["063"], "電気工事": ["064"],
+    "小売": ["602"],
+    "保険": ["670"],
+}
+
 
 @dataclass
 class IndustryEntry:
@@ -529,6 +547,16 @@ class IndustryClassifier:
         boost_scores(minor_scores, self.taxonomy.minor_names)
         if use_detail:
             boost_scores(detail_scores, self.taxonomy.detail_names)
+
+        # エイリアス（略称・英語）の加点。存在しないコードは無視。
+        norm_text_upper = norm_text.upper()
+        for alias, codes in _ALIAS_TO_MINOR.items():
+            if alias and alias in norm_text_upper:
+                for code in codes:
+                    if code in self.taxonomy.detail_names:
+                        detail_scores[code] = detail_scores.get(code, 0) + 1
+                    if code in self.taxonomy.minor_names:
+                        minor_scores[code] = minor_scores.get(code, 0) + 1
 
         return {
             "use_detail": use_detail,

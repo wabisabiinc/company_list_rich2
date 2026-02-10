@@ -6138,7 +6138,6 @@ async def process():
                                     blocks = _collect_business_text_blocks(payloads_for_desc)
                                 if not blocks and info_dict:
                                     blocks.append(info_dict.get("text", "") or "")
-                                desc_text = build_ai_text_payload(*blocks)
                                 shot = b""
                                 try:
                                     maybe_shot = (info_dict or {}).get("screenshot")
@@ -6146,15 +6145,20 @@ async def process():
                                         shot = bytes(maybe_shot)
                                 except Exception:
                                     shot = b""
-                                ai_desc_attempted = True
-                                ai_used = 1
-                                if not ai_model:
-                                    ai_model = AI_MODEL_NAME or ""
-                                generated = await asyncio.wait_for(
-                                    verifier.generate_description(desc_text, shot, name, addr_raw, industry_hint=""),
-                                    timeout=clamp_timeout(ai_call_timeout),
-                                )
-                                apply_ai_description(generated)
+                                # 入力が空（本文もスクショもなし）の場合はAI生成を行わず欠損のままにする
+                                if (not blocks) and (not shot):
+                                    pass
+                                else:
+                                    desc_text = build_ai_text_payload(*blocks)
+                                    ai_desc_attempted = True
+                                    ai_used = 1
+                                    if not ai_model:
+                                        ai_model = AI_MODEL_NAME or ""
+                                    generated = await asyncio.wait_for(
+                                        verifier.generate_description(desc_text, shot, name, addr_raw, industry_hint=""),
+                                        timeout=clamp_timeout(ai_call_timeout),
+                                    )
+                                    apply_ai_description(generated)
                             except Exception:
                                 pass
 
@@ -6178,7 +6182,6 @@ async def process():
                                     blocks = _collect_business_text_blocks(payloads_for_desc)
                                 if not blocks and info_dict:
                                     blocks.append(info_dict.get("text", "") or "")
-                                desc_text = build_ai_text_payload(*blocks)
                                 shot = b""
                                 try:
                                     maybe_shot = (info_dict or {}).get("screenshot")
@@ -6186,15 +6189,20 @@ async def process():
                                         shot = bytes(maybe_shot)
                                 except Exception:
                                     shot = b""
-                                prev_desc = description_val
-                                generated = await asyncio.wait_for(
-                                    verifier.generate_description(desc_text, shot, name, addr_raw, industry_hint=""),
-                                    timeout=clamp_timeout(ai_call_timeout),
-                                )
-                                apply_ai_description(generated)
-                                # 生成に失敗/不適合なら直前の値に戻す（空欄化で欠損を作らない）
-                                if (not description_val) or (len(description_val) < 10):
-                                    description_val = prev_desc
+                                # 入力が空なら生成しない（ハルシネーション防止）
+                                if (not blocks) and (not shot):
+                                    pass
+                                else:
+                                    prev_desc = description_val
+                                    desc_text = build_ai_text_payload(*blocks)
+                                    generated = await asyncio.wait_for(
+                                        verifier.generate_description(desc_text, shot, name, addr_raw, industry_hint=""),
+                                        timeout=clamp_timeout(ai_call_timeout),
+                                    )
+                                    apply_ai_description(generated)
+                                    # 生成に失敗/不適合なら直前の値に戻す（空欄化で欠損を作らない）
+                                    if (not description_val) or (len(description_val) < 10):
+                                        description_val = prev_desc
                             except Exception:
                                 pass
 
