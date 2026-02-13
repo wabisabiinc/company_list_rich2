@@ -15,3 +15,15 @@ def test_build_final_description_from_payloads_rebuilds_from_text() -> None:
     ]
     desc = main.build_final_description_from_payloads(payloads, min_len=20, max_len=160)
     assert isinstance(desc, str) and desc
+
+
+def test_ensure_name_industry_in_description_inserts_industry_when_missing() -> None:
+    src = "株式会社Exampleは、法人向けソフトウェアを開発・提供しています。"
+    out = main._ensure_name_industry_in_description(src, "株式会社Example", "IT・ソフトウェア")
+    assert "株式会社Example（IT・ソフトウェア）" in out
+
+
+def test_ensure_name_industry_in_description_keeps_text_when_industry_unknown() -> None:
+    src = "株式会社Exampleは、法人向けソフトウェアを開発・提供しています。"
+    out = main._ensure_name_industry_in_description(src, "株式会社Example", "不明")
+    assert out == src

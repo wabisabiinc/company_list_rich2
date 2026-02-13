@@ -18,7 +18,7 @@
 3) representative は「人名のみ」。役職語（代表取締役/社長/CEO 等）や「メッセージ/ご挨拶」等のページ種別語は含めない。
 4) representative は「代表/代表取締役/社長/CEO 等のラベルや役職語とペアになっている候補」からのみ採用（TABLE/LABEL/ROLE/JSONLD由来）。ペア根拠が無い場合は null。
 5) description は事業内容のみから生成。問い合わせ/採用/アクセス/所在地/電話/URL/メール等は含めない。材料が無ければ null。
-   - company_name（企業名）は必ず含める。industry（業種）はヒント/候補に根拠がある場合は含める（推測は禁止。根拠が弱ければ含めない）
+   - company_name（企業名）と industry（業種）を必ず含める（推測は禁止。業種の根拠が弱ければ description を null にする）
 6) 出力は JSON のみ（説明文・箇条書き・コードフェンスは禁止）。
 
 # strict（厳格）のルール

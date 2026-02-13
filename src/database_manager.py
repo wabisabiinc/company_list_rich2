@@ -154,6 +154,7 @@ class DatabaseManager:
                 homepage_checked_at TEXT,
                 homepage_check_url TEXT,
                 homepage_check_source TEXT,
+                homepage_check_logic_hash TEXT,
                 error_code     TEXT
             )
             """
@@ -242,6 +243,9 @@ class DatabaseManager:
         if "homepage_check_source" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN homepage_check_source TEXT;")
             cols.add("homepage_check_source")
+        if "homepage_check_logic_hash" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN homepage_check_logic_hash TEXT;")
+            cols.add("homepage_check_logic_hash")
         if "reference_homepage" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN reference_homepage TEXT;")
             cols.add("reference_homepage")
@@ -684,7 +688,7 @@ class DatabaseManager:
                          WHERE id=(SELECT id FROM picked)
                         RETURNING id, company_name, address, employee_count, homepage, phone, found_address, status, corporate_number, corporate_number_norm,
                                   final_homepage, homepage_official_flag, homepage_fingerprint, homepage_content_length, homepage_checked_at,
-                                  homepage_check_url, homepage_check_source
+                                  homepage_check_url, homepage_check_source, homepage_check_logic_hash
                         """,
                         (st, worker_id),
                     ).fetchone()
@@ -715,7 +719,7 @@ class DatabaseManager:
                             """
                             SELECT id, company_name, address, employee_count, homepage, phone, found_address, status, corporate_number, corporate_number_norm
                                  , final_homepage, homepage_official_flag, homepage_fingerprint, homepage_content_length, homepage_checked_at
-                                 , homepage_check_url, homepage_check_source
+                                 , homepage_check_url, homepage_check_source, homepage_check_logic_hash
                               FROM companies
                              WHERE locked_by=? AND status='running'
                              ORDER BY locked_at DESC, id DESC
@@ -1282,6 +1286,7 @@ class DatabaseManager:
         set_value("homepage_checked_at", company.get("homepage_checked_at", "") or "")
         set_value("homepage_check_url", company.get("homepage_check_url", "") or "")
         set_value("homepage_check_source", company.get("homepage_check_source", "") or "")
+        set_value("homepage_check_logic_hash", company.get("homepage_check_logic_hash", "") or "")
         set_value("reference_phone", company.get("reference_phone", "") or "")
         set_value("reference_address", company.get("reference_address", "") or "")
         set_value("accuracy_homepage", company.get("accuracy_homepage", "") or "")
@@ -1408,6 +1413,7 @@ class DatabaseManager:
         homepage_checked_at: str,
         homepage_check_url: str,
         homepage_check_source: str,
+        homepage_check_logic_hash: str,
         skip_reason: str,
     ) -> None:
         cols = self._schema_columns
@@ -1425,6 +1431,7 @@ class DatabaseManager:
         add_value("homepage_checked_at", homepage_checked_at)
         add_value("homepage_check_url", homepage_check_url)
         add_value("homepage_check_source", homepage_check_source)
+        add_value("homepage_check_logic_hash", homepage_check_logic_hash)
         add_value("skip_reason", skip_reason)
         if "last_checked_at" in cols:
             updates.append("last_checked_at = datetime('now')")

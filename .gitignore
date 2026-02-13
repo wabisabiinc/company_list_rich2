@@ -187,6 +187,7 @@ data/**
 
 # Large data formats anywhere (guardrail for accidental commits)
 *.csv
+!industry_aliases.csv
 *.tsv
 *.xlsx
 *.xls

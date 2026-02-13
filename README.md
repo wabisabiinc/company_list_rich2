@@ -89,9 +89,40 @@ COMPANIES_DB_PATH=data/companies_logistics.db python3 main.py
 - `REQUIRE_OFFICIAL_HOMEPAGE`（official確定できないURLを `homepage` に保存しない。既定 `true`）
 - `SAVE_PROVISIONAL_HOMEPAGE`（暫定URLを `homepage` にも保存する。既定 `false`。`final_homepage/provisional_homepage` には常に記録）
 - `APPLY_PROVISIONAL_HOMEPAGE_POLICY`（弱い暫定URLを自動で落とす。既定 `true`）
+- `UPDATE_CHECK_LOGIC_HASH`（更新チェックのロジック識別子を手動指定。未指定時は `main.py` など主要ソースの内容ハッシュを自動利用し、ロジック更新時に再取得を強制）
 - `DIRECTORY_HARD_REJECT_SCORE`（企業DB/ディレクトリ疑いのハード拒否閾値。既定 `9`）
 - `SEARCH_CANDIDATE_LIMIT`（検索候補の最大数）
 - `RELATED_BASE_PAGES`, `RELATED_MAX_HOPS_BASE`（深掘りのページ数/ホップ上限。内部でも最大3にクランプ）
+- `INDUSTRY_FORCE_CLASSIFY`（`true` で未決定業種を強制補完）
+- `INDUSTRY_FORCE_DEFAULT_MINOR_CODES`（強制補完時の既定候補。現在の既定は `392,401`）
+  - 以前の既定値: `9599,9299,9999`
+
+業種分類の強制補完を有効化する例:
+```bash
+INDUSTRY_FORCE_CLASSIFY=true
+INDUSTRY_FORCE_DEFAULT_MINOR_CODES=392,401
+```
+
+## 業種分類運用フロー
+
+1. `industry_aliases.csv` を更新（同義語と `target_minor_code` を追加）
+2. backfill を実行して既存データへ反映
+3. レポートで分類状態を確認
+4. 未分類から候補語を抽出し、次回辞書更新へ回す
+
+```bash
+# 1) aliases更新
+$EDITOR industry_aliases.csv
+
+# 2) backfill実行（ルールベース）
+python3 scripts/backfill_industry_class.py --db data/companies.db --min-score 1
+
+# 3) report確認
+python3 scripts/industry_classification_report.py --db data/companies.db
+
+# 4) candidates抽出
+python3 scripts/extract_unclassified_terms.py --db data/companies.db --out industry_alias_candidates.csv --min-freq 2
+```
 
 既存DBのノイズを一括除去したい場合:
 ```bash

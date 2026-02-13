@@ -4096,16 +4096,15 @@ class CompanyScraper:
                     if need_screenshot:
                         screenshot_timeout_ms = _cap_timeout_ms(min(4000, attempt_timeout))
                         if screenshot_timeout_ms > 0:
-                            task: asyncio.Task | None = None
                             try:
-                                task = asyncio.create_task(page.screenshot(full_page=True))
-                                screenshot = await asyncio.wait_for(task, timeout=screenshot_timeout_ms / 1000.0)
+                                # Playwright 側の timeout を使って待機を制限する。
+                                # create_task+wait_for だと上位キャンセル時に未回収Futureが残ることがあるため回避する。
+                                screenshot = await page.screenshot(
+                                    full_page=True,
+                                    timeout=screenshot_timeout_ms,
+                                )
                             except Exception:
                                 screenshot = b""
-                                if task is not None and not task.done():
-                                    task.cancel()
-                                if task is not None:
-                                    await asyncio.gather(task, return_exceptions=True)
                 cleaned_text = self._clean_text_from_html(html, fallback_text=text or "")
                 result = {"url": url, "text": cleaned_text, "html": html, "screenshot": screenshot}
                 if cached and not screenshot:

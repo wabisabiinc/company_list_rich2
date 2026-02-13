@@ -3,36 +3,85 @@ import json
 import logging
 import os
 import re
-import unicodedata
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
+
+from src.text_normalizer import norm_text, norm_text_compact
 
 log = logging.getLogger(__name__)
 
 DEFAULT_JSIC_CSV_PATH = os.getenv("JSIC_CSV_PATH", "docs/industry_select.csv")
 DEFAULT_JSIC_JSON_PATH = os.getenv("JSIC_JSON_PATH", "docs/industry_select.json")
+DEFAULT_INDUSTRY_ALIASES_CSV_PATH = os.getenv("INDUSTRY_ALIASES_CSV_PATH", "industry_aliases.csv")
 
 _GENERIC_TOKENS = {
     "事業", "業", "サービス", "製品", "商品", "販売", "製造", "提供", "運営", "管理",
     "開発", "加工", "設計", "施工", "保守", "メンテナンス", "関連", "その他", "附随",
 }
 
-# 短い略称・カタカナ英語をJSIC小分類コードに補助マッピング
-# ※最終決定はAI側が行うため、ここでは候補スコアを加点するのみ
-_ALIAS_TO_MINOR = {
-    "IT": ["392"], "ＩＴ": ["392"], "システム": ["392"], "ソフトウェア": ["392"], "SAAS": ["392"], "ＳＡＡＳ": ["392"], "DX": ["392"], "ＤＸ": ["392"], "クラウド": ["392"],
-    "WEB": ["401"], "ＷＥＢ": ["401"], "EC": ["401"], "ＥＣ": ["401"], "ＥＣサイト": ["401"],
-    "マーケ": ["731"], "マーケティング": ["731"], "広告": ["731"], "PR": ["731"], "ＰＲ": ["731"],
-    "コンサル": ["728"], "コンサルティング": ["728"],
-    "物流": ["441"], "運送": ["441"], "配送": ["441"], "倉庫": ["470"],
-    "派遣": ["912"], "人材": ["912"], "紹介": ["911"],
-    "介護": ["854"], "福祉": ["854"],
-    "医療": ["831"], "病院": ["831"],
-    "飲食": ["761"], "レストラン": ["761"], "カフェ": ["761"],
-    "不動産": ["681"], "賃貸": ["681"], "仲介": ["681"],
-    "建設": ["062"], "工事": ["062"], "施工": ["062"], "設備": ["063"], "電気工事": ["064"],
-    "小売": ["602"],
-    "保険": ["670"],
+# CSV が読めない場合の最小限fallback
+_ALIAS_TO_MINOR_FALLBACK: dict[str, tuple[str, int, int, str]] = {
+    "ai": ("392", 6, 0, "it"),
+    "生成ai": ("392", 7, 0, "it"),
+    "llm": ("392", 7, 0, "it"),
+    "dx": ("392", 6, 0, "it"),
+    "it": ("392", 5, 0, "it"),
+    "ict": ("392", 5, 0, "it"),
+    "iot": ("392", 5, 0, "it"),
+    "saas": ("392", 6, 0, "it"),
+    "paas": ("392", 5, 0, "it"),
+    "iaas": ("392", 5, 0, "it"),
+    "クラウド": ("392", 5, 0, "it"),
+    "システム開発": ("391", 6, 0, "it"),
+    "受託開発": ("391", 6, 0, "it"),
+    "ソフトウェア開発": ("391", 6, 0, "it"),
+    "webサービス": ("401", 6, 0, "it"),
+    "ec": ("401", 6, 0, "ec"),
+    "eコマース": ("611", 6, 0, "ec"),
+    "ネット通販": ("611", 7, 0, "ec"),
+    "オンラインショップ": ("611", 7, 0, "ec"),
+    "ec運営": ("611", 6, 0, "ec"),
+    "d2c": ("611", 6, 0, "ec"),
+    "seo": ("731", 5, 0, "ad"),
+    "広告運用": ("731", 6, 0, "ad"),
+    "デジタルマーケティング": ("731", 6, 0, "ad"),
+    "人材派遣": ("912", 7, 0, "hr"),
+    "人材紹介": ("911", 7, 0, "hr"),
+    "bpo": ("929", 5, 1, "review"),
+    "物流": ("441", 6, 0, "logistics"),
+    "運送": ("441", 6, 0, "logistics"),
+    "配送": ("441", 6, 0, "logistics"),
+    "倉庫": ("471", 6, 0, "logistics"),
+    "建設": ("062", 6, 0, "construction"),
+    "土木工事": ("062", 7, 0, "construction"),
+    "電気工事": ("081", 7, 0, "construction"),
+    "管工事": ("083", 7, 0, "construction"),
+    "不動産売買": ("681", 7, 0, "real_estate"),
+    "賃貸仲介": ("682", 7, 0, "real_estate"),
+    "不動産管理": ("694", 7, 0, "real_estate"),
+    "病院": ("831", 7, 0, "medical"),
+    "クリニック": ("832", 7, 0, "medical"),
+    "介護": ("854", 7, 0, "medical"),
+    "訪問介護": ("854", 7, 0, "medical"),
+    "訪問看護": ("854", 7, 0, "medical"),
+    "学習塾": ("823", 7, 0, "education"),
+    "eラーニング": ("822", 6, 0, "education"),
+    "職業訓練": ("822", 7, 0, "education"),
+    "保育": ("853", 7, 0, "education"),
+    "保険代理店": ("674", 7, 0, "finance"),
+    "決済": ("661", 6, 1, "review"),
+    "リース": ("701", 6, 0, "finance"),
+    "ファクタリング": ("649", 6, 1, "review"),
+    "貸金": ("641", 7, 0, "finance"),
+    "試作": ("329", 5, 1, "review"),
+    "量産": ("329", 5, 1, "review"),
+    "金型": ("269", 6, 0, "manufacturing"),
+    "精密加工": ("266", 6, 0, "manufacturing"),
+    "切削": ("266", 6, 0, "manufacturing"),
+    "板金": ("244", 6, 0, "manufacturing"),
+    "表面処理": ("246", 6, 0, "manufacturing"),
+    "oem": ("329", 5, 1, "review"),
+    "odm": ("329", 5, 1, "review"),
 }
 
 
@@ -44,6 +93,16 @@ class IndustryEntry:
     major_code: str
     middle_code: str
     minor_code: str
+
+
+@dataclass
+class IndustryAliasEntry:
+    alias: str
+    target_minor_code: str
+    priority: int
+    requires_review: bool
+    notes: str
+    alias_norm: str
 
 
 class JSICTaxonomy:
@@ -62,88 +121,92 @@ class JSICTaxonomy:
         self.detail_to_minor: dict[str, str] = {}
         self.detail_to_middle: dict[str, str] = {}
         self.detail_to_major: dict[str, str] = {}
+        self.normalized_name_index: dict[str, list[dict[str, str]]] = {}
         self._token_index: dict[str, set[str]] = {}
 
     def load(self) -> bool:
-        prefer_json = os.getenv("JSIC_PREFER_JSON", "false").lower() == "true"
-
-        def _load_from_csv() -> bool:
-            if not self.csv_path or not os.path.exists(self.csv_path):
-                return False
-            rows = self._read_rows(self.csv_path)
-            if not rows:
-                log.warning("JSIC taxonomy CSV empty: %s", self.csv_path)
-                return False
-
-            # Prefer structured JSIC CSV with explicit major/middle/minor/detail columns.
-            if self._looks_like_industry_select(rows):
-                self._load_from_industry_select(rows)
-                self._build_token_index()
-                return True
-
-            current_major = ""
-            current_middle = ""
-            current_minor = ""
-            for row in rows:
-                code, name = self._extract_code_name(row)
-                if not code or not name:
-                    continue
-                level = self._infer_level(code)
-                if level == "major":
-                    current_major = code
-                    current_middle = ""
-                    current_minor = ""
-                    self.major_names[code] = name
-                elif level == "middle":
-                    current_middle = code
-                    current_minor = ""
-                    if current_major:
-                        self.middle_to_major[current_middle] = current_major
-                    self.middle_names[code] = name
-                elif level == "minor":
-                    current_minor = code
-                    if current_middle:
-                        self.minor_to_middle[current_minor] = current_middle
-                    self.minor_names[code] = name
-                    self._minor_names_norm[code] = self._normalize(name)
-                else:
-                    # detail or unknown; skip storing as selectable
-                    continue
-
-                entry = IndustryEntry(
-                    level=level,
-                    code=code,
-                    name=name,
-                    major_code=current_major,
-                    middle_code=current_middle,
-                    minor_code=current_minor,
-                )
-                self.entries.append(entry)
-
-            self._build_token_index()
+        if self._load_from_csv():
+            self._finalize_loaded_data()
             return True
 
-        def _load_from_json_wrapper() -> bool:
-            if self.json_path and os.path.exists(self.json_path):
-                if self._load_from_json(self.json_path):
-                    self._build_token_index()
-                    return True
-            return False
-
-        # デフォルトではCSV優先。JSIC_PREFER_JSON=true のときのみJSONを優先する。
-        if prefer_json:
-            if _load_from_json_wrapper():
-                return True
-            if _load_from_csv():
-                return True
-        else:
-            if _load_from_csv():
-                return True
-            if _load_from_json_wrapper():
+        allow_json_fallback = os.getenv("JSIC_ALLOW_JSON_FALLBACK", "false").lower() == "true"
+        if allow_json_fallback and self.json_path and os.path.exists(self.json_path):
+            if self._load_from_json(self.json_path):
+                self._finalize_loaded_data()
                 return True
 
         log.warning("JSIC taxonomy not loaded. CSV=%s JSON=%s", self.csv_path, self.json_path)
         return False
+
+    def _finalize_loaded_data(self) -> None:
+        self._rebuild_reverse_indexes()
+        self._build_name_index_from_maps()
+        self._build_token_index()
+
+    def _load_from_csv(self) -> bool:
+        if not self.csv_path or not os.path.exists(self.csv_path):
+            return False
+        rows = self._read_rows(self.csv_path)
+        if not rows:
+            log.warning("JSIC taxonomy CSV empty: %s", self.csv_path)
+            return False
+
+        if self._looks_like_industry_select(rows):
+            self._load_from_industry_select(rows)
+            return True
+
+        current_major = ""
+        current_middle = ""
+        current_minor = ""
+        for row in rows:
+            code, name = self._extract_code_name(row)
+            if not code or not name:
+                continue
+            level = self._infer_level(code)
+            if level == "major":
+                current_major = code
+                current_middle = ""
+                current_minor = ""
+                self.major_names[code] = name
+            elif level == "middle":
+                current_middle = code
+                current_minor = ""
+                if current_major:
+                    self.middle_to_major[current_middle] = current_major
+                self.middle_names[code] = name
+            elif level == "minor":
+                current_minor = code
+                if current_middle:
+                    self.minor_to_middle[current_minor] = current_middle
+                self.minor_names[code] = name
+                self._minor_names_norm[code] = self._normalize(name)
+            elif level == "detail":
+                self.detail_names[code] = name
+                self._detail_names_norm[code] = self._normalize(name)
+                if current_minor:
+                    self.detail_to_minor[code] = current_minor
+            else:
+                continue
+
+            entry = IndustryEntry(
+                level=level,
+                code=code,
+                name=name,
+                major_code=current_major,
+                middle_code=current_middle,
+                minor_code=current_minor,
+            )
+            self.entries.append(entry)
+
+            self._append_normalized_name_index(
+                name=name,
+                major_code=current_major,
+                middle_code=current_middle,
+                minor_code=current_minor if level in {"minor", "detail"} else "",
+                detail_code=code if level == "detail" else "",
+            )
+
+        return True
 
     def _load_from_json(self, path: str) -> bool:
         try:
@@ -163,6 +226,7 @@ class JSICTaxonomy:
         entries = data.get("entries")
         if not isinstance(major_names, dict) or not isinstance(middle_names, dict) or not isinstance(minor_names, dict):
             return False
+
         self.major_names = {str(k): str(v) for k, v in major_names.items()}
         self.middle_names = {str(k): str(v) for k, v in (middle_names or {}).items()}
         self.minor_names = {str(k): str(v) for k, v in (minor_names or {}).items()}
@@ -172,6 +236,7 @@ class JSICTaxonomy:
         self.detail_to_minor = {str(k): str(v) for k, v in (detail_to_minor or {}).items()}
         self._minor_names_norm = {k: self._normalize(v) for k, v in self.minor_names.items()}
         self._detail_names_norm = {k: self._normalize(v) for k, v in self.detail_names.items()}
+
         self.entries = []
         if isinstance(entries, list) and entries:
             for e in entries:
@@ -231,19 +296,16 @@ class JSICTaxonomy:
 
             level = ""
             code = ""
-            # 大分類代表: 中分類=00 かつ 小分類=000（細分類は 0000 を想定）
             if middle == "00" and minor == "000" and detail == "0000":
                 level = "major"
                 code = major
                 self.major_names[major] = name
-            # 中分類代表: 小分類=000 かつ 細分類=0000
             elif minor == "000" and detail == "0000":
                 level = "middle"
                 code = middle
                 self.middle_names[middle] = name
                 if major:
                     self.middle_to_major[middle] = major
-            # 小分類代表: 細分類=0000 かつ 小分類!=000
             elif detail == "0000" and minor != "000":
                 level = "minor"
                 code = minor
@@ -253,7 +315,6 @@ class JSICTaxonomy:
                     self.minor_to_middle[minor] = middle
                 if major and middle:
                     self.middle_to_major[middle] = major
-            # 小分類: 細分類コードが0000以外（= 詳細行を小分類として扱う）
             elif detail and detail != "0000":
                 level = "detail"
                 code = detail
@@ -266,7 +327,6 @@ class JSICTaxonomy:
                 if major:
                     self.detail_to_major[detail] = major
             else:
-                # detail rows are not selectable in our classification
                 continue
 
             if level and code:
@@ -281,6 +341,14 @@ class JSICTaxonomy:
                     )
                 )
 
+                self._append_normalized_name_index(
+                    name=name,
+                    major_code=major,
+                    middle_code="" if middle == "00" else middle,
+                    minor_code="" if minor == "000" else minor,
+                    detail_code="" if detail == "0000" else detail,
+                )
+
     def _read_rows(self, path: str) -> list[dict[str, str]]:
         for enc in ("utf-8-sig", "cp932", "shift_jis"):
             try:
@@ -289,7 +357,7 @@ class JSICTaxonomy:
                     return [dict(row) for row in reader]
             except Exception:
                 continue
-        # fallback: raw CSV rows without header
+
         try:
             with open(path, "r", encoding="utf-8-sig", newline="") as f:
                 reader = csv.reader(f)
@@ -306,8 +374,6 @@ class JSICTaxonomy:
         keys = [k for k in row.keys() if k is not None]
         values = [str(row.get(k) or "").strip() for k in keys]
 
-        # Support "industry_select.csv" style headers:
-        # 大分類コード, 中分類コード, 小分類コード, 細分類コード, 項目名
         if {"大分類コード", "中分類コード", "小分類コード", "細分類コード", "項目名"}.issubset(keys):
             name = (row.get("項目名") or "").strip()
             major = (row.get("大分類コード") or "").strip()
@@ -343,7 +409,6 @@ class JSICTaxonomy:
         if code and name:
             return code, name
 
-        # try to parse from a single field: "A 農業、林業" or "0121 露地野菜作"
         for v in values:
             if not v:
                 continue
@@ -364,6 +429,10 @@ class JSICTaxonomy:
             return "detail"
         return "unknown"
 
+    @staticmethod
+    def _normalize(text: str) -> str:
+        return norm_text_compact(text)
+
     def _build_token_index(self) -> None:
         index: dict[str, set[str]] = {}
         for code, name in self.minor_names.items():
@@ -372,19 +441,12 @@ class JSICTaxonomy:
                 index.setdefault(t, set()).add(code)
         self._token_index = index
 
-    @staticmethod
-    def _normalize(text: str) -> str:
-        s = unicodedata.normalize("NFKC", text or "")
-        s = re.sub(r"\s+", "", s)
-        return s
-
     def _tokenize_name(self, name: str) -> set[str]:
-        s = self._normalize(name)
-        if not s:
+        spaced = norm_text(name)
+        if not spaced:
             return set()
-        parts = re.split(r"[・、/()（）・\-〜～~]", s)
         tokens = set()
-        for p in parts:
+        for p in spaced.split(" "):
             p = p.strip()
             if len(p) < 2:
                 continue
@@ -393,15 +455,91 @@ class JSICTaxonomy:
             tokens.add(p)
         return tokens
 
+    def _rebuild_reverse_indexes(self) -> None:
+        for detail_code, minor_code in list(self.detail_to_minor.items()):
+            if not detail_code or not minor_code:
+                continue
+            if not self.detail_to_middle.get(detail_code):
+                middle_code = self.minor_to_middle.get(minor_code, "")
+                if middle_code:
+                    self.detail_to_middle[detail_code] = middle_code
+            if not self.detail_to_major.get(detail_code):
+                middle_code = self.detail_to_middle.get(detail_code, "")
+                major_code = self.middle_to_major.get(middle_code, "") if middle_code else ""
+                if major_code:
+                    self.detail_to_major[detail_code] = major_code
+
+    def _append_normalized_name_index(
+        self,
+        *,
+        name: str,
+        major_code: str,
+        middle_code: str,
+        minor_code: str,
+        detail_code: str,
+    ) -> None:
+        norm = self._normalize(name)
+        if not norm:
+            return
+        record = {
+            "major_code": major_code,
+            "middle_code": middle_code,
+            "minor_code": minor_code,
+            "detail_code": detail_code,
+            "raw_name": name,
+        }
+        arr = self.normalized_name_index.setdefault(norm, [])
+        if record not in arr:
+            arr.append(record)
+
+    def _build_name_index_from_maps(self) -> None:
+        self.normalized_name_index = {}
+        for code, name in self.major_names.items():
+            self._append_normalized_name_index(
+                name=name,
+                major_code=code,
+                middle_code="",
+                minor_code="",
+                detail_code="",
+            )
+        for code, name in self.middle_names.items():
+            self._append_normalized_name_index(
+                name=name,
+                major_code=self.middle_to_major.get(code, ""),
+                middle_code=code,
+                minor_code="",
+                detail_code="",
+            )
+        for code, name in self.minor_names.items():
+            middle_code = self.minor_to_middle.get(code, "")
+            self._append_normalized_name_index(
+                name=name,
+                major_code=self.middle_to_major.get(middle_code, "") if middle_code else "",
+                middle_code=middle_code,
+                minor_code=code,
+                detail_code="",
+            )
+        for code, name in self.detail_names.items():
+            minor_code = self.detail_to_minor.get(code, "")
+            middle_code = self.detail_to_middle.get(code, "") or self.minor_to_middle.get(minor_code, "")
+            major_code = self.detail_to_major.get(code, "") or (self.middle_to_major.get(middle_code, "") if middle_code else "")
+            self._append_normalized_name_index(
+                name=name,
+                major_code=major_code,
+                middle_code=middle_code,
+                minor_code=minor_code,
+                detail_code=code,
+            )
+
     def score_minors(self, text: str) -> dict[str, int]:
         if not text:
             return {}
         norm = self._normalize(text)
         if not norm:
             return {}
-        # extract candidate tokens from text
+
         text_tokens = set()
-        for m in re.finditer(r"[一-龥ぁ-んァ-ンA-Za-z0-9]{2,}", norm):
+        for m in re.finditer(r"[一-龥ぁ-んァ-ンa-z0-9]{2,}", norm):
             tok = m.group(0)
             if tok in _GENERIC_TOKENS:
                 continue
@@ -411,7 +549,6 @@ class JSICTaxonomy:
         for tok in text_tokens:
             for code in self._token_index.get(tok, set()):
                 scores[code] = scores.get(code, 0) + 1
-            # substring match against minor names (helps short industry hints)
             for code, name_norm in self._minor_names_norm.items():
                 if tok in name_norm:
                     scores[code] = scores.get(code, 0) + 1
@@ -424,7 +561,7 @@ class JSICTaxonomy:
         if not norm:
             return {}
         text_tokens = set()
-        for m in re.finditer(r"[一-龥ぁ-んァ-ンA-Za-z0-9]{2,}", norm):
+        for m in re.finditer(r"[一-龥ぁ-んァ-ンa-z0-9]{2,}", norm):
             tok = m.group(0)
             if tok in _GENERIC_TOKENS:
                 continue
@@ -460,10 +597,275 @@ class JSICTaxonomy:
 
 
 class IndustryClassifier:
-    def __init__(self, csv_path: str | None = None) -> None:
+    def __init__(self, csv_path: str | None = None, aliases_csv_path: str | None = None) -> None:
         self.csv_path = csv_path or DEFAULT_JSIC_CSV_PATH
         self.taxonomy = JSICTaxonomy(self.csv_path, DEFAULT_JSIC_JSON_PATH)
         self.loaded = self.taxonomy.load()
+
+        self.aliases_csv_path = aliases_csv_path or DEFAULT_INDUSTRY_ALIASES_CSV_PATH
+        self.alias_entries: list[IndustryAliasEntry] = []
+        self.alias_source = "fallback"
+        if self.loaded:
+            self._load_alias_entries()
+
+    def _read_alias_rows(self, path: str) -> list[dict[str, str]]:
+        for enc in ("utf-8-sig", "cp932", "shift_jis"):
+            try:
+                with open(path, "r", encoding=enc, newline="") as f:
+                    reader = csv.DictReader(f)
+                    return [dict(row) for row in reader]
+            except Exception:
+                continue
+        return []
+
+    def _fallback_alias_rows(self) -> list[dict[str, str]]:
+        rows: list[dict[str, str]] = []
+        for alias, (target, priority, requires_review, notes) in _ALIAS_TO_MINOR_FALLBACK.items():
+            rows.append(
+                {
+                    "alias": alias,
+                    "target_minor_code": target,
+                    "priority": str(priority),
+                    "requires_review": str(requires_review),
+                    "notes": notes,
+                }
+            )
+        return rows
+
+    def _normalize_alias_row(self, row: dict[str, str]) -> IndustryAliasEntry | None:
+        alias = str(row.get("alias") or "").strip()
+        alias_norm = norm_text_compact(alias)
+        if not alias_norm:
+            return None
+
+        target_minor_code = str(row.get("target_minor_code") or "").strip()
+        try:
+            priority = int(str(row.get("priority") or "1").strip())
+        except Exception:
+            priority = 1
+        priority = max(1, priority)
+
+        requires_review_raw = str(row.get("requires_review") or "0").strip().lower()
+        requires_review = requires_review_raw in {"1", "true", "yes"}
+        notes = str(row.get("notes") or "").strip()
+
+        valid_target = bool(
+            target_minor_code
+            and (
+                target_minor_code in self.taxonomy.minor_names
+                or target_minor_code in self.taxonomy.detail_names
+            )
+        )
+        if target_minor_code and not valid_target:
+            requires_review = True
+            notes = f"{notes}|unknown_minor_code" if notes else "unknown_minor_code"
+            target_minor_code = ""
+
+        return IndustryAliasEntry(
+            alias=alias,
+            target_minor_code=target_minor_code,
+            priority=priority,
+            requires_review=requires_review,
+            notes=notes,
+            alias_norm=alias_norm,
+        )
+
+    def _load_alias_entries(self) -> None:
+        rows: list[dict[str, str]] = []
+        if self.aliases_csv_path and os.path.exists(self.aliases_csv_path):
+            rows = self._read_alias_rows(self.aliases_csv_path)
+            if rows and not {"alias", "target_minor_code", "priority", "requires_review", "notes"}.issubset(set(rows[0].keys())):
+                rows = []
+            if rows:
+                self.alias_source = "csv"
+
+        if not rows:
+            rows = self._fallback_alias_rows()
+            self.alias_source = "fallback"
+
+        entries: list[IndustryAliasEntry] = []
+        for row in rows:
+            entry = self._normalize_alias_row(row)
+            if entry is None:
+                continue
+            entries.append(entry)
+
+        entries.sort(key=lambda x: (-x.priority, -len(x.alias_norm), x.alias_norm, x.target_minor_code))
+        self.alias_entries = entries
+        log.info("Industry aliases loaded: %s entries (source=%s)", len(entries), self.alias_source)
+
+    def _alias_hits_for_text(self, text: str) -> list[IndustryAliasEntry]:
+        if not text or not self.alias_entries:
+            return []
+        spaced = norm_text(text)
+        compact = spaced.replace(" ", "")
+        if not compact:
+            return []
+
+        hits: list[IndustryAliasEntry] = []
+        seen: set[tuple[str, str]] = set()
+        for entry in self.alias_entries:
+            if not entry.alias_norm:
+                continue
+            if re.fullmatch(r"[a-z0-9]+", entry.alias_norm):
+                pat = re.compile(rf"(?<![a-z0-9]){re.escape(entry.alias_norm)}(?![a-z0-9])")
+                if not pat.search(compact):
+                    continue
+            else:
+                if entry.alias_norm not in compact:
+                    continue
+            key = (entry.alias_norm, entry.target_minor_code)
+            if key in seen:
+                continue
+            seen.add(key)
+            hits.append(entry)
+        return hits
+
+    def _iter_tag_values(self, business_tags: Any) -> list[str]:
+        if business_tags is None:
+            return []
+        if isinstance(business_tags, (list, tuple, set)):
+            return [str(v).strip() for v in business_tags if str(v).strip()]
+
+        text = str(business_tags).strip()
+        if not text:
+            return []
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    return [str(v).strip() for v in parsed if str(v).strip()]
+            except Exception:
+                pass
+        parts = re.split(r"[\n,、/|]+", text)
+        return [p.strip() for p in parts if p.strip()]
+
+    def _resolve_candidate_from_code(self, code: str) -> Optional[dict[str, str]]:
+        target = str(code or "").strip()
+        if not target:
+            return None
+        if target in self.taxonomy.detail_names:
+            (
+                major_code,
+                major_name,
+                middle_code,
+                middle_name,
+                _minor_code,
+                _minor_name,
+                detail_code,
+                detail_name,
+            ) = self.taxonomy.resolve_detail_hierarchy(target)
+            if not (major_code and middle_code and detail_code):
+                return None
+            return {
+                "major_code": major_code,
+                "major_name": major_name,
+                "middle_code": middle_code,
+                "middle_name": middle_name,
+                "minor_code": detail_code,
+                "minor_name": detail_name,
+            }
+
+        if target in self.taxonomy.minor_names:
+            major_code, major_name, middle_code, middle_name, minor_code, minor_name = self.taxonomy.resolve_hierarchy(target)
+            if not (major_code and middle_code and minor_code):
+                return None
+            return {
+                "major_code": major_code,
+                "major_name": major_name,
+                "middle_code": middle_code,
+                "middle_name": middle_name,
+                "minor_code": minor_code,
+                "minor_name": minor_name,
+            }
+        return None
+
+    def classify_from_aliases(self, description: str, business_tags: Any) -> Optional[dict[str, Any]]:
+        if not self.loaded or not self.alias_entries:
+            return None
+
+        desc_hits = self._alias_hits_for_text(description or "")
+        tag_values = self._iter_tag_values(business_tags)
+        tag_hits: list[IndustryAliasEntry] = []
+        for tag in tag_values:
+            tag_hits.extend(self._alias_hits_for_text(tag))
+
+        scores: dict[str, dict[str, Any]] = {}
+
+        def apply_hit(entry: IndustryAliasEntry, source: str) -> None:
+            if not entry.target_minor_code:
+                return
+            slot = scores.setdefault(
+                entry.target_minor_code,
+                {
+                    "score": 0,
+                    "desc_hits": 0,
+                    "tag_hits": 0,
+                    "max_priority": 0,
+                    "requires_review": False,
+                    "aliases": set(),
+                },
+            )
+            boost = max(1, int(entry.priority))
+            if source == "tag":
+                boost += 1
+                slot["tag_hits"] = int(slot.get("tag_hits") or 0) + 1
+            else:
+                slot["desc_hits"] = int(slot.get("desc_hits") or 0) + 1
+            slot["score"] = int(slot.get("score") or 0) + boost
+            slot["max_priority"] = max(int(slot.get("max_priority") or 0), int(entry.priority))
+            if entry.requires_review:
+                slot["requires_review"] = True
+            alias_set = slot.get("aliases")
+            if isinstance(alias_set, set):
+                alias_set.add(entry.alias)
+
+        for hit in desc_hits:
+            apply_hit(hit, "desc")
+        for hit in tag_hits:
+            apply_hit(hit, "tag")
+
+        if not scores:
+            return None
+
+        ranked = sorted(
+            scores.items(),
+            key=lambda item: (
+                -int(item[1].get("score") or 0),
+                -int(item[1].get("tag_hits") or 0),
+                -int(item[1].get("desc_hits") or 0),
+                -int(item[1].get("max_priority") or 0),
+                item[0],
+            ),
+        )
+        best_code, best_meta = ranked[0]
+        candidate = self._resolve_candidate_from_code(best_code)
+        if not candidate:
+            return None
+
+        desc_count = int(best_meta.get("desc_hits") or 0)
+        tag_count = int(best_meta.get("tag_hits") or 0)
+        both_sources = desc_count > 0 and tag_count > 0
+
+        base_conf = 0.45 + 0.04 * min(5, int(best_meta.get("score") or 0))
+        if both_sources:
+            confidence = min(0.72, max(0.55, base_conf))
+        else:
+            confidence = min(0.5, base_conf)
+
+        review_required = bool(best_meta.get("requires_review") or confidence <= 0.5)
+
+        return {
+            **candidate,
+            "confidence": float(max(0.0, min(1.0, confidence))),
+            "source": "alias_desc_tags" if both_sources else "alias_single",
+            "review_required": review_required,
+            "alias_only": True,
+            "alias_match_count": int(desc_count + tag_count),
+            "alias_desc_hits": desc_count,
+            "alias_tag_hits": tag_count,
+            "alias_matches": sorted(list(best_meta.get("aliases") or [])),
+        }
 
     def score_levels(self, text_blocks: list[str]) -> dict[str, Any]:
         if not self.loaded:
@@ -473,7 +875,10 @@ class IndustryClassifier:
                 "minor_scores": {},
                 "middle_scores": {},
                 "major_scores": {},
+                "alias_matches": [],
+                "alias_requires_review": False,
             }
+
         text = "\n".join([t for t in text_blocks if t])
         if not text:
             return {
@@ -482,17 +887,17 @@ class IndustryClassifier:
                 "minor_scores": {},
                 "middle_scores": {},
                 "major_scores": {},
+                "alias_matches": [],
+                "alias_requires_review": False,
             }
 
         use_detail = bool(self.taxonomy.detail_names)
         detail_scores: dict[str, int] = {}
         if use_detail:
             detail_scores = self.taxonomy.score_details(text)
-        minor_scores: dict[str, int]
+
         if use_detail:
-            # 通常は細分類スコアを小分類に集計する。
-            # ただし細分類に全くヒットしない場合は、小分類スコアを直接計算して落ちないようにする。
-            minor_scores = {}
+            minor_scores: dict[str, int] = {}
             for detail_code, score in detail_scores.items():
                 minor_code = self.taxonomy.detail_to_minor.get(detail_code, "")
                 if not minor_code:
@@ -502,6 +907,49 @@ class IndustryClassifier:
                 minor_scores = self.taxonomy.score_minors(text)
         else:
             minor_scores = self.taxonomy.score_minors(text)
+
+        norm_compact = self.taxonomy._normalize(text)
+        tokens = set()
+        for m in re.finditer(r"[一-龥ぁ-んァ-ンa-z0-9]{2,}", norm_compact):
+            tok = m.group(0)
+            if tok in _GENERIC_TOKENS:
+                continue
+            tokens.add(tok)
+
+        def boost_scores(scores: dict[str, int], name_map: dict[str, str], base_boost: int = 3) -> None:
+            if not norm_compact:
+                return
+            for code, name in name_map.items():
+                name_norm = self.taxonomy._normalize(name)
+                if not name_norm:
+                    continue
+                boost = 0
+                if name_norm in norm_compact or norm_compact in name_norm:
+                    boost += base_boost
+                else:
+                    for tok in tokens:
+                        if tok in name_norm:
+                            boost += 1
+                if boost > 0:
+                    scores[code] = scores.get(code, 0) + boost
+
+        boost_scores(minor_scores, self.taxonomy.minor_names)
+        if use_detail:
+            boost_scores(detail_scores, self.taxonomy.detail_names)
+
+        alias_hits = self._alias_hits_for_text(text)
+        for hit in alias_hits:
+            if not hit.target_minor_code:
+                continue
+            boost = max(1, int(hit.priority))
+            target = hit.target_minor_code
+            if target in self.taxonomy.detail_names:
+                detail_scores[target] = detail_scores.get(target, 0) + boost
+                mapped_minor = self.taxonomy.detail_to_minor.get(target, "")
+                if mapped_minor:
+                    minor_scores[mapped_minor] = minor_scores.get(mapped_minor, 0) + max(1, boost - 1)
+            elif target in self.taxonomy.minor_names:
+                minor_scores[target] = minor_scores.get(target, 0) + boost
 
         middle_scores: dict[str, int] = {}
         for minor_code, score in minor_scores.items():
@@ -517,46 +965,8 @@ class IndustryClassifier:
                 continue
             major_scores[major_code] = major_scores.get(major_code, 0) + score
 
-        norm_text = self.taxonomy._normalize(text)
-        tokens = set()
-        for m in re.finditer(r"[一-龥ぁ-んァ-ンA-Za-z0-9]{2,}", norm_text):
-            tok = m.group(0)
-            if tok in _GENERIC_TOKENS:
-                continue
-            tokens.add(tok)
-
-        def boost_scores(scores: dict[str, int], name_map: dict[str, str], base_boost: int = 3) -> None:
-            if not norm_text:
-                return
-            for code, name in name_map.items():
-                name_norm = self.taxonomy._normalize(name)
-                if not name_norm:
-                    continue
-                boost = 0
-                if name_norm in norm_text or norm_text in name_norm:
-                    boost += base_boost
-                else:
-                    for tok in tokens:
-                        if tok in name_norm:
-                            boost += 1
-                if boost > 0:
-                    scores[code] = scores.get(code, 0) + boost
-
         boost_scores(major_scores, self.taxonomy.major_names)
         boost_scores(middle_scores, self.taxonomy.middle_names)
-        boost_scores(minor_scores, self.taxonomy.minor_names)
-        if use_detail:
-            boost_scores(detail_scores, self.taxonomy.detail_names)
-
-        # エイリアス（略称・英語）の加点。存在しないコードは無視。
-        norm_text_upper = norm_text.upper()
-        for alias, codes in _ALIAS_TO_MINOR.items():
-            if alias and alias in norm_text_upper:
-                for code in codes:
-                    if code in self.taxonomy.detail_names:
-                        detail_scores[code] = detail_scores.get(code, 0) + 1
-                    if code in self.taxonomy.minor_names:
-                        minor_scores[code] = minor_scores.get(code, 0) + 1
 
         return {
             "use_detail": use_detail,
@@ -564,6 +974,17 @@ class IndustryClassifier:
             "minor_scores": minor_scores,
             "middle_scores": middle_scores,
             "major_scores": major_scores,
+            "alias_matches": [
+                {
+                    "alias": h.alias,
+                    "target_minor_code": h.target_minor_code,
+                    "priority": h.priority,
+                    "requires_review": int(h.requires_review),
+                    "notes": h.notes,
+                }
+                for h in alias_hits
+            ],
+            "alias_requires_review": any(h.requires_review for h in alias_hits),
         }
 
     def build_level_candidates(
@@ -666,7 +1087,7 @@ class IndustryClassifier:
                         maj = self.taxonomy.middle_to_major.get(mid, "")
                     if maj != major_code:
                         continue
-                major_code_val, major_name, middle_code_val, middle_name, minor_code_val, minor_name, detail_code, detail_name = (
+                major_code_val, major_name, middle_code_val, middle_name, _minor_code_val, _minor_name, detail_code, detail_name = (
                     self.taxonomy.resolve_detail_hierarchy(code)
                 )
                 if not (major_code_val and middle_code_val and detail_code):
@@ -692,16 +1113,30 @@ class IndustryClassifier:
     def rule_classify(self, text_blocks: list[str], min_score: int = 2) -> Optional[dict[str, Any]]:
         if not self.loaded:
             return None
-        text = "\n".join([t for t in text_blocks if t])
-        scores = self.taxonomy.score_minors(text)
+
+        scores_bundle = self.score_levels(text_blocks)
+        scores = scores_bundle.get("minor_scores") or {}
         if not scores:
             return None
+
         best_code, best_score = max(scores.items(), key=lambda x: x[1])
-        if best_score < min_score:
+        if int(best_score) < int(min_score):
             return None
+
         major_code, major_name, middle_code, middle_name, minor_code, minor_name = self.taxonomy.resolve_hierarchy(best_code)
         if not (major_code and middle_code and minor_code):
             return None
+
+        alias_codes = {
+            str(m.get("target_minor_code") or "")
+            for m in (scores_bundle.get("alias_matches") or [])
+            if str(m.get("target_minor_code") or "")
+        }
+        alias_based = best_code in alias_codes
+        confidence = min(1.0, 0.45 + 0.08 * int(best_score))
+        if alias_based:
+            confidence = min(confidence, 0.5)
+
         return {
             "major_code": major_code,
             "major_name": major_name,
@@ -709,8 +1144,9 @@ class IndustryClassifier:
             "middle_name": middle_name,
             "minor_code": minor_code,
             "minor_name": minor_name,
-            "confidence": min(1.0, 0.5 + 0.1 * best_score),
-            "source": "rule",
+            "confidence": confidence,
+            "source": "rule_alias" if alias_based else "rule",
+            "review_required": bool(alias_based and (scores_bundle.get("alias_requires_review") or confidence <= 0.5)),
         }
 
     def build_ai_candidates(self, text_blocks: list[str], top_n: int = 12) -> list[dict[str, str]]:
@@ -725,7 +1161,7 @@ class IndustryClassifier:
         out: list[dict[str, str]] = []
         for code, _ in sorted_codes:
             if use_detail:
-                major_code, major_name, middle_code, middle_name, minor_code, minor_name, detail_code, detail_name = (
+                major_code, major_name, middle_code, middle_name, _minor_code, _minor_name, detail_code, detail_name = (
                     self.taxonomy.resolve_detail_hierarchy(code)
                 )
                 if not (major_code and middle_code and detail_code):
@@ -759,22 +1195,12 @@ class IndustryClassifier:
     def build_candidates_from_industry_name(self, industry_text: str, top_n: int = 12) -> list[dict[str, str]]:
         if not self.loaded:
             return []
-        norm = self.taxonomy._normalize(industry_text)
+        norm_spaced = norm_text(industry_text)
+        norm = norm_spaced.replace(" ", "")
         if not norm:
             return []
-        seps = "・,、/()（）-〜～~"
-        tokens: list[str] = []
-        buf = ""
-        for ch in norm:
-            if ch in seps:
-                if buf:
-                    tokens.append(buf)
-                    buf = ""
-            else:
-                buf += ch
-        if buf:
-            tokens.append(buf)
-        tokens = [t for t in tokens if len(t) >= 2]
+
+        tokens = [t for t in norm_spaced.split(" ") if len(t) >= 2]
 
         use_detail = bool(self.taxonomy.detail_names)
         source = self.taxonomy.detail_names if use_detail else self.taxonomy.minor_names
@@ -787,7 +1213,7 @@ class IndustryClassifier:
             if norm in name_norm or name_norm in norm:
                 score += 5
             for tok in tokens:
-                if tok in name_norm:
+                if tok and tok in name_norm:
                     score += 1
             if score > 0:
                 scores.append((score, code))
@@ -798,7 +1224,7 @@ class IndustryClassifier:
         out: list[dict[str, str]] = []
         for _, code in scores[: max(1, top_n)]:
             if use_detail:
-                major_code, major_name, middle_code, middle_name, minor_code, minor_name, detail_code, detail_name = (
+                major_code, major_name, middle_code, middle_name, _minor_code, _minor_name, detail_code, detail_name = (
                     self.taxonomy.resolve_detail_hierarchy(code)
                 )
                 if not (major_code and middle_code and detail_code):
@@ -836,7 +1262,47 @@ class IndustryClassifier:
         if not norm:
             return None
 
-        # detail -> minor hierarchy
+        entries = self.taxonomy.normalized_name_index.get(norm, [])
+        if entries:
+            entries = sorted(entries, key=lambda e: (0 if e.get("detail_code") else 1, 0 if e.get("minor_code") else 1))
+            for e in entries:
+                detail_code = str(e.get("detail_code") or "")
+                minor_code = str(e.get("minor_code") or "")
+                if detail_code and detail_code in self.taxonomy.detail_names:
+                    (
+                        major_code,
+                        major_name,
+                        middle_code,
+                        middle_name,
+                        _minor_code,
+                        _minor_name,
+                        resolved_detail_code,
+                        detail_name,
+                    ) = self.taxonomy.resolve_detail_hierarchy(detail_code)
+                    if not (major_code and middle_code and resolved_detail_code):
+                        continue
+                    return {
+                        "major_code": major_code,
+                        "major_name": major_name,
+                        "middle_code": middle_code,
+                        "middle_name": middle_name,
+                        "minor_code": resolved_detail_code,
+                        "minor_name": detail_name,
+                    }
+
+                if minor_code and minor_code in self.taxonomy.minor_names:
+                    major_code, major_name, middle_code, middle_name, resolved_minor_code, minor_name = self.taxonomy.resolve_hierarchy(minor_code)
+                    if not (major_code and middle_code and resolved_minor_code):
+                        continue
+                    return {
+                        "major_code": major_code,
+                        "major_name": major_name,
+                        "middle_code": middle_code,
+                        "middle_name": middle_name,
+                        "minor_code": resolved_minor_code,
+                        "minor_name": minor_name,
+                    }
+
         for code, name in self.taxonomy.detail_names.items():
             if self.taxonomy._normalize(name) != norm:
                 continue

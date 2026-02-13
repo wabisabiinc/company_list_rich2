@@ -4,6 +4,7 @@ import os
 import csv
 import logging
 import json
+import hashlib
 import re
 import random
 import time
@@ -14,6 +15,7 @@ import unicodedata
 from difflib import SequenceMatcher
 from typing import Any, Dict
 from urllib.parse import urlparse, unquote
+from pathlib import Path
 try:
     from dotenv import load_dotenv
     DOTENV_AVAILABLE = True
@@ -33,6 +35,7 @@ from src.ai_verifier import (
 )
 from src.homepage_policy import apply_provisional_homepage_policy
 from src.industry_classifier import IndustryClassifier
+from src.text_normalizer import norm_text_compact
 from scripts.extract_contact_urls import _pick_contact_url, _build_ai_signals, AI_MIN_CONFIDENCE_DEFAULT
 from src.reference_checker import ReferenceChecker
 from src.jp_number import normalize_kanji_numbers
@@ -169,7 +172,7 @@ INDUSTRY_DETAIL_MIN_EVIDENCE_CHARS = max(0, int(os.getenv("INDUSTRY_DETAIL_MIN_E
 INDUSTRY_FORCE_CLASSIFY = os.getenv("INDUSTRY_FORCE_CLASSIFY", "false").lower() == "true"
 INDUSTRY_FORCE_DEFAULT_MINOR_CODES = [
     s.strip()
-    for s in os.getenv("INDUSTRY_FORCE_DEFAULT_MINOR_CODES", "9599,9299,9999").split(",")
+    for s in os.getenv("INDUSTRY_FORCE_DEFAULT_MINOR_CODES", "392,401").split(",")
     if s.strip()
 ]
 INDUSTRY_REQUIRE_AI = os.getenv("INDUSTRY_REQUIRE_AI", "true").lower() == "true"
@@ -204,6 +207,18 @@ UPDATE_CHECK_ENABLED = os.getenv("UPDATE_CHECK_ENABLED", "true").lower() == "tru
 UPDATE_CHECK_TIMEOUT_MS = int(os.getenv("UPDATE_CHECK_TIMEOUT_MS", "2500"))
 UPDATE_CHECK_ALLOW_SLOW = os.getenv("UPDATE_CHECK_ALLOW_SLOW", "false").lower() == "true"
 UPDATE_CHECK_FINAL_ONLY = os.getenv("UPDATE_CHECK_FINAL_ONLY", "true").lower() == "true"
+# 更新チェックの「ロジック更新」検知:
+# - 既定は主要ソースの内容ハッシュを自動計算
+# - UPDATE_CHECK_LOGIC_HASH が指定されていればその値を優先（強制再取得/固定運用用）
+UPDATE_CHECK_LOGIC_HASH_OVERRIDE = (os.getenv("UPDATE_CHECK_LOGIC_HASH", "") or "").strip()
+UPDATE_CHECK_LOGIC_FILES = [
+    p.strip()
+    for p in (os.getenv(
+        "UPDATE_CHECK_LOGIC_FILES",
+        "main.py,src/company_scraper.py,src/ai_verifier.py,src/industry_classifier.py,src/homepage_policy.py",
+    ) or "").split(",")
+    if p.strip()
+]
 # directory_like を強く疑う場合のハード拒否閾値（既定: 9）
 DIRECTORY_HARD_REJECT_SCORE = int(os.getenv("DIRECTORY_HARD_REJECT_SCORE", "9"))
 DEFAULT_TIME_LIMIT_FETCH_ONLY = TIME_LIMIT_FETCH_ONLY
@@ -2192,13 +2207,36 @@ def _pick_hierarchy_from_tags(tags: list[str], required_major: str | None = None
     best["margin"] = max(0, int(best.get("count", 0)) - second_count)
     return best
 
+INFO_COMM_HINT_TERMS: set[str] = {
+    "ai", "生成ai", "llm", "dx", "saas", "paas", "iaas",
+    "it", "ict", "iot", "ec", "eコマース", "デジタル",
+    "クラウド", "webサービス", "システム開発", "情報処理",
+}
+INFO_COMM_HINT_TERMS_NORM = {norm_text_compact(t) for t in INFO_COMM_HINT_TERMS if t}
+
+
+def _has_info_comm_signal(tags: list[str]) -> bool:
+    for tag in tags:
+        nt = norm_text_compact(tag)
+        if not nt:
+            continue
+        for sig in INFO_COMM_HINT_TERMS_NORM:
+            if sig and sig in nt:
+                return True
+    return False
+
+
 # 強い業種タグ（1件でも補完を許可するドメイン）
 STRONG_MAJOR_TAGS: dict[str, set[str]] = {
     "製造業": {"製造", "加工", "工場", "部品", "生産", "組立", "装置", "機械", "鋳造", "金型", "塗装"},
     "建設業": {"建設", "建築", "工事", "施工", "土木", "解体", "リフォーム", "電気工事", "配管", "設備工事"},
     "不動産業，物品賃貸業": {"不動産", "賃貸", "仲介", "管理", "宅建", "宅地建物", "PM", "AM"},
-    "情報通信業": {"IT", "ソフトウェア", "システム", "SaaS", "クラウド", "DX", "アプリ", "Webサービス", "ICT"},
-    "卸売業，小売業": {"卸", "小売", "EC", "通販", "販売", "店舗運営", "リテール"},
+    "情報通信業": {
+        "IT", "ICT", "IoT", "AI", "生成AI", "LLM", "DX", "SaaS",
+        "ソフトウェア", "システム", "システム開発", "Webサービス",
+        "デジタル", "クラウド", "アプリ",
+    },
+    "卸売業，小売業": {"卸", "小売", "EC", "通販", "販売", "店舗運営", "リテール", "ネット通販", "オンライン販売", "EC運営"},
     "運輸業，郵便業": {"物流", "運送", "配送", "倉庫", "輸送", "フォワーダー", "宅配", "郵便"},
     "金融業，保険業": {"金融", "保険", "銀行", "証券", "融資", "貸金", "リース"},
     "医療，福祉": {"医療", "介護", "福祉", "クリニック", "病院", "看護", "訪問看護", "調剤"},
@@ -2232,9 +2270,16 @@ def _pick_strong_major_from_tags(tags: list[str]) -> tuple[str, int, int]:
     if not tags:
         return ("", 0, 0)
     scores: dict[str, int] = {}
+    kw_norm_map: dict[str, set[str]] = {
+        major: {norm_text_compact(k) for k in kwset if norm_text_compact(k)}
+        for major, kwset in STRONG_MAJOR_TAGS.items()
+    }
     for t in tags:
-        for major, kwset in STRONG_MAJOR_TAGS.items():
-            if any(k.lower() in t.lower() for k in kwset):
+        nt = norm_text_compact(t)
+        if not nt:
+            continue
+        for major, kwset_norm in kw_norm_map.items():
+            if any(k in nt for k in kwset_norm):
                 scores[major] = scores.get(major, 0) + 1
     if not scores:
         return ("", 0, 0)
@@ -2630,6 +2675,39 @@ def jittered_seconds(base: float, ratio: float) -> float:
 def _now_utc_str() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
 
+
+def build_update_check_logic_hash(files: list[str], *, root_dir: str | None = None) -> str:
+    """
+    更新チェックで使うロジック識別子を生成する。
+    主要ソースの内容ハッシュを使うことで、ロジック更新時に再取得を強制できる。
+    """
+    root = Path(root_dir or Path(__file__).resolve().parent)
+    digest = hashlib.sha256()
+    used = 0
+    for rel in files:
+        rel_path = (rel or "").strip()
+        if not rel_path:
+            continue
+        path = root / rel_path
+        try:
+            data = path.read_bytes()
+        except Exception:
+            continue
+        digest.update(rel_path.encode("utf-8", errors="ignore"))
+        digest.update(b"\0")
+        digest.update(data)
+        digest.update(b"\0")
+        used += 1
+    if used <= 0:
+        return "auto:none"
+    return f"auto:{digest.hexdigest()[:16]}"
+
+
+if UPDATE_CHECK_LOGIC_HASH_OVERRIDE:
+    CURRENT_UPDATE_CHECK_LOGIC_HASH = f"manual:{UPDATE_CHECK_LOGIC_HASH_OVERRIDE}"
+else:
+    CURRENT_UPDATE_CHECK_LOGIC_HASH = build_update_check_logic_hash(UPDATE_CHECK_LOGIC_FILES)
+
 def _pick_update_check_url(company: Dict[str, Any]) -> tuple[str, str]:
     final_homepage = (company.get("final_homepage") or "").strip()
     if final_homepage:
@@ -2652,6 +2730,8 @@ async def maybe_skip_if_unchanged(
     if not url:
         return False
     prev_url = (company.get("homepage_check_url") or "").strip()
+    prev_logic_hash = (company.get("homepage_check_logic_hash") or "").strip()
+    current_logic_hash = CURRENT_UPDATE_CHECK_LOGIC_HASH
     try:
         info = await scraper._fetch_http_info(  # type: ignore[attr-defined]
             url,
@@ -2676,15 +2756,25 @@ async def maybe_skip_if_unchanged(
         company["homepage_content_length"] = content_length
         company["homepage_fingerprint"] = fingerprint
         company["homepage_check_source"] = url_source
+        company["homepage_check_logic_hash"] = current_logic_hash
         return False
     url_matches = (not prev_url) or (prev_url == url)
-    unchanged = bool(url_matches and prev_fp == fingerprint)
+    logic_matches = (not prev_logic_hash) or (prev_logic_hash == current_logic_hash)
+    unchanged = bool(url_matches and logic_matches and prev_fp == fingerprint)
     if not unchanged:
+        if url_matches and prev_fp == fingerprint and not logic_matches:
+            log.info(
+                "[skip-check] logic hash changed -> force recrawl (id=%s prev=%s current=%s)",
+                company.get("id"),
+                prev_logic_hash or "-",
+                current_logic_hash,
+            )
         company["homepage_check_url"] = url
         company["homepage_checked_at"] = now_str
         company["homepage_content_length"] = content_length
         company["homepage_fingerprint"] = fingerprint
         company["homepage_check_source"] = url_source
+        company["homepage_check_logic_hash"] = current_logic_hash
         return False
     manager.save_update_check_result(
         company_id=int(company.get("id") or 0),
@@ -2694,6 +2784,7 @@ async def maybe_skip_if_unchanged(
         homepage_checked_at=now_str,
         homepage_check_url=url,
         homepage_check_source=url_source,
+        homepage_check_logic_hash=current_logic_hash,
         skip_reason="homepage_unchanged",
     )
     log.info("[skip] homepage unchanged -> done (id=%s url=%s)", company.get("id"), url)
@@ -2711,6 +2802,7 @@ async def process():
         WORKER_ID, HEADLESS, USE_AI, MAX_ROWS, ID_MIN, ID_MAX,
         AI_COOLDOWN_SEC, SLEEP_BETWEEN_SEC, JITTER_RATIO, MIRROR_TO_CSV
     )
+    log.info("update-check logic hash: %s", CURRENT_UPDATE_CHECK_LOGIC_HASH)
 
     scraper = CompanyScraper(headless=HEADLESS)
     base_page_timeout_ms = getattr(scraper, "page_timeout_ms", 9000) or 9000
@@ -6662,6 +6754,31 @@ async def process():
                                         "source": "name_exact",
                                     }
 
+                            if not industry_result:
+                                try:
+                                    industry_result = INDUSTRY_CLASSIFIER.classify_from_aliases(
+                                        description_val or "",
+                                        business_tags_val or "",
+                                    )
+                                except Exception:
+                                    industry_result = None
+
+                            if industry_result and str(industry_result.get("source") or "").startswith("alias"):
+                                # alias単独は誤分類抑止のため review 寄せ・confidence上限を維持
+                                try:
+                                    conf_now = float(industry_result.get("confidence") or 0.0)
+                                except Exception:
+                                    conf_now = 0.0
+                                alias_desc_hits = int(industry_result.get("alias_desc_hits") or 0)
+                                alias_tag_hits = int(industry_result.get("alias_tag_hits") or 0)
+                                alias_both = alias_desc_hits > 0 and alias_tag_hits > 0
+                                if not alias_both:
+                                    conf_now = min(conf_now, 0.5)
+                                    industry_result["review_required"] = True
+                                industry_result["confidence"] = conf_now
+                                if bool(industry_result.get("review_required")):
+                                    force_review = True
+
                             final_industry_name = ""
                             if industry_result:
                                 final_industry_name = (
@@ -6729,8 +6846,12 @@ async def process():
                                     company["industry_minor_item_code"] = ""
                                     company["industry_minor_item"] = "不明"
 
-                        # description は「何をしているどの会社か」が分かる形に整形（業種は含めない）
-                        description_val = clean_description_value(sanitize_text_block(description_val))
+                        # description は「何をしているどの会社か」が分かる形に整形（会社名+業種を含める）
+                        description_val = _ensure_name_industry_in_description(
+                            clean_description_value(sanitize_text_block(description_val)),
+                            name,
+                            industry_val,
+                        )
                         if description_val and len(description_val) > FINAL_DESCRIPTION_MAX_LEN:
                             description_val = _truncate_final_description(description_val, max_len=FINAL_DESCRIPTION_MAX_LEN)
 
@@ -7434,6 +7555,16 @@ async def process():
                                         "source": "name_exact_post",
                                     }
 
+                            if not industry_result_post:
+                                alias_business_tags: Any = parsed_business_tags if parsed_business_tags else (business_tags_val or "")
+                                try:
+                                    industry_result_post = INDUSTRY_CLASSIFIER.classify_from_aliases(
+                                        description_val or "",
+                                        alias_business_tags,
+                                    )
+                                except Exception:
+                                    industry_result_post = None
+
                             # 低信頼なら tags を強いヒントにして再AI判定（精度補強）
                             if (
                                 industry_result_post
@@ -7682,6 +7813,22 @@ async def process():
                                         "source": "forced_post",
                                     }
 
+                            if industry_result_post and str(industry_result_post.get("source") or "").startswith("alias"):
+                                try:
+                                    conf_now = float(industry_result_post.get("confidence") or 0.0)
+                                except Exception:
+                                    conf_now = 0.0
+                                alias_desc_hits = int(industry_result_post.get("alias_desc_hits") or 0)
+                                alias_tag_hits = int(industry_result_post.get("alias_tag_hits") or 0)
+                                alias_both = alias_desc_hits > 0 and alias_tag_hits > 0
+                                if not alias_both:
+                                    conf_now = min(conf_now, 0.5)
+                                    industry_result_post["review_required"] = True
+                                industry_result_post["confidence"] = conf_now
+
+                            if industry_result_post and bool(industry_result_post.get("review_required")):
+                                force_review = True
+
                             if industry_result_post:
                                 minor_item_code = ""
                                 minor_item_name = ""
@@ -7814,8 +7961,12 @@ async def process():
                                 best_h = _pick_hierarchy_from_tags(tag_list_for_major, required_major=industry_major_code)
                                 best_count = int(best_h.get("count", 0))
                                 best_margin = int(best_h.get("margin", 0))
-                                # 2ヒット以上かつ2位との差が2以上のときだけ採用
-                                if best_h and best_count >= 2 and best_margin >= 2:
+                                info_signal = _has_info_comm_signal(tag_list_for_major)
+                                # 通常: 2ヒット以上 & margin>=2
+                                # 情報通信系シグナルあり: 1ヒット以上 & margin>=0
+                                need_count = 1 if info_signal else 2
+                                need_margin = 0 if info_signal else 2
+                                if best_h and best_count >= need_count and best_margin >= need_margin:
                                     industry_middle_code = best_h.get("middle_code") or industry_middle_code
                                     industry_middle = best_h.get("middle_name") or industry_middle or "不明"
                                     industry_minor_code = best_h.get("minor_code") or industry_minor_code
@@ -7910,6 +8061,22 @@ async def process():
                             company["industry_class_source"] = industry_class_source or "unclassified"
                             company["industry_class_confidence"] = float(industry_class_confidence or 0.0)
                             company["business_tags"] = business_tags_val
+                            # 業種確定後に description へ業種を反映（最終保存の一貫性を確保）
+                            final_industry_for_desc = str(company.get("industry") or industry_val or "").strip()
+                            if (not final_industry_for_desc) or final_industry_for_desc == "不明":
+                                # 方針: description は業種を必ず含める。業種不明なら保存しない。
+                                description_val = ""
+                            else:
+                                description_val = _ensure_name_industry_in_description(
+                                    description_val,
+                                    name,
+                                    final_industry_for_desc,
+                                )
+                                if description_val and len(description_val) > FINAL_DESCRIPTION_MAX_LEN:
+                                    description_val = _truncate_final_description(
+                                        description_val, max_len=FINAL_DESCRIPTION_MAX_LEN
+                                    )
+                            company["description"] = description_val
 
                         if not homepage:
                             top3_urls = list(urls or [])[:3]
