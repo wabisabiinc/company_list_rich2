@@ -89,6 +89,7 @@ COMPANIES_DB_PATH=data/companies_logistics.db python3 main.py
 - `REQUIRE_OFFICIAL_HOMEPAGE`（official確定できないURLを `homepage` に保存しない。既定 `true`）
 - `SAVE_PROVISIONAL_HOMEPAGE`（暫定URLを `homepage` にも保存する。既定 `false`。`final_homepage/provisional_homepage` には常に記録）
 - `APPLY_PROVISIONAL_HOMEPAGE_POLICY`（弱い暫定URLを自動で落とす。既定 `true`）
+- `SEARCH_ENGINES`（検索エンジン順。既定 `startpage`。例: `startpage,bing`）
 - `UPDATE_CHECK_LOGIC_HASH`（更新チェックのロジック識別子を手動指定。未指定時は `main.py` など主要ソースの内容ハッシュを自動利用し、ロジック更新時に再取得を強制）
 - `DIRECTORY_HARD_REJECT_SCORE`（企業DB/ディレクトリ疑いのハード拒否閾値。既定 `9`）
 - `SEARCH_CANDIDATE_LIMIT`（検索候補の最大数）

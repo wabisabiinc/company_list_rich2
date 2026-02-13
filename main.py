@@ -166,6 +166,7 @@ INDUSTRY_RULE_MIN_SCORE = max(1, int(os.getenv("INDUSTRY_RULE_MIN_SCORE", "2")))
 INDUSTRY_AI_ENABLED = os.getenv("INDUSTRY_AI_ENABLED", "true").lower() == "true"
 INDUSTRY_AI_TOP_N = max(5, int(os.getenv("INDUSTRY_AI_TOP_N", "12")))
 INDUSTRY_AI_MIN_CONFIDENCE = float(os.getenv("INDUSTRY_AI_MIN_CONFIDENCE", "0.50"))
+INDUSTRY_MAJOR_MIN_CONFIDENCE = float(os.getenv("INDUSTRY_MAJOR_MIN_CONFIDENCE", "0.50"))
 INDUSTRY_MINOR_DIRECT_MAX_CANDIDATES = max(20, int(os.getenv("INDUSTRY_MINOR_DIRECT_MAX_CANDIDATES", "60")))
 INDUSTRY_DETAIL_MIN_CONFIDENCE = float(os.getenv("INDUSTRY_DETAIL_MIN_CONFIDENCE", "0.72"))
 INDUSTRY_DETAIL_MIN_EVIDENCE_CHARS = max(0, int(os.getenv("INDUSTRY_DETAIL_MIN_EVIDENCE_CHARS", "200")))
@@ -6764,11 +6765,34 @@ async def process():
                                 alias_desc_hits = int(industry_result.get("alias_desc_hits") or 0)
                                 alias_tag_hits = int(industry_result.get("alias_tag_hits") or 0)
                                 alias_both = alias_desc_hits > 0 and alias_tag_hits > 0
+                                alias_domain_conflict = bool(industry_result.get("alias_domain_conflict"))
                                 if not alias_both:
                                     conf_now = min(conf_now, 0.5)
                                     industry_result["review_required"] = True
+                                if alias_domain_conflict:
+                                    conf_now = min(conf_now, 0.58)
+                                    industry_result["review_required"] = True
                                 industry_result["confidence"] = conf_now
                                 if bool(industry_result.get("review_required")):
+                                    force_review = True
+
+                            if industry_result:
+                                try:
+                                    major_conf_now = float(industry_result.get("confidence") or 0.0)
+                                except Exception:
+                                    major_conf_now = 0.0
+                                major_code_now = str(industry_result.get("major_code") or "").strip()
+                                major_name_now = str(industry_result.get("major_name") or "").strip()
+                                major_confirmed = bool(
+                                    major_code_now
+                                    and major_name_now
+                                    and major_name_now != "不明"
+                                    and major_conf_now >= INDUSTRY_MAJOR_MIN_CONFIDENCE
+                                )
+                                if not major_confirmed:
+                                    industry_result = None
+                                    industry_class_source = (industry_class_source or "unclassified") + "|major_unconfirmed"
+                                    industry_class_confidence = 0.0
                                     force_review = True
 
                             final_industry_name = ""
@@ -6922,7 +6946,7 @@ async def process():
                             homepage_official_flag = 0
                             homepage_official_source = ""
                             homepage_official_score = 0.0
-                        if not final_homepage_candidate:
+                        if (not final_homepage_candidate) and (not str(company.get("final_homepage") or "").strip()):
                             description_val = ""
                         normalized_phone = normalize_phone(phone)
                         if normalized_phone:
@@ -7128,6 +7152,64 @@ async def process():
                         company["alt_homepage"] = alt_homepage
                         company["alt_homepage_type"] = alt_homepage_type
                         company["final_homepage"] = final_homepage_candidate
+
+                        # final_homepage があるのに description が空なら、同URLの本文から再構成して補完する。
+                        # 追加AI呼び出しは行わず、既存の抽出ロジックのみで埋める。
+                        if (not description_val) and final_homepage_candidate:
+                            try:
+                                def _normalize_host_for_desc(url_val: str) -> str:
+                                    try:
+                                        host_val = (urlparse(url_val).netloc or "").lower().split(":")[0]
+                                    except Exception:
+                                        host_val = ""
+                                    return host_val[4:] if host_val.startswith("www.") else host_val
+
+                                final_host = _normalize_host_for_desc(final_homepage_candidate)
+                                desc_payload_candidates: list[dict[str, Any]] = []
+                                for payload in payloads_for_desc:
+                                    if not isinstance(payload, dict):
+                                        continue
+                                    p_url = str(payload.get("url") or "").strip()
+                                    if not p_url:
+                                        continue
+                                    if p_url == final_homepage_candidate:
+                                        desc_payload_candidates.insert(0, payload)
+                                        continue
+                                    if final_host and _normalize_host_for_desc(p_url) == final_host:
+                                        desc_payload_candidates.append(payload)
+
+                                if not desc_payload_candidates:
+                                    refreshed = await ensure_info_text(
+                                        scraper,
+                                        final_homepage_candidate,
+                                        {"url": final_homepage_candidate},
+                                        allow_slow=False,
+                                    )
+                                    if isinstance(refreshed, dict) and ((refreshed.get("text") or "") or (refreshed.get("html") or "")):
+                                        desc_payload_candidates = [refreshed]
+
+                                rebuilt_from_final = ""
+                                if desc_payload_candidates:
+                                    rebuilt_from_final = build_final_description_from_payloads(
+                                        desc_payload_candidates[:4],
+                                        min_len=max(20, FINAL_DESCRIPTION_MIN_LEN // 3),
+                                        max_len=FINAL_DESCRIPTION_MAX_LEN,
+                                    )
+                                    if not rebuilt_from_final:
+                                        for payload in desc_payload_candidates[:3]:
+                                            rebuilt_from_final = extract_description_from_payload(payload) or ""
+                                            if rebuilt_from_final:
+                                                break
+
+                                if rebuilt_from_final:
+                                    description_val = _ensure_name_industry_in_description(
+                                        clean_description_value(sanitize_text_block(rebuilt_from_final)),
+                                        name,
+                                        "",
+                                    )
+                                    company["description"] = description_val
+                            except Exception:
+                                pass
 
                         # ---- 業種（final_homepage確定後に最終判定） ----
                         if INDUSTRY_CLASSIFY_AFTER_HOMEPAGE and INDUSTRY_CLASSIFY_ENABLED and INDUSTRY_CLASSIFIER.loaded:
@@ -7812,10 +7894,33 @@ async def process():
                                 alias_desc_hits = int(industry_result_post.get("alias_desc_hits") or 0)
                                 alias_tag_hits = int(industry_result_post.get("alias_tag_hits") or 0)
                                 alias_both = alias_desc_hits > 0 and alias_tag_hits > 0
+                                alias_domain_conflict = bool(industry_result_post.get("alias_domain_conflict"))
                                 if not alias_both:
                                     conf_now = min(conf_now, 0.5)
                                     industry_result_post["review_required"] = True
+                                if alias_domain_conflict:
+                                    conf_now = min(conf_now, 0.58)
+                                    industry_result_post["review_required"] = True
                                 industry_result_post["confidence"] = conf_now
+
+                            if industry_result_post:
+                                try:
+                                    major_conf_now = float(industry_result_post.get("confidence") or 0.0)
+                                except Exception:
+                                    major_conf_now = 0.0
+                                major_code_now = str(industry_result_post.get("major_code") or "").strip()
+                                major_name_now = str(industry_result_post.get("major_name") or "").strip()
+                                major_confirmed = bool(
+                                    major_code_now
+                                    and major_name_now
+                                    and major_name_now != "不明"
+                                    and major_conf_now >= INDUSTRY_MAJOR_MIN_CONFIDENCE
+                                )
+                                if not major_confirmed:
+                                    industry_result_post = None
+                                    industry_class_source = (industry_class_source or "unclassified") + "|major_unconfirmed"
+                                    industry_class_confidence = 0.0
+                                    force_review = True
 
                             if industry_result_post and bool(industry_result_post.get("review_required")):
                                 force_review = True
@@ -7932,7 +8037,14 @@ async def process():
                                 major_conflict = bool(industry_major_code and industry_major_code != tag_major_code)
                                 weak_conf = float(industry_class_confidence or 0.0) < 0.55
                                 unknown_major = (not industry_major_code) or (industry_major in {"", "不明"})
-                                strong_major_signal = (tag_major_count >= 2) and (tag_major_margin >= 1)
+                                major_info_signal = _has_info_comm_signal(tag_list_for_major)
+                                if major_info_signal:
+                                    strong_major_signal = (tag_major_count >= 2) and (tag_major_margin >= 1)
+                                else:
+                                    strong_major_signal = (
+                                        (tag_major_count >= 3 and tag_major_margin >= 1)
+                                        or (tag_major_count >= 2 and tag_major_margin >= 2)
+                                    )
                                 if (unknown_major or (major_conflict and weak_conf)) and strong_major_signal:
                                     industry_major_code = tag_major_code
                                     industry_major = tag_major_name
@@ -7953,10 +8065,10 @@ async def process():
                                 best_count = int(best_h.get("count", 0))
                                 best_margin = int(best_h.get("margin", 0))
                                 info_signal = _has_info_comm_signal(tag_list_for_major)
-                                # 通常: 2ヒット以上 & margin>=2
-                                # 情報通信系シグナルあり: 1ヒット以上 & margin>=0
-                                need_count = 1 if info_signal else 2
-                                need_margin = 0 if info_signal else 2
+                                # 通常: 3ヒット以上 & margin>=2
+                                # 情報通信系シグナルあり: 2ヒット以上 & margin>=1
+                                need_count = 2 if info_signal else 3
+                                need_margin = 1 if info_signal else 2
                                 if best_h and best_count >= need_count and best_margin >= need_margin:
                                     industry_middle_code = best_h.get("middle_code") or industry_middle_code
                                     industry_middle = best_h.get("middle_name") or industry_middle or "不明"
@@ -7965,11 +8077,12 @@ async def process():
                                     industry_class_source = (industry_class_source or "unclassified") + "|tag_hierarchy"
                                     industry_class_confidence = min(float(industry_class_confidence or 0.6), 0.6)
 
-                            # --- 強い業種タグが1件でもある場合の最終フォールバック & 矛盾ガード ---
+                            # --- 強い業種タグによる最終フォールバック & 矛盾ガード ---
                             if TAG_HIERARCHY_FILL and tag_list_for_major:
-                                # 強いタグがある大分類に寄せる（ヒット数1件でも許可、差分も見る）
+                                # 最低2ヒットかつmargin>=1のときだけ大分類補完を許可する。
                                 strong_major, strong_hits, strong_margin = _pick_strong_major_from_tags(tag_list_for_major)
-                                if strong_major:
+                                strong_major_signal = (strong_hits >= 2) and (strong_margin >= 1)
+                                if strong_major and strong_major_signal:
                                     deny_set = MAJOR_DENY_MAP.get(strong_major, set())
                                     if industry_major and industry_major in deny_set:
                                         # 矛盾する場合は分類をリセットし review へ
@@ -7993,7 +8106,7 @@ async def process():
                                         industry_minor = "不明"
                                         industry_class_source = (industry_class_source or "unclassified") + "|tag_strong"
                                         # ヒット数に応じて控えめに confidence を設定
-                                        base_conf = 0.45 if strong_hits == 1 else 0.55
+                                        base_conf = 0.48 if strong_hits == 2 else 0.55
                                         industry_class_confidence = max(float(industry_class_confidence or 0.0), base_conf)
 
                             company["industry"] = (industry_val or "不明")[:60]

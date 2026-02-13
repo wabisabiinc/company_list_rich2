@@ -28,8 +28,24 @@ SAMPLE_HTML = """
   </body>
 </html>
 """
+STARTPAGE_SAMPLE_HTML = """
+<html>
+  <body>
+    <article class="w-gl__result">
+      <a class="w-gl__result-title" href="/sp/click?url=https%3A%2F%2Fwww.tawaraya-official.co.jp%2Fcompany%2F&source=web">Tawaraya</a>
+    </article>
+    <article class="w-gl__result">
+      <a data-testid="result-title-a" href="https://www.startpage.com/sp/click?u=https%3A%2F%2Fwww.example.co.jp%2Fabout">Example</a>
+    </article>
+    <article class="w-gl__result">
+      <a class="w-gl__result-title" href="https://facebook.com/profile">FB</a>
+    </article>
+  </body>
+</html>
+"""
 @pytest.fixture
-def scraper():
+def scraper(monkeypatch):
+    monkeypatch.setenv("SEARCH_ENGINES", "ddg")
     sc = CompanyScraper(headless=True)
     sc.http_session = None  # テストでは requests.get のモックを使う
     return sc
@@ -40,9 +56,15 @@ def _strip_rep_tags(value: str) -> str:
 
 
 def test_search_engines_env_parsing(monkeypatch):
-    monkeypatch.setenv("SEARCH_ENGINES", "duckduckgo,bing,unknown,DDG")
+    monkeypatch.setenv("SEARCH_ENGINES", "startpage,duckduckgo,bing,unknown,DDG,sp")
     sc = CompanyScraper(headless=True)
-    assert sc.search_engines == ["ddg", "bing"]
+    assert sc.search_engines == ["startpage", "ddg", "bing"]
+
+
+def test_search_engines_default_is_startpage(monkeypatch):
+    monkeypatch.delenv("SEARCH_ENGINES", raising=False)
+    sc = CompanyScraper(headless=True)
+    assert sc.search_engines == ["startpage"]
 
 
 def test_build_company_queries_includes_short_address_tokens(scraper):
@@ -129,6 +151,40 @@ def test_is_likely_official_site_true(scraper):
 def test_clean_candidate_url_relative(scraper):
     assert scraper._clean_candidate_url("/relative/path") == "https://duckduckgo.com/relative/path"
     assert scraper._clean_candidate_url("//bar.com/page").startswith("https://")
+
+
+def test_extract_startpage_urls_decodes_redirect(scraper):
+    urls = list(scraper._extract_startpage_urls(STARTPAGE_SAMPLE_HTML))
+    assert "https://www.tawaraya-official.co.jp/company/" in urls
+    assert "https://www.example.co.jp/about" in urls
+    assert not any("startpage.com/sp/click" in u for u in urls)
+    assert not any("facebook.com" in u for u in urls)
+
+
+@pytest.mark.asyncio
+async def test_search_company_uses_startpage(monkeypatch):
+    monkeypatch.setenv("SEARCH_ENGINES", "startpage")
+    scraper = CompanyScraper(headless=True)
+    called_queries = []
+
+    async def _fake_startpage_fetch(query: str) -> str:
+        called_queries.append(query)
+        return STARTPAGE_SAMPLE_HTML
+
+    async def _unexpected_fetch(*_args, **_kwargs):
+        raise AssertionError("Unexpected search engine fetch path")
+
+    scraper._fetch_startpage = _fake_startpage_fetch  # type: ignore[method-assign]
+    scraper._fetch_duckduckgo = _unexpected_fetch  # type: ignore[method-assign]
+    scraper._fetch_bing = _unexpected_fetch  # type: ignore[method-assign]
+
+    urls = await scraper.search_company("株式会社オフィス俵屋", "茨城県つくば市", num_results=5)
+    assert "https://www.tawaraya-official.co.jp/company/" in urls
+    assert "https://www.example.co.jp/about" in urls
+    assert not any("startpage.com/sp/click" in u for u in urls)
+    assert called_queries
+    expected_queries = set(scraper._build_company_queries("株式会社オフィス俵屋", "茨城県つくば市"))
+    assert set(called_queries).issubset(expected_queries)
 
 
 

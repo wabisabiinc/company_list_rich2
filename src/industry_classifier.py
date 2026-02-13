@@ -962,14 +962,37 @@ class IndustryClassifier:
         desc_count = int(best_meta.get("desc_hits") or 0)
         tag_count = int(best_meta.get("tag_hits") or 0)
         both_sources = desc_count > 0 and tag_count > 0
+        best_score = int(best_meta.get("score") or 0)
+        best_domain_tags = {str(v) for v in (best_meta.get("domain_tags") or set()) if str(v)}
 
-        base_conf = 0.45 + 0.04 * min(5, int(best_meta.get("score") or 0))
+        # aliasヒットが複数ドメインをまたぐ/僅差で競合する場合は誤分類リスクが高い。
+        domain_conflict = len(best_domain_tags) >= 2
+        if len(ranked) >= 2:
+            second_code, second_meta = ranked[1]
+            second_score = int(second_meta.get("score") or 0)
+            score_close = second_score > 0 and (best_score - second_score) <= 1
+            if score_close:
+                second_candidate = self._resolve_candidate_from_code(second_code)
+                second_domain_tags = {str(v) for v in (second_meta.get("domain_tags") or set()) if str(v)}
+                if (
+                    second_candidate
+                    and str(second_candidate.get("major_code") or "")
+                    and str(candidate.get("major_code") or "")
+                    and str(second_candidate.get("major_code") or "") != str(candidate.get("major_code") or "")
+                ):
+                    domain_conflict = True
+                elif second_domain_tags and best_domain_tags and second_domain_tags != best_domain_tags:
+                    domain_conflict = True
+
+        base_conf = 0.45 + 0.04 * min(5, best_score)
         if both_sources:
             confidence = min(0.72, max(0.55, base_conf))
         else:
             confidence = min(0.5, base_conf)
+        if domain_conflict:
+            confidence = min(confidence, 0.58)
 
-        review_required = bool(best_meta.get("requires_review") or confidence <= 0.5)
+        review_required = bool(best_meta.get("requires_review") or confidence <= 0.5 or domain_conflict)
 
         return {
             **candidate,
@@ -977,6 +1000,7 @@ class IndustryClassifier:
             "source": "alias_desc_tags" if both_sources else "alias_single",
             "review_required": review_required,
             "alias_only": True,
+            "alias_domain_conflict": domain_conflict,
             "alias_match_count": int(desc_count + tag_count),
             "alias_desc_hits": desc_count,
             "alias_tag_hits": tag_count,

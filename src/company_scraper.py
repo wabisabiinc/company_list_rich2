@@ -396,7 +396,7 @@ MARKET_CODE_RE = re.compile(
 class CompanyScraper:
     PREFECTURE_NAMES = PREFECTURE_NAMES
     """
-    DuckDuckGo 非JS(html.duckduckgo.com/html)で検索 → 上位リンク取得
+    検索エンジン（既定: Startpage）で検索 → 上位リンク取得
     ＋ Playwrightで本文/スクショ取得。
     各ワーカーでブラウザ/コンテキストを使い回して高速化＆安定化。
     """
@@ -719,20 +719,22 @@ class CompanyScraper:
         self.search_cache: Dict[tuple[str, str], List[str]] = {}
         # 共有 HTTP セッションでコネクションを再利用し、検索/HTTP取得のレイテンシを抑える
         self.http_session: Optional[requests.Session] = requests.Session()
-        # 検索エンジン（環境変数 SEARCH_ENGINES=ddg,bing 等で指定。既定は ddg）
-        raw_engines = os.getenv("SEARCH_ENGINES", "ddg")
+        # 検索エンジン（環境変数 SEARCH_ENGINES=startpage,bing 等で指定。既定は startpage）
+        raw_engines = os.getenv("SEARCH_ENGINES", "startpage")
         engines: list[str] = []
         for part in (raw_engines or "").replace(" ", ",").split(","):
             token = (part or "").strip().lower()
             if not token:
                 continue
+            if token in {"startpage", "sp"}:
+                token = "startpage"
             if token in {"duckduckgo", "ddg"}:
                 token = "ddg"
-            if token not in {"ddg", "bing"}:
+            if token not in {"startpage", "ddg", "bing"}:
                 continue
             if token not in engines:
                 engines.append(token)
-        self.search_engines = engines or ["ddg"]
+        self.search_engines = engines or ["startpage"]
         # 代表者は構造化ソース（テーブル/ラベル/JSON-LD）のみ許可するか
         self.rep_strict_sources = os.getenv("REP_STRICT_SOURCES", "true").lower() == "true"
         # ブラウザ操作専用セマフォ（HTTPとは別枠で制御し渋滞を防ぐ）
@@ -1988,14 +1990,40 @@ class CompanyScraper:
             pass
         return False
 
-    def _clean_candidate_url(self, raw: str) -> Optional[str]:
+    @staticmethod
+    def _is_search_internal_url(url: str) -> bool:
+        if not url:
+            return False
+        try:
+            parsed = urllib.parse.urlparse(url)
+        except Exception:
+            return False
+        host = (parsed.netloc or "").lower().split(":")[0]
+        path = (parsed.path or "").lower()
+        if host.endswith("duckduckgo.com"):
+            return path.startswith("/l") or path.startswith("/html") or path.startswith("/anomaly")
+        if host.endswith("startpage.com"):
+            return (
+                path.startswith("/sp/search")
+                or path.startswith("/do/search")
+                or path.startswith("/do/asearch")
+                or path.startswith("/sp/click")
+                or path in {"", "/"}
+            )
+        if host.endswith("bing.com"):
+            return path.startswith("/search") or path.startswith("/ck/a")
+        return False
+
+    def _clean_candidate_url(self, raw: str, source_base: str = "https://duckduckgo.com") -> Optional[str]:
         if not raw:
             return None
         href = self._decode_uddg(raw)
         if href.startswith("//"):
             href = "https:" + href
         elif href.startswith("/"):
-            href = urljoin("https://duckduckgo.com", href)
+            href = urljoin(source_base or "https://duckduckgo.com", href)
+        if self._is_search_internal_url(href):
+            return None
         lowered_full = href.lower()
         if self._is_excluded(lowered_full):
             return None
@@ -2057,6 +2085,49 @@ class CompanyScraper:
             or "bots use duckduckgo too" in lowered
         )
 
+    def _is_startpage_challenge(self, html: str) -> bool:
+        if not html:
+            return False
+        lowered = html.lower()
+        return (
+            "captcha" in lowered
+            and ("are you human" in lowered or "verify you are human" in lowered or "robot" in lowered)
+        ) or "captcha-delivery.com" in lowered
+
+    async def _fetch_startpage(self, query: str) -> str:
+        headers = {
+            "User-Agent": "Mozilla/5.0",
+            "Accept-Language": "ja,en-US;q=0.9",
+            "Referer": "https://www.startpage.com/",
+        }
+        endpoint_params = (
+            ("https://www.startpage.com/sp/search", {"query": query, "cat": "web", "language": "japanese"}),
+            ("https://www.startpage.com/do/search", {"query": query}),
+        )
+        for attempt in range(3):
+            for endpoint, params in endpoint_params:
+                try:
+                    resp = await asyncio.to_thread(
+                        self._session_get,
+                        endpoint,
+                        params=params,
+                        headers=headers,
+                        timeout=(5, 30),
+                    )
+                    if resp.status_code in (429, 500, 502, 503, 504):
+                        continue
+                    resp.raise_for_status()
+                    text = resp.text or ""
+                    if self._is_startpage_challenge(text):
+                        continue
+                    if text:
+                        return text
+                except Exception:
+                    continue
+            if attempt < 2:
+                await asyncio.sleep(0.8 * (2 ** attempt))
+        return ""
+
     async def _fetch_duckduckgo_via_proxy(self, query: str) -> str:
         try:
             proxy_url = "https://r.jina.ai/https://duckduckgo.com/html/"
@@ -2077,7 +2148,7 @@ class CompanyScraper:
         anchors = soup.select("a.result__a")
         if anchors:
             for a in anchors:
-                cleaned = self._clean_candidate_url(a.get("href"))
+                cleaned = self._clean_candidate_url(a.get("href"), source_base="https://duckduckgo.com")
                 if not cleaned or self._is_excluded(cleaned):
                     continue
                 yield cleaned
@@ -2085,9 +2156,37 @@ class CompanyScraper:
 
         # Proxy経由のレスポンスはMarkdown/テキスト形式なので手動抽出する
         for match in re.findall(r"https://duckduckgo\.com/l/\?uddg=[^\s)]+", html or ""):
-            cleaned = self._clean_candidate_url(match)
+            cleaned = self._clean_candidate_url(match, source_base="https://duckduckgo.com")
             if not cleaned or self._is_excluded(cleaned):
                 continue
+            yield cleaned
+
+    def _extract_startpage_urls(self, html: str) -> Iterable[str]:
+        soup = BeautifulSoup(html, "html.parser")
+        seen_cleaned: set[str] = set()
+        selectors = (
+            "a.w-gl__result-title",
+            "a[data-testid='result-title-a']",
+            "a.result-title",
+            "div.w-gl__result a[href]",
+            "article a[href]",
+        )
+        for selector in selectors:
+            for anchor in soup.select(selector):
+                cleaned = self._clean_candidate_url(anchor.get("href"), source_base="https://www.startpage.com")
+                if not cleaned or cleaned in seen_cleaned or self._is_excluded(cleaned):
+                    continue
+                seen_cleaned.add(cleaned)
+                yield cleaned
+
+        # HTML構造変更時の保険として、StartpageのリダイレクトURLを生文字列から拾う
+        for match in re.findall(r"(?:https?://(?:www\.)?startpage\.com)?/sp/click\?[^\s\"'<>]+", html or "", flags=re.IGNORECASE):
+            cleaned = self._clean_candidate_url(match, source_base="https://www.startpage.com")
+            if not cleaned or self._is_excluded(cleaned):
+                continue
+            if cleaned in seen_cleaned:
+                continue
+            seen_cleaned.add(cleaned)
             yield cleaned
 
     def _extract_bing_urls(self, html: str) -> Iterable[str]:
@@ -3463,12 +3562,54 @@ class CompanyScraper:
     def _decode_uddg(url: str) -> str:
         if not url:
             return url
+        def _safe_unquote(value: str) -> str:
+            decoded = value or ""
+            for _ in range(2):
+                next_decoded = unquote(decoded)
+                if next_decoded == decoded:
+                    break
+                decoded = next_decoded
+            return decoded
         try:
-            parsed = urlparse("https://duckduckgo.com" + url) if url.startswith("/l") else urlparse(url)
-            if parsed.netloc.endswith("duckduckgo.com") and parsed.path.startswith("/l"):
-                qs = parse_qs(parsed.query)
-                if "uddg" in qs and qs["uddg"]:
-                    return unquote(qs["uddg"][0])
+            raw = str(url).strip()
+            if raw.startswith("/l"):
+                parsed = urlparse("https://duckduckgo.com" + raw)
+            elif raw.startswith("/sp/") or raw.startswith("/do/"):
+                parsed = urlparse("https://www.startpage.com" + raw)
+            elif raw.startswith("//"):
+                parsed = urlparse("https:" + raw)
+            else:
+                parsed = urlparse(raw)
+
+            host = (parsed.netloc or "").lower()
+            path = parsed.path or ""
+            qs = parse_qs(parsed.query or "")
+
+            if host.endswith("duckduckgo.com") and path.startswith("/l"):
+                vals = qs.get("uddg")
+                if vals and vals[0]:
+                    return _safe_unquote(vals[0])
+
+            if host.endswith("startpage.com"):
+                for key in ("url", "u", "target", "redirect_url", "redirectUrl", "adurl"):
+                    vals = qs.get(key)
+                    if not vals or not vals[0]:
+                        continue
+                    decoded = _safe_unquote(vals[0])
+                    if decoded.startswith("//"):
+                        decoded = "https:" + decoded
+                    if decoded:
+                        return decoded
+
+            for key in ("uddg", "url", "u", "target", "redirect_url", "redirectUrl", "adurl"):
+                vals = qs.get(key)
+                if not vals or not vals[0]:
+                    continue
+                decoded = _safe_unquote(vals[0])
+                if decoded.startswith("//"):
+                    decoded = "https:" + decoded
+                if decoded:
+                    return decoded
         except Exception:
             pass
         return url
@@ -3661,7 +3802,7 @@ class CompanyScraper:
 
     async def search_company(self, company_name: str, address: str, num_results: int = 3) -> List[str]:
         """
-        DuckDuckGoで検索し、候補URLを返す（会社概要/企業情報/会社情報の固定クエリ）。
+        検索エンジンで検索し、候補URLを返す（会社概要/企業情報/会社情報の固定クエリ）。
         """
         key = (
             unicodedata.normalize("NFKC", company_name or "").strip(),
@@ -3690,12 +3831,14 @@ class CompanyScraper:
         async def run_queries(qs: list[str]) -> list[Dict[str, Any]]:
             candidates: List[Dict[str, Any]] = []
             seen: set[str] = set()
-            engines = self.search_engines or ["ddg"]
+            engines = self.search_engines or ["startpage"]
 
             async def run_engine(engine: str, q_idx: int, query: str) -> str:
                 if engine == "bing":
                     return await self._fetch_bing(query)
-                return await self._fetch_duckduckgo(query)
+                if engine == "ddg":
+                    return await self._fetch_duckduckgo(query)
+                return await self._fetch_startpage(query)
 
             for q_idx, query in enumerate(qs):
                 for eng in engines:
@@ -3705,7 +3848,12 @@ class CompanyScraper:
                         continue
                     if not html:
                         continue
-                    extractor = self._extract_bing_urls if eng == "bing" else self._extract_search_urls
+                    if eng == "bing":
+                        extractor = self._extract_bing_urls
+                    elif eng == "ddg":
+                        extractor = self._extract_search_urls
+                    else:
+                        extractor = self._extract_startpage_urls
                     for rank, url in enumerate(extractor(html)):
                         if url in seen:
                             continue
