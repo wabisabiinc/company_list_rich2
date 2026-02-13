@@ -1930,12 +1930,6 @@ def _truncate_final_description(text: str, max_len: int = FINAL_DESCRIPTION_MAX_
     trimmed = re.sub(r"\s+\S*$", "", truncated).strip()
     return trimmed if len(trimmed) >= max(10, FINAL_DESCRIPTION_MIN_LEN // 2) else truncated.rstrip()
 
-def _description_has_company_name_exact(description: str, company_name: str) -> bool:
-    if not description or not company_name:
-        return False
-    return company_name in description
-
-
 def _ensure_name_industry_in_description(description: str, company_name: str, industry: str) -> str:
     desc = (description or "").strip()
     if not desc:
@@ -3066,8 +3060,6 @@ async def process():
                     final_candidate = homepage or (company.get("final_homepage") or "").strip()
                     description_to_save = description_val or ""
                     if not final_candidate:
-                        description_to_save = ""
-                    elif description_to_save and not _description_has_company_name_exact(description_to_save, name):
                         description_to_save = ""
                     company.update({
                         "homepage": homepage or "",
@@ -6846,7 +6838,8 @@ async def process():
                                     company["industry_minor_item_code"] = ""
                                     company["industry_minor_item"] = "不明"
 
-                        # description は「何をしているどの会社か」が分かる形に整形（会社名+業種を含める）
+                        # description は「何をしているどの会社か」が分かる形に整形
+                        # （会社名は必須、業種は判明している場合のみ付与）
                         description_val = _ensure_name_industry_in_description(
                             clean_description_value(sanitize_text_block(description_val)),
                             name,
@@ -6930,8 +6923,6 @@ async def process():
                             homepage_official_source = ""
                             homepage_official_score = 0.0
                         if not final_homepage_candidate:
-                            description_val = ""
-                        elif description_val and not _description_has_company_name_exact(description_val, name):
                             description_val = ""
                         normalized_phone = normalize_phone(phone)
                         if normalized_phone:
@@ -8061,21 +8052,19 @@ async def process():
                             company["industry_class_source"] = industry_class_source or "unclassified"
                             company["industry_class_confidence"] = float(industry_class_confidence or 0.0)
                             company["business_tags"] = business_tags_val
-                            # 業種確定後に description へ業種を反映（最終保存の一貫性を確保）
+                            # 業種確定後に description へ反映（業種が判明時のみ付与）
                             final_industry_for_desc = str(company.get("industry") or industry_val or "").strip()
-                            if (not final_industry_for_desc) or final_industry_for_desc == "不明":
-                                # 方針: description は業種を必ず含める。業種不明なら保存しない。
-                                description_val = ""
-                            else:
-                                description_val = _ensure_name_industry_in_description(
-                                    description_val,
-                                    name,
-                                    final_industry_for_desc,
+                            if final_industry_for_desc == "不明":
+                                final_industry_for_desc = ""
+                            description_val = _ensure_name_industry_in_description(
+                                description_val,
+                                name,
+                                final_industry_for_desc,
+                            )
+                            if description_val and len(description_val) > FINAL_DESCRIPTION_MAX_LEN:
+                                description_val = _truncate_final_description(
+                                    description_val, max_len=FINAL_DESCRIPTION_MAX_LEN
                                 )
-                                if description_val and len(description_val) > FINAL_DESCRIPTION_MAX_LEN:
-                                    description_val = _truncate_final_description(
-                                        description_val, max_len=FINAL_DESCRIPTION_MAX_LEN
-                                    )
                             company["description"] = description_val
 
                         if not homepage:
