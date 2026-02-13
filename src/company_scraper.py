@@ -634,6 +634,10 @@ class CompanyScraper:
         re.compile(r"/corporations/\d+(?:/|$)", re.IGNORECASE),
         re.compile(r"/\d{13}(?:/|$)", re.IGNORECASE),
     )
+    # ドメインだけでディレクトリ/マッチング系と分かるもの（強制スコア）
+    DIRECTORY_HOSTS_STRONG = {
+        "zehitomo.com",
+    }
     DIRECTORY_QUERY_ID_KEYS = ("company_id", "companyid", "cid", "id", "detail_id", "detailid")
     DIRECTORY_QUERY_CORP_KEYS = ("corporate_number", "corporatenumber", "hojin_no", "houjin_no", "hojinbango", "corporateno")
     DIRECTORY_TEXT_KEYWORDS_STRONG = (
@@ -2324,6 +2328,11 @@ class CompanyScraper:
             path = unquote(parsed.path or "")
             query = parsed.query or ""
         path_lower = (path or "").lower()
+        host_lower = (parsed.netloc or "").lower() if parsed else ""
+
+        if host_lower in cls.DIRECTORY_HOSTS_STRONG:
+            score += 12
+            reasons.append(f"host:{host_lower}")
 
         for pat in cls.DIRECTORY_URL_PATTERNS_STRONG:
             if pat.search(path_lower):

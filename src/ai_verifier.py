@@ -463,6 +463,7 @@ class AIVerifier:
             "- Cookie/利用規約/ナビ/フッター/メニュー等の定型文やHTML/CSS/JS断片を住所に混ぜない。\n"
             "- address は「住所のみ」を返す（アクセス案内/営業時間/従業員数/許認可/コード類/地図/連絡先を混ぜない）。\n"
             "- description は事業内容のみ（問い合わせ/採用/アクセス/所在地/電話/URL/メール等は除外）。日本語1文で60〜120文字。迷ったら null。\n"
+            "- description には会社名を必ず含める（対象企業の表記をそのまま使用）。\n"
             "厳守:\n"
             "- csv_address（入力住所）と抽出候補住所の都道府県が不一致なら、住所近傍に「本社所在地/本店所在地」等の明示があり、代表電話も同ページ等で確認できる場合に限り address を返す。迷ったら null。\n"
             f"対象企業: {company_name or '不明'} / csv_address: {address or '不明'}\n"
@@ -487,7 +488,7 @@ class AIVerifier:
             "あなたは企業サイトから「何をしているどの会社か」が一目で分かるように要約する専門家です。\n"
             "次の要件を満たす description を JSON のみで返してください（説明文やマークダウンは禁止）。\n"
             "- 日本語1文・80〜160文字\n"
-            "- 会社名を必ず含める（先頭推奨）\n"
+            "- 会社名を必ず含める（対象企業の表記をそのまま使用。先頭推奨）\n"
             "- 業種は書かない（業種ヒントがあっても description には含めない）\n"
             "- 事業内容のみ（問い合わせ/採用/アクセス/所在地/電話/URL/メール/代表者情報は除外）\n"
             "- 「当社/弊社」など一人称は使わない\n"
@@ -577,6 +578,7 @@ class AIVerifier:
             "制約:\n"
             "- business_tags は最大5件。\n"
             "- description は80〜160字、日本語1〜2文、事業内容のみ。根拠が薄い/材料が無い場合は null。\n"
+            "- description には会社名を必ず含める（対象企業の表記をそのまま使用）。\n"
             "- description!=null の場合、description_evidence は必ず2件（URLと短い抜粋）。\n"
             "- evidence は住所/電話/代表者の根拠の短い抜粋（無ければ null）。\n"
             "- representative_valid は代表者名の妥当性。候補の representative が人名として不自然なら false、判断材料が無ければ null。\n"
@@ -773,6 +775,78 @@ class AIVerifier:
         single = self._normalize_company_fields_result(data)
         single["selection_stage"] = selection_stage
         return single
+
+    async def filter_business_tags(self, text: str, tags: list[str], allow_new: bool = False) -> list[str]:
+        """
+        主要/副次の事業キーワードだけを残す・生成する。
+        - allow_new=False: 候補タグのサブセットのみ返す。
+        - allow_new=True: 候補に無いがより的確なタグを生成してもよい。
+        """
+        if (not self.model) or (not tags and not allow_new):
+            return tags
+        try:
+            tags_json = json.dumps(tags, ensure_ascii=False)
+        except Exception:
+            tags_json = "[]"
+
+        system_prompt = (
+            "You are an assistant that extracts business keywords.\n"
+            "- Keep only terms directly related to the company's MAIN or SUB businesses.\n"
+            "- Exclude addresses, phones, licenses, greetings/visions, recruitment, access info, news.\n"
+            "- Drop vague generic words (例: サービス, 支援, 提供, 事業) if they are not paired with a domain noun (例: 不動産管理, 医療機器開発)。\n"
+            "- Prefer concrete business phrases that are immediately understandable (例: 自動車のカスタマイズ, チューニングパーツ販売)。\n"
+            "- Prefer phrases with domain noun + action. Length is flexible; avoid single-word tags unless they are highly specific.\n"
+            "- Aim for 3-10 items when possible.\n"
+            "- Output JSON array only. No commentary."
+        )
+        user_prompt = (
+            "TEXT:\n"
+            f"{text[:3800]}\n\n"
+            "CANDIDATE_TAGS:\n"
+            f"{tags_json}\n\n"
+            f"allow_new={allow_new}\n"
+            "Return JSON array of business keywords. "
+            "If allow_new=false, only return items that exist in CANDIDATE_TAGS. "
+            "If allow_new=true, you may replace or add clearer business keywords. "
+            "If uncertain, return []."
+        )
+
+        content = [system_prompt, user_prompt]
+        resp = await self._generate_with_timeout(content)
+        if resp is None:
+            return tags
+        raw = _resp_text(resp)
+        cleaned = raw.strip()
+        # まずJSONとして解釈を試みる
+        def _normalize_out(data: Any) -> list[str]:
+            out: list[str] = []
+            if not isinstance(data, list):
+                return out
+            for t in data:
+                if not isinstance(t, str):
+                    continue
+                tt = t.strip()
+                if not tt:
+                    continue
+                if allow_new:
+                    out.append(tt[:40])
+                else:
+                    if tt in tags:
+                        out.append(tt[:40])
+            return out
+
+        try:
+            data = json.loads(cleaned)
+            out = _normalize_out(data)
+            if out:
+                return out
+        except Exception:
+            pass
+        data = _extract_first_json(cleaned)
+        out = _normalize_out(data)
+        if out:
+            return out
+        return tags
 
     async def verify_info(self, text: str, screenshot: bytes, company_name: str, address: str) -> Optional[Dict[str, Any]]:
         if not self.model:
