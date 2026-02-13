@@ -1788,15 +1788,51 @@ class CompanyScraper:
     def _build_company_queries(self, company_name: str, address: Optional[str]) -> List[str]:
         """
         会社名に情報系キーワードを付けたクエリを生成する。
+        検索回数は増やさず、住所要素（都道府県+市区町村/郵便番号/都道府県）を
+        クエリへ織り込んで同名企業の取り違えを抑える。
         """
         base_name = (company_name or "").strip()
         if not base_name:
             return []
-        base_queries = [
-            f"{base_name} 会社概要",
-            f"{base_name} 企業情報",
-            f"{base_name} 会社情報",
-        ]
+
+        normalized_address = unicodedata.normalize("NFKC", address or "").strip()
+        pref = self._extract_prefecture(normalized_address)
+        city = self._extract_city(normalized_address)
+        zip_digits = self._extract_postal_code(normalized_address)
+        zip_term = f"{zip_digits[:3]}-{zip_digits[3:]}" if len(zip_digits) == 7 else ""
+        city_term = (city or "").strip()
+        if not city_term and normalized_address:
+            # CITY_RE が拾いにくい「つくば市」等のかな市名をローカルに補完する。
+            addr_body = normalized_address
+            if pref and pref in addr_body:
+                addr_body = addr_body.split(pref, 1)[1]
+            m_city = re.search(r"([一-龥ぁ-んァ-ヶー]{1,12}(?:市|区|町|村|郡))", addr_body)
+            if m_city:
+                city_term = m_city.group(1).strip()
+        if pref and city_term.startswith(pref):
+            city_term = city_term[len(pref):].strip()
+
+        # フル住所は表記ゆれノイズが強いため、短い識別子だけ使う。
+        address_terms: list[str] = []
+        pref_city = f"{pref}{city_term}".strip()
+        if pref_city:
+            address_terms.append(pref_city)
+        if zip_term and zip_term not in address_terms:
+            address_terms.append(zip_term)
+        if pref and pref not in address_terms:
+            address_terms.append(pref)
+        if city_term and city_term not in address_terms and not pref_city:
+            address_terms.append(city_term)
+
+        keywords = ("会社概要", "企業情報", "会社情報")
+        base_queries: list[str] = []
+        for idx, keyword in enumerate(keywords):
+            addr_token = address_terms[idx % len(address_terms)] if address_terms else ""
+            if addr_token:
+                base_queries.append(f"{base_name} {addr_token} {keyword}")
+            else:
+                base_queries.append(f"{base_name} {keyword}")
+
         # 末尾/重複を正規化しつつ、順序を維持して重複排除
         seen: set[str] = set()
         ordered: list[str] = []

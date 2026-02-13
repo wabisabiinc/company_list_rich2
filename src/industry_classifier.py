@@ -101,6 +101,8 @@ class IndustryAliasEntry:
     target_minor_code: str
     priority: int
     requires_review: bool
+    domain_tag: str
+    allowed_major_codes: tuple[str, ...]
     notes: str
     alias_norm: str
 
@@ -627,10 +629,56 @@ class IndustryClassifier:
                     "target_minor_code": target,
                     "priority": str(priority),
                     "requires_review": str(requires_review),
+                    "domain_tag": notes,
+                    "allowed_major_codes": "",
                     "notes": notes,
                 }
             )
         return rows
+
+    @staticmethod
+    def _append_alias_note(notes: str, marker: str) -> str:
+        marker = str(marker or "").strip()
+        if not marker:
+            return notes
+        current = str(notes or "").strip()
+        if not current:
+            return marker
+        parts = [p.strip() for p in current.split("|") if p.strip()]
+        if marker in parts:
+            return current
+        return f"{current}|{marker}"
+
+    @staticmethod
+    def _parse_allowed_major_codes(raw: str) -> tuple[str, ...]:
+        text = str(raw or "").strip().upper()
+        if not text:
+            return ()
+        out: list[str] = []
+        seen: set[str] = set()
+        for token in re.split(r"[\s,|/]+", text):
+            code = token.strip().upper()
+            if not code:
+                continue
+            if not re.fullmatch(r"[A-Z]", code):
+                continue
+            if code in seen:
+                continue
+            seen.add(code)
+            out.append(code)
+        return tuple(sorted(out))
+
+    def _resolve_target_major_code(self, target_code: str) -> str:
+        target = str(target_code or "").strip()
+        if not target:
+            return ""
+        if target in self.taxonomy.minor_names:
+            major_code, *_ = self.taxonomy.resolve_hierarchy(target)
+            return major_code
+        if target in self.taxonomy.detail_names:
+            major_code, *_ = self.taxonomy.resolve_detail_hierarchy(target)
+            return major_code
+        return ""
 
     def _normalize_alias_row(self, row: dict[str, str]) -> IndustryAliasEntry | None:
         alias = str(row.get("alias") or "").strip()
@@ -647,6 +695,8 @@ class IndustryClassifier:
 
         requires_review_raw = str(row.get("requires_review") or "0").strip().lower()
         requires_review = requires_review_raw in {"1", "true", "yes"}
+        domain_tag = str(row.get("domain_tag") or row.get("notes") or "").strip()
+        allowed_major_codes = self._parse_allowed_major_codes(str(row.get("allowed_major_codes") or ""))
         notes = str(row.get("notes") or "").strip()
 
         valid_target = bool(
@@ -658,14 +708,25 @@ class IndustryClassifier:
         )
         if target_minor_code and not valid_target:
             requires_review = True
-            notes = f"{notes}|unknown_minor_code" if notes else "unknown_minor_code"
+            notes = self._append_alias_note(notes, "unknown_minor_code")
             target_minor_code = ""
+        elif target_minor_code:
+            target_major_code = self._resolve_target_major_code(target_minor_code)
+            if target_major_code and not allowed_major_codes:
+                allowed_major_codes = (target_major_code,)
+            if target_major_code and allowed_major_codes and target_major_code not in allowed_major_codes:
+                requires_review = True
+                notes = self._append_alias_note(notes, "allowed_major_mismatch")
+                # target major mismatch rows are disabled to suppress false positives.
+                target_minor_code = ""
 
         return IndustryAliasEntry(
             alias=alias,
             target_minor_code=target_minor_code,
             priority=priority,
             requires_review=requires_review,
+            domain_tag=domain_tag,
+            allowed_major_codes=allowed_major_codes,
             notes=notes,
             alias_norm=alias_norm,
         )
@@ -674,7 +735,8 @@ class IndustryClassifier:
         rows: list[dict[str, str]] = []
         if self.aliases_csv_path and os.path.exists(self.aliases_csv_path):
             rows = self._read_alias_rows(self.aliases_csv_path)
-            if rows and not {"alias", "target_minor_code", "priority", "requires_review", "notes"}.issubset(set(rows[0].keys())):
+            required = {"alias", "target_minor_code", "priority", "requires_review"}
+            if rows and not required.issubset(set(rows[0].keys())):
                 rows = []
             if rows:
                 self.alias_source = "csv"
@@ -720,6 +782,49 @@ class IndustryClassifier:
             seen.add(key)
             hits.append(entry)
         return hits
+
+    def _infer_major_context_from_text(self, text: str) -> tuple[str, int, int]:
+        if not text:
+            return "", 0, 0
+        major_scores: dict[str, int] = {}
+
+        minor_scores = self.taxonomy.score_minors(text)
+        for minor_code, score in minor_scores.items():
+            middle_code = self.taxonomy.minor_to_middle.get(minor_code, "")
+            major_code = self.taxonomy.middle_to_major.get(middle_code, "") if middle_code else ""
+            if not major_code:
+                continue
+            major_scores[major_code] = major_scores.get(major_code, 0) + int(score)
+
+        norm_compact = self.taxonomy._normalize(text)
+        if norm_compact:
+            for major_code, major_name in self.taxonomy.major_names.items():
+                major_name_norm = self.taxonomy._normalize(major_name)
+                if major_name_norm and major_name_norm in norm_compact:
+                    major_scores[major_code] = major_scores.get(major_code, 0) + 3
+
+        if not major_scores:
+            return "", 0, 0
+        ranked = sorted(major_scores.items(), key=lambda x: (-x[1], x[0]))
+        best_major, best_score = ranked[0]
+        second_score = ranked[1][1] if len(ranked) >= 2 else 0
+        margin = max(0, int(best_score) - int(second_score))
+        return best_major, int(best_score), margin
+
+    def _filter_alias_hits_by_major_context(self, hits: list[IndustryAliasEntry], text: str) -> list[IndustryAliasEntry]:
+        if not hits:
+            return hits
+        best_major, best_score, margin = self._infer_major_context_from_text(text)
+        # Apply guard only when text has a clear major-level signal.
+        if not best_major or best_score < 3 or margin < 2:
+            return hits
+
+        filtered: list[IndustryAliasEntry] = []
+        for hit in hits:
+            if hit.allowed_major_codes and best_major not in hit.allowed_major_codes:
+                continue
+            filtered.append(hit)
+        return filtered
 
     def _iter_tag_values(self, business_tags: Any) -> list[str]:
         if business_tags is None:
@@ -789,6 +894,9 @@ class IndustryClassifier:
         tag_hits: list[IndustryAliasEntry] = []
         for tag in tag_values:
             tag_hits.extend(self._alias_hits_for_text(tag))
+        context_text = "\n".join([description or ""] + tag_values).strip()
+        desc_hits = self._filter_alias_hits_by_major_context(desc_hits, context_text)
+        tag_hits = self._filter_alias_hits_by_major_context(tag_hits, context_text)
 
         scores: dict[str, dict[str, Any]] = {}
 
@@ -804,11 +912,16 @@ class IndustryClassifier:
                     "max_priority": 0,
                     "requires_review": False,
                     "aliases": set(),
+                    "domain_tags": set(),
                 },
             )
             boost = max(1, int(entry.priority))
             if source == "tag":
                 boost += 1
+            if entry.requires_review:
+                # Review-required aliases are intentionally weak to reduce false positives.
+                boost = min(boost, 2)
+            if source == "tag":
                 slot["tag_hits"] = int(slot.get("tag_hits") or 0) + 1
             else:
                 slot["desc_hits"] = int(slot.get("desc_hits") or 0) + 1
@@ -819,6 +932,9 @@ class IndustryClassifier:
             alias_set = slot.get("aliases")
             if isinstance(alias_set, set):
                 alias_set.add(entry.alias)
+            domain_tag_set = slot.get("domain_tags")
+            if isinstance(domain_tag_set, set) and entry.domain_tag:
+                domain_tag_set.add(entry.domain_tag)
 
         for hit in desc_hits:
             apply_hit(hit, "desc")
@@ -865,6 +981,7 @@ class IndustryClassifier:
             "alias_desc_hits": desc_count,
             "alias_tag_hits": tag_count,
             "alias_matches": sorted(list(best_meta.get("aliases") or [])),
+            "alias_domain_tags": sorted(list(best_meta.get("domain_tags") or [])),
         }
 
     def score_levels(self, text_blocks: list[str]) -> dict[str, Any]:
@@ -938,10 +1055,13 @@ class IndustryClassifier:
             boost_scores(detail_scores, self.taxonomy.detail_names)
 
         alias_hits = self._alias_hits_for_text(text)
+        alias_hits = self._filter_alias_hits_by_major_context(alias_hits, text)
         for hit in alias_hits:
             if not hit.target_minor_code:
                 continue
             boost = max(1, int(hit.priority))
+            if hit.requires_review:
+                boost = min(boost, 2)
             target = hit.target_minor_code
             if target in self.taxonomy.detail_names:
                 detail_scores[target] = detail_scores.get(target, 0) + boost
@@ -980,6 +1100,8 @@ class IndustryClassifier:
                     "target_minor_code": h.target_minor_code,
                     "priority": h.priority,
                     "requires_review": int(h.requires_review),
+                    "domain_tag": h.domain_tag,
+                    "allowed_major_codes": list(h.allowed_major_codes),
                     "notes": h.notes,
                 }
                 for h in alias_hits

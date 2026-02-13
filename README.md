@@ -106,21 +106,34 @@ INDUSTRY_FORCE_DEFAULT_MINOR_CODES=392,401
 ## 業種分類運用フロー
 
 1. `industry_aliases.csv` を更新（同義語と `target_minor_code` を追加）
-2. backfill を実行して既存データへ反映
-3. レポートで分類状態を確認
-4. 未分類から候補語を抽出し、次回辞書更新へ回す
+2. alias辞書の整合性を検証（`allowed_major_codes` / 正規化競合 / コード存在）
+3. backfill を実行して既存データへ反映
+4. レポートで分類状態を確認
+5. 未分類から候補語を抽出し、次回辞書更新へ回す
+
+`industry_aliases.csv` の推奨カラム:
+- `alias`
+- `target_minor_code`
+- `priority`
+- `requires_review`
+- `domain_tag`（業務ラベル）
+- `allowed_major_codes`（`A`〜`T` の大分類コード。複数可: `G|I`）
+- `notes`（任意メモ）
 
 ```bash
 # 1) aliases更新
 $EDITOR industry_aliases.csv
 
-# 2) backfill実行（ルールベース）
+# 2) 整合性チェック
+python3 scripts/validate_industry_aliases.py --aliases industry_aliases.csv --taxonomy docs/industry_select.csv --fail-on-domain-outlier
+
+# 3) backfill実行（ルールベース）
 python3 scripts/backfill_industry_class.py --db data/companies.db --min-score 1
 
-# 3) report確認
+# 4) report確認
 python3 scripts/industry_classification_report.py --db data/companies.db
 
-# 4) candidates抽出
+# 5) candidates抽出
 python3 scripts/extract_unclassified_terms.py --db data/companies.db --out industry_alias_candidates.csv --min-freq 2
 ```
 

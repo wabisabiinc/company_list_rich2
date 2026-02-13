@@ -44,6 +44,27 @@ def test_search_engines_env_parsing(monkeypatch):
     sc = CompanyScraper(headless=True)
     assert sc.search_engines == ["ddg", "bing"]
 
+
+def test_build_company_queries_includes_short_address_tokens(scraper):
+    queries = scraper._build_company_queries(
+        "株式会社オフィス俵屋",
+        "〒305-0031 茨城県つくば市吾妻 1-5-7 ダイワロイネットホテルつくばビル 2F",
+    )
+    assert len(queries) == 3
+    assert all("株式会社オフィス俵屋" in q for q in queries)
+    assert all(any(kw in q for kw in ("会社概要", "企業情報", "会社情報")) for q in queries)
+    assert all(any(token in q for token in ("茨城県つくば市", "305-0031", "茨城県")) for q in queries)
+    assert not any("ダイワロイネットホテル" in q for q in queries)
+
+
+def test_build_company_queries_without_address_uses_keyword_only(scraper):
+    assert scraper._build_company_queries("社名", "") == [
+        "社名 会社概要",
+        "社名 企業情報",
+        "社名 会社情報",
+    ]
+
+
 @pytest.mark.asyncio
 @patch("src.company_scraper.requests.get")
 async def test_search_company_filters_and_resolves(mock_get, scraper):
@@ -54,13 +75,10 @@ async def test_search_company_filters_and_resolves(mock_get, scraper):
 
     urls = await scraper.search_company("トヨタ自動車株式会社", "愛知県豊田市", num_results=10)
     queries = {call.kwargs["params"]["q"] for call in mock_get.call_args_list}
-    allowed_queries = {
-        "トヨタ自動車株式会社 会社概要",
-        "トヨタ自動車株式会社 企業情報",
-        "トヨタ自動車株式会社 会社情報",
-    }
-    assert queries.issubset(allowed_queries)
-    assert allowed_queries & queries
+    expected_queries = set(scraper._build_company_queries("トヨタ自動車株式会社", "愛知県豊田市"))
+    assert queries.issubset(expected_queries)
+    assert expected_queries & queries
+    assert all(("愛知県" in q) or ("豊田市" in q) for q in queries)
 
     # /l/?uddg= が正しく剥がれている（相対/絶対）
     assert "https://example.com/home" in urls

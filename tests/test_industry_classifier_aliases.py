@@ -48,3 +48,55 @@ def test_alias_fallback_is_available_when_csv_missing() -> None:
     assert cls.loaded
     assert cls.alias_source == "fallback"
     assert len(cls.alias_entries) > 0
+
+
+def test_alias_row_with_allowed_major_mismatch_is_disabled(tmp_path) -> None:
+    alias_path = tmp_path / "industry_aliases.csv"
+    with alias_path.open("w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(
+            [
+                "alias",
+                "target_minor_code",
+                "priority",
+                "requires_review",
+                "domain_tag",
+                "allowed_major_codes",
+                "notes",
+            ]
+        )
+        # 441 is major=H (運輸業，郵便業), but allowed_major_codes intentionally mismatches to G.
+        w.writerow(["物流", "441", "8", "0", "物流", "G", ""])
+
+    cls = IndustryClassifier("docs/industry_select.csv", aliases_csv_path=str(alias_path))
+    assert cls.loaded
+    assert len(cls.alias_entries) == 1
+    entry = cls.alias_entries[0]
+    assert entry.target_minor_code == ""
+    assert entry.requires_review is True
+    assert "allowed_major_mismatch" in (entry.notes or "")
+
+
+def test_alias_major_context_guard_suppresses_conflicting_hits(tmp_path) -> None:
+    alias_path = tmp_path / "industry_aliases.csv"
+    with alias_path.open("w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(
+            [
+                "alias",
+                "target_minor_code",
+                "priority",
+                "requires_review",
+                "domain_tag",
+                "allowed_major_codes",
+                "notes",
+            ]
+        )
+        # AI is allowed only for G, but the context strongly indicates 建設業 (D).
+        w.writerow(["AI", "392", "8", "0", "情報通信", "G", ""])
+
+    cls = IndustryClassifier("docs/industry_select.csv", aliases_csv_path=str(alias_path))
+    assert cls.loaded
+
+    res = cls.classify_from_aliases("当社の主たる事業は建設業です。", ["AI"])
+    assert res is None
