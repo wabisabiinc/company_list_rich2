@@ -70,7 +70,7 @@ def main() -> int:
     rows = list(
         cur.execute(
             """
-            SELECT id, description, business_tags,
+            SELECT id, status, description, business_tags,
                    industry_class_source,
                    industry_major_code, industry_major,
                    industry_middle_code, industry_middle,
@@ -81,14 +81,24 @@ def main() -> int:
     )
 
     source_counts: dict[str, int] = {}
+    status_counts: dict[str, int] = {}
     unclassified_count = 0
     classified_count = 0
     major_only_count = 0
     it_hint_unclassified = 0
+    source_empty_count = 0
+    pending_source_empty_count = 0
 
     for row in rows:
+        status = str(row["status"] or "").strip() or "(empty)"
+        status_counts[status] = status_counts.get(status, 0) + 1
+
         source = str(row["industry_class_source"] or "").strip() or "(empty)"
         source_counts[source] = source_counts.get(source, 0) + 1
+        if source == "(empty)":
+            source_empty_count += 1
+            if status in {"pending", "running"}:
+                pending_source_empty_count += 1
 
         major_code = str(row["industry_major_code"] or "").strip()
         major_name = str(row["industry_major"] or "").strip()
@@ -122,8 +132,14 @@ def main() -> int:
     print(f"総件数: {total}")
     print(f"classified件数: {classified_count} ({classified_rate:.1f}%)")
     print(f"unclassified件数: {unclassified_count}")
+    print(f"industry_class_source空欄件数: {source_empty_count}")
+    print(f"pending/running かつ source空欄件数: {pending_source_empty_count}")
     print(f"majorのみ件数: {major_only_count}")
     print(f"AI/DX/EC/SaaS/IT語あり未分類件数: {it_hint_unclassified}")
+
+    print("\n--- status別件数 ---")
+    for status, count in sorted(status_counts.items(), key=lambda x: (-x[1], x[0])):
+        print(f"{status}\t{count}")
 
     print("\n--- industry_class_source別件数 ---")
     for source, count in sorted(source_counts.items(), key=lambda x: (-x[1], x[0])):

@@ -167,6 +167,10 @@ INDUSTRY_RULE_MIN_SCORE = max(1, int(os.getenv("INDUSTRY_RULE_MIN_SCORE", "2")))
 INDUSTRY_AI_ENABLED = os.getenv("INDUSTRY_AI_ENABLED", "true").lower() == "true"
 INDUSTRY_AI_TOP_N = max(5, int(os.getenv("INDUSTRY_AI_TOP_N", "12")))
 INDUSTRY_AI_MIN_CONFIDENCE = float(os.getenv("INDUSTRY_AI_MIN_CONFIDENCE", "0.50"))
+# AI分類を1回のプロンプトで完結させる（候補を絞って単発で判定）
+INDUSTRY_AI_SINGLE_PASS = (os.getenv("INDUSTRY_AI_SINGLE_PASS", "true") or "true").strip().lower() == "true"
+# 業種AIの本文スニペット最大長（description + tags + 会社概要ページ）
+INDUSTRY_AI_MAX_SNIPPET_CHARS = max(2000, int(os.getenv("INDUSTRY_AI_MAX_SNIPPET_CHARS", "9000")))
 # true の場合、業種AIは「不明/怪しいケース」に限定して実行する。
 INDUSTRY_AI_UNCERTAIN_ONLY = os.getenv("INDUSTRY_AI_UNCERTAIN_ONLY", "true").lower() == "true"
 INDUSTRY_MAJOR_MIN_CONFIDENCE = float(os.getenv("INDUSTRY_MAJOR_MIN_CONFIDENCE", "0.50"))
@@ -196,6 +200,8 @@ TAG_HIERARCHY_FILL = (os.getenv("TAG_HIERARCHY_FILL", "true") or "true").strip()
 BUSINESS_TAGS_AI_FILTER = (os.getenv("BUSINESS_TAGS_AI_FILTER", "true") or "true").strip().lower() == "true"
 # ノイズが多いときにAIでタグを置き換え/整形するか（新規タグ許可）
 BUSINESS_TAGS_AI_REWRITE = (os.getenv("BUSINESS_TAGS_AI_REWRITE", "true") or "true").strip().lower() == "true"
+# business_tags は必ずAIを通すか（AI不可なら空欄にする）
+BUSINESS_TAGS_REQUIRE_AI = (os.getenv("BUSINESS_TAGS_REQUIRE_AI", "true") or "true").strip().lower() == "true"
 # business_tags の上限（0以下なら無制限）
 BUSINESS_TAGS_LIMIT = int(os.getenv("BUSINESS_TAGS_LIMIT", "0") or "0")
 
@@ -2081,6 +2087,41 @@ def _collect_business_text_blocks(payloads: list[dict[str, Any]]) -> list[str]:
         out.append(bb)
     return out[:10]
 
+
+def _collect_profile_text_blocks_all(payloads: list[dict[str, Any]]) -> list[str]:
+    """
+    会社概要/事業内容ページの本文をできるだけ漏らさず集める。
+    過剰なナビゲーションは後段のAI用サニタイズで除去する。
+    """
+    blocks: list[str] = []
+    for p in payloads or []:
+        if not isinstance(p, dict):
+            continue
+        try:
+            text = (p.get("text", "") or "").strip()
+            if text:
+                biz = select_relevant_paragraphs(text, limit=5)
+                if biz:
+                    blocks.append(biz[:1600])
+        except Exception:
+            pass
+        try:
+            html = p.get("html", "") or ""
+            meta = extract_meta_description(html)
+            if meta:
+                blocks.append(meta)
+        except Exception:
+            pass
+    out: list[str] = []
+    seen: set[str] = set()
+    for b in blocks:
+        bb = (b or "").strip()
+        if not bb or bb in seen:
+            continue
+        seen.add(bb)
+        out.append(bb)
+    return out
+
 # 会社概要/事業内容テキストから事業キーワードをシンプル抽出
 BUSINESS_STOPWORDS: set[str] = {
     "会社概要", "事業内容", "事業", "サービス", "製品", "提供", "ソリューション",
@@ -2334,6 +2375,88 @@ def _parse_business_tags_value(raw: Any) -> list[str]:
     return [text]
 
 
+_BAD_BUSINESS_TAG_PATTERNS = re.compile(
+    r"(bad request|not found|forbidden|access denied|timeout|timed out|error|エラー|タイムアウト|アクセス拒否)",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_business_tags(tags: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for tag in tags or []:
+        t = str(tag or "").strip()
+        if not t:
+            continue
+        if len(t) > 80:
+            continue
+        if _BAD_BUSINESS_TAG_PATTERNS.search(t):
+            continue
+        key = norm_text_compact(t)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(t)
+    return out
+
+
+def _build_candidates_from_concept_context(
+    concept_context: dict[str, Any] | None,
+    *,
+    top_n: int,
+) -> list[dict[str, str]]:
+    if not concept_context or not isinstance(concept_context, dict):
+        return []
+    cards = concept_context.get("concept_cards") or []
+    if not isinstance(cards, list):
+        return []
+    hints: list[str] = []
+    for card in cards:
+        if not isinstance(card, dict):
+            continue
+        for hint in card.get("industry_hints") or []:
+            h = str(hint or "").strip()
+            if h:
+                hints.append(h)
+    if not hints:
+        return []
+    cand_map: dict[str, dict[str, str]] = {}
+    for hint in hints:
+        for cand in INDUSTRY_CLASSIFIER.build_candidates_from_industry_name(hint, top_n=max(top_n, 60)):
+            key = (
+                str(cand.get("minor_code") or "")
+                or str(cand.get("middle_code") or "")
+                or str(cand.get("major_code") or "")
+            )
+            if not key or key in cand_map:
+                continue
+            cand_map[key] = cand
+            if len(cand_map) >= max(top_n, 10):
+                break
+        if len(cand_map) >= max(top_n, 10):
+            break
+    return list(cand_map.values())[: max(top_n, 10)]
+
+
+def _majorize_candidates(candidates: list[dict[str, str]], *, top_n: int) -> list[dict[str, str]]:
+    major_map: dict[str, dict[str, str]] = {}
+    for cand in candidates or []:
+        maj = str(cand.get("major_code") or "").strip()
+        if not maj or maj in major_map:
+            continue
+        major_map[maj] = {
+            "major_code": maj,
+            "major_name": str(cand.get("major_name") or ""),
+            "middle_code": "",
+            "middle_name": "",
+            "minor_code": "",
+            "minor_name": "",
+        }
+        if len(major_map) >= max(1, top_n):
+            break
+    return list(major_map.values())[: max(1, top_n)]
+
+
 def _build_concept_context_for_industry(
     *,
     company_id: Any,
@@ -2566,6 +2689,42 @@ def build_ai_text_payload(*blocks: str) -> str:
             payloads.append(cleaned)
     joined = "\n\n".join(payloads)
     return joined[:4000]
+
+
+def build_industry_ai_text(
+    *,
+    description: str,
+    tags: list[str],
+    profile_blocks: list[str],
+    extra_blocks: list[str] | None = None,
+    max_chars: int | None = None,
+) -> str:
+    """
+    業種判定用のAI入力を1回のプロンプトで完結させるため、
+    description / business_tags / 会社概要ページの本文を全て含める。
+    """
+    limit = max_chars if isinstance(max_chars, int) and max_chars > 0 else INDUSTRY_AI_MAX_SNIPPET_CHARS
+    parts: list[str] = []
+    if description:
+        desc = _sanitize_ai_text_block(description)
+        if desc:
+            parts.append(f"[PRIORITY_DESCRIPTION]{desc}")
+    for tag in tags or []:
+        t = str(tag or "").strip()
+        if t:
+            parts.append(f"[PRIORITY_TAG]{t}")
+    for idx, block in enumerate(profile_blocks or []):
+        cleaned = _sanitize_ai_text_block(block)
+        if cleaned:
+            parts.append(f"[COMPANY_PROFILE_{idx+1}]{cleaned}")
+    for idx, block in enumerate(extra_blocks or []):
+        cleaned = _sanitize_ai_text_block(block)
+        if cleaned:
+            parts.append(f"[EVIDENCE_{idx+1}]{cleaned}")
+    joined = "\n".join(parts)
+    if len(joined) > limit:
+        joined = joined[:limit]
+    return joined
 
 def append_jsonl(path: str, payload: dict[str, Any]) -> None:
     if not path:
@@ -6703,45 +6862,24 @@ async def process():
                         industry_val = ""
                         industry_hint_val = ""
                         business_tags_val = (company.get("business_tags") or "").strip()
-                        # 先に本文/descriptionから business_tags を埋める（環境変数で切替）
-                        if (BUSINESS_TAGS_MODE == "extract") and not business_tags_val:
-                            blocks_for_tags: list[str] = []
-                            if description_val:
-                                blocks_for_tags = [description_val]
-                            else:
-                                blocks_for_tags = _collect_business_text_blocks(payloads_for_desc_priority)
-                                if (not blocks_for_tags) and (payloads_for_desc_priority is not payloads_for_desc):
-                                    blocks_for_tags = _collect_business_text_blocks(payloads_for_desc)
-                            tags_extracted: list[str] = []
+                        tag_candidates = _sanitize_business_tags(_parse_business_tags_value(business_tags_val))
+                        tag_source_blocks: list[str] = []
+                        if description_val:
+                            tag_source_blocks = [description_val]
+                        else:
+                            tag_source_blocks = _collect_business_text_blocks(payloads_for_desc_priority)
+                            if (not tag_source_blocks) and (payloads_for_desc_priority is not payloads_for_desc):
+                                tag_source_blocks = _collect_business_text_blocks(payloads_for_desc)
+                        if (not tag_source_blocks) and info_dict:
+                            tag_source_blocks.append(info_dict.get("text", "") or "")
+
+                        # 先に本文/descriptionから business_tags 候補を抽出（環境変数で切替）
+                        if (BUSINESS_TAGS_MODE == "extract") and not tag_candidates:
                             if not description_val:
-                                tags_extracted = extract_business_keywords(
-                                    blocks_for_tags,
+                                tag_candidates = extract_business_keywords(
+                                    tag_source_blocks,
                                     max_tags=BUSINESS_TAGS_LIMIT,
                                 )
-                            # AIで関連度フィルタ／整形（description優先、allow_newで生成許可）
-                            if BUSINESS_TAGS_AI_FILTER and verifier is not None and USE_AI:
-                                try:
-                                    ai_text = build_ai_text_payload(*blocks_for_tags) or "\n".join(blocks_for_tags)
-                                    filtered = await asyncio.wait_for(
-                                        verifier.filter_business_tags(
-                                            ai_text,
-                                            tags_extracted,
-                                            allow_new=bool(BUSINESS_TAGS_AI_REWRITE or not tags_extracted),
-                                        ),
-                                        timeout=clamp_timeout(ai_call_timeout),
-                                    )
-                                    if isinstance(filtered, list) and filtered:
-                                        tags_extracted = filtered
-                                except Exception:
-                                    pass
-                            if tags_extracted:
-                                try:
-                                    tags_for_save = list(tags_extracted)
-                                    if BUSINESS_TAGS_LIMIT > 0:
-                                        tags_for_save = tags_for_save[:BUSINESS_TAGS_LIMIT]
-                                    business_tags_val = json.dumps(tags_for_save, ensure_ascii=False)
-                                except Exception:
-                                    business_tags_val = ""
                         if INFER_INDUSTRY_ALWAYS:
                             if description_val:
                                 blocks = [description_val]
@@ -6754,13 +6892,40 @@ async def process():
                                 industry_hint_val = inferred_industry[:60]
                             elif not industry_hint_val:
                                 industry_hint_val = "不明"
-                            if inferred_tags and (not business_tags_val):
+                            if inferred_tags and (not tag_candidates):
+                                tag_candidates = inferred_tags[:5]
+
+                        # business_tags は必ずAIに通して必要なものだけ保存
+                        if BUSINESS_TAGS_REQUIRE_AI or BUSINESS_TAGS_AI_FILTER:
+                            if verifier is not None and USE_AI and hasattr(verifier, "filter_business_tags") and tag_source_blocks:
                                 try:
-                                    business_tags_val = json.dumps(inferred_tags[:5], ensure_ascii=False)
+                                    ai_text = build_ai_text_payload(*tag_source_blocks) or "\n".join(tag_source_blocks)
+                                    filtered = await asyncio.wait_for(
+                                        verifier.filter_business_tags(
+                                            ai_text,
+                                            tag_candidates,
+                                            allow_new=bool(BUSINESS_TAGS_AI_REWRITE or not tag_candidates),
+                                        ),
+                                        timeout=clamp_timeout(ai_call_timeout),
+                                    )
+                                    tag_candidates = filtered if isinstance(filtered, list) else []
                                 except Exception:
-                                    business_tags_val = ""
-                            elif not business_tags_val:
+                                    tag_candidates = []
+                            else:
+                                if BUSINESS_TAGS_REQUIRE_AI:
+                                    tag_candidates = []
+
+                        tag_candidates = _sanitize_business_tags(tag_candidates)
+                        if tag_candidates:
+                            try:
+                                tags_for_save = list(tag_candidates)
+                                if BUSINESS_TAGS_LIMIT > 0:
+                                    tags_for_save = tags_for_save[:BUSINESS_TAGS_LIMIT]
+                                business_tags_val = json.dumps(tags_for_save, ensure_ascii=False)
+                            except Exception:
                                 business_tags_val = ""
+                        else:
+                            business_tags_val = ""
                         # description を整形（業種の付与は分類後に実施）
                         description_val = clean_description_value(sanitize_text_block(description_val))
                         if description_val and len(description_val) > FINAL_DESCRIPTION_MAX_LEN:
@@ -6768,32 +6933,53 @@ async def process():
 
                         # ---- 業種（AI優先・ruleは厳格フォールバック） ----
                         if (not INDUSTRY_CLASSIFY_AFTER_HOMEPAGE) and INDUSTRY_CLASSIFY_ENABLED and INDUSTRY_CLASSIFIER.loaded:
-                            blocks: list[str] = []
-                            if description_val:
-                                blocks = [description_val]
-                            else:
-                                blocks = _collect_business_text_blocks(payloads_for_desc)
+                            parsed_business_tags_pre: list[str] = []
+                            if business_tags_val:
+                                try:
+                                    if business_tags_val.strip().startswith("["):
+                                        tags = json.loads(business_tags_val)
+                                        if isinstance(tags, list):
+                                            parsed_business_tags_pre = [str(t).strip() for t in tags if str(t).strip()]
+                                    else:
+                                        parsed_business_tags_pre = [business_tags_val.strip()]
+                                except Exception:
+                                    parsed_business_tags_pre = [business_tags_val.strip()]
+                            parsed_business_tags_pre = _sanitize_business_tags(parsed_business_tags_pre)
+
+                            profile_payloads_pre: list[dict[str, Any]] = []
+                            for p in payloads_for_desc or []:
+                                if not isinstance(p, dict):
+                                    continue
+                                p_url = str(p.get("url") or "").strip()
+                                pt = str((page_type_per_url or {}).get(p_url) or "")
+                                if (pt == "COMPANY_PROFILE") or _is_profile_like_url(p_url):
+                                    profile_payloads_pre.append(p)
+                            profile_blocks_pre = _collect_profile_text_blocks_all(profile_payloads_pre)
+
+                            extra_blocks_pre: list[str] = []
+                            if not profile_blocks_pre:
+                                extra_blocks_pre = _collect_business_text_blocks(payloads_for_desc)
                                 if name:
-                                    blocks.append(name)
-                                if business_tags_val:
-                                    try:
-                                        if business_tags_val.strip().startswith("["):
-                                            tags = json.loads(business_tags_val)
-                                            if isinstance(tags, list):
-                                                blocks.extend([str(t) for t in tags if t])
-                                        else:
-                                            blocks.append(business_tags_val)
-                                    except Exception:
-                                        blocks.append(business_tags_val)
+                                    extra_blocks_pre.append(name)
                                 desc_ev = (company.get("description_evidence") or "").strip()
                                 if desc_ev:
-                                    blocks.append(f"根拠: {desc_ev}"[:400])
+                                    extra_blocks_pre.append(f"根拠: {desc_ev}"[:400])
+
+                            blocks: list[str] = []
+                            if description_val:
+                                blocks.append(description_val)
+                            if profile_blocks_pre:
+                                blocks.extend(profile_blocks_pre)
+                            else:
+                                blocks.extend(extra_blocks_pre)
+                            if parsed_business_tags_pre:
+                                blocks.extend(parsed_business_tags_pre)
 
                             concept_context_pre = _build_concept_context_for_industry(
                                 company_id=cid,
                                 company_name=name,
                                 description=description_val or "",
-                                business_tags=business_tags_val,
+                                business_tags=parsed_business_tags_pre if parsed_business_tags_pre else business_tags_val,
                                 evidence_blocks=blocks,
                                 stage="pre_homepage",
                             )
@@ -6846,6 +7032,16 @@ async def process():
                                         score_map,
                                         top_n=INDUSTRY_AI_TOP_N,
                                     )
+                                if not candidates:
+                                    candidates = _build_candidates_from_concept_context(
+                                        concept_context_pre,
+                                        top_n=INDUSTRY_AI_TOP_N,
+                                    )
+                                if not candidates:
+                                    candidates = INDUSTRY_CLASSIFIER.build_ai_candidates(
+                                        blocks,
+                                        top_n=INDUSTRY_AI_TOP_N,
+                                    )
                                 return candidates
 
                             def _match_ai_candidate(
@@ -6874,14 +7070,23 @@ async def process():
                                             return c
                                 return None
 
-                            if description_val:
-                                ai_text = description_val
-                            else:
-                                ai_text = "\n".join([b for b in blocks if b])
+                            ai_text = build_industry_ai_text(
+                                description=description_val or "",
+                                tags=parsed_business_tags_pre,
+                                profile_blocks=profile_blocks_pre,
+                                extra_blocks=extra_blocks_pre,
+                                max_chars=INDUSTRY_AI_MAX_SNIPPET_CHARS,
+                            )
                             class_candidates = _build_classification_candidates(scores)
                             rule_result = None
                             needs_ai_escalation = _needs_industry_ai_escalation(scores)
-                            if (not INDUSTRY_REQUIRE_AI) and INDUSTRY_AI_UNCERTAIN_ONLY and (not needs_ai_escalation):
+                            allow_non_ai_fallback = (not INDUSTRY_REQUIRE_AI) and INDUSTRY_RULE_FALLBACK_ENABLED
+                            if (
+                                allow_non_ai_fallback
+                                and INDUSTRY_AI_UNCERTAIN_ONLY
+                                and (not needs_ai_escalation)
+                                and (not INDUSTRY_REQUIRE_AI)
+                            ):
                                 rule_result = _build_rule_industry_result_from_scores(
                                     scores,
                                     source="rule_clear_pre",
@@ -6899,6 +7104,7 @@ async def process():
                                             company_name=name,
                                             candidates_text=INDUSTRY_CLASSIFIER.format_candidates_text(class_candidates),
                                             concept_context=concept_context_pre,
+                                            max_snippet_chars=INDUSTRY_AI_MAX_SNIPPET_CHARS,
                                         ),
                                         timeout=min(clamp_timeout(ai_call_timeout), 30.0),
                                     )
@@ -6927,7 +7133,8 @@ async def process():
                             industry_result = industry_result_ai or rule_result
 
                             lookup_name = ai_industry_val or industry_hint_val or industry_val
-                            if (not industry_result) and (not INDUSTRY_REQUIRE_AI) and INDUSTRY_NAME_LOOKUP_ENABLED and lookup_name:
+                            fallback_allowed = allow_non_ai_fallback
+                            if (not industry_result) and fallback_allowed and INDUSTRY_NAME_LOOKUP_ENABLED and lookup_name:
                                 try:
                                     exact_candidate = INDUSTRY_CLASSIFIER.resolve_exact_candidate_from_name(lookup_name)
                                 except Exception:
@@ -6944,20 +7151,20 @@ async def process():
                                         "source": "name_exact",
                                     }
 
-                            if (not industry_result) and (not INDUSTRY_REQUIRE_AI):
+                            if (not industry_result) and fallback_allowed:
                                 try:
                                     industry_result = INDUSTRY_CLASSIFIER.classify_from_semantic_taxonomy(
                                         description_val or "",
-                                        business_tags_val or "",
+                                        parsed_business_tags_pre if parsed_business_tags_pre else (business_tags_val or ""),
                                     )
                                 except Exception:
                                     industry_result = None
 
-                            if (not industry_result) and (not INDUSTRY_REQUIRE_AI):
+                            if (not industry_result) and fallback_allowed:
                                 try:
                                     industry_result = INDUSTRY_CLASSIFIER.classify_from_aliases(
                                         description_val or "",
-                                        business_tags_val or "",
+                                        parsed_business_tags_pre if parsed_business_tags_pre else (business_tags_val or ""),
                                     )
                                 except Exception:
                                     industry_result = None
@@ -7466,7 +7673,9 @@ async def process():
                             primary_payloads = profile_payloads if profile_payloads else payloads_for_industry
                             primary_blocks = _collect_business_text_blocks(primary_payloads)
                             secondary_blocks = _collect_business_text_blocks(non_profile_payloads) if profile_payloads else []
-                            same_host_evidence_chars = sum(len(b) for b in primary_blocks if isinstance(b, str))
+                            profile_blocks_all = _collect_profile_text_blocks_all(profile_payloads)
+                            evidence_blocks_for_len = profile_blocks_all if profile_blocks_all else primary_blocks
+                            same_host_evidence_chars = sum(len(b) for b in evidence_blocks_for_len if isinstance(b, str))
 
                             parsed_business_tags: list[str] = []
                             if business_tags_val:
@@ -7479,27 +7688,32 @@ async def process():
                                         parsed_business_tags = [business_tags_val.strip()]
                                 except Exception:
                                     parsed_business_tags = [business_tags_val.strip()]
+                            parsed_business_tags = _sanitize_business_tags(parsed_business_tags)
+
+                            extra_blocks_post: list[str] = []
+                            if not profile_blocks_all:
+                                extra_blocks_post.extend(primary_blocks)
+                                if secondary_blocks and same_host_evidence_chars < 180:
+                                    extra_blocks_post.extend(secondary_blocks[:2])
+                                if name:
+                                    extra_blocks_post.append(name)
+                                if industry_hint_val:
+                                    extra_blocks_post.append(industry_hint_val)
+                                desc_ev = (company.get("description_evidence") or "").strip()
+                                if desc_ev:
+                                    extra_blocks_post.append(f"根拠: {desc_ev}"[:400])
 
                             industry_blocks: list[str] = []
                             if description_val:
-                                # description を主材料にする
                                 industry_blocks.append(description_val)
+                            if profile_blocks_all:
+                                industry_blocks.extend(profile_blocks_all)
                             else:
-                                # description が無い場合のみ本文/タグを使う
-                                industry_blocks.extend(primary_blocks)
-                                if secondary_blocks and same_host_evidence_chars < 180:
-                                    industry_blocks.extend(secondary_blocks[:2])
-                                if name:
-                                    industry_blocks.append(name)
-                                if industry_hint_val:
-                                    industry_blocks.append(industry_hint_val)
-                                desc_ev = (company.get("description_evidence") or "").strip()
-                                if desc_ev:
-                                    industry_blocks.append(f"根拠: {desc_ev}"[:400])
-                                if parsed_business_tags:
-                                    industry_blocks.extend(parsed_business_tags)
-                                elif business_tags_val:
-                                    industry_blocks.append(business_tags_val)
+                                industry_blocks.extend(extra_blocks_post)
+                            if parsed_business_tags:
+                                industry_blocks.extend(parsed_business_tags)
+                            elif business_tags_val:
+                                industry_blocks.append(business_tags_val)
 
                             dedup_industry_blocks: list[str] = []
                             seen_industry_blocks: set[str] = set()
@@ -7535,8 +7749,14 @@ async def process():
                             scores = INDUSTRY_CLASSIFIER.score_levels(score_blocks)
                             use_detail = bool(scores.get("use_detail"))
                             needs_ai_escalation = _needs_industry_ai_escalation(scores)
+                            allow_non_ai_fallback = (not INDUSTRY_REQUIRE_AI) and INDUSTRY_RULE_FALLBACK_ENABLED
                             rule_result_post = None
-                            if (not INDUSTRY_REQUIRE_AI) and INDUSTRY_AI_UNCERTAIN_ONLY and (not needs_ai_escalation):
+                            if (
+                                allow_non_ai_fallback
+                                and INDUSTRY_AI_UNCERTAIN_ONLY
+                                and (not needs_ai_escalation)
+                                and (not INDUSTRY_REQUIRE_AI)
+                            ):
                                 rule_result_post = _build_rule_industry_result_from_scores(
                                     scores,
                                     source="rule_clear_post",
@@ -7554,22 +7774,13 @@ async def process():
                             ai_allowed_now = ai_available and (
                                 INDUSTRY_REQUIRE_AI or (not INDUSTRY_AI_UNCERTAIN_ONLY) or needs_ai_escalation
                             )
-                            if description_val:
-                                ai_text = description_val
-                            else:
-                                ai_text_blocks: list[str] = []
-                                for tag in parsed_business_tags:
-                                    ai_text_blocks.append(f"[PRIORITY_TAG]{tag}")
-                                ai_text_blocks.extend([b for b in score_blocks if b])
-                                ai_text_dedup: list[str] = []
-                                ai_text_seen: set[str] = set()
-                                for block in ai_text_blocks:
-                                    bb = (block or "").strip()
-                                    if not bb or bb in ai_text_seen:
-                                        continue
-                                    ai_text_seen.add(bb)
-                                    ai_text_dedup.append(bb)
-                                ai_text = "\n".join(ai_text_dedup)
+                            ai_text = build_industry_ai_text(
+                                description=description_val or "",
+                                tags=parsed_business_tags,
+                                profile_blocks=profile_blocks_all,
+                                extra_blocks=extra_blocks_post,
+                                max_chars=INDUSTRY_AI_MAX_SNIPPET_CHARS,
+                            )
 
                             def _ai_confidence(ai_res: dict[str, Any]) -> float:
                                 try:
@@ -7652,6 +7863,7 @@ async def process():
                                             company_name=name,
                                             candidates_text=INDUSTRY_CLASSIFIER.format_candidates_text(candidates),
                                             concept_context=concept_context_post,
+                                            max_snippet_chars=INDUSTRY_AI_MAX_SNIPPET_CHARS,
                                         ),
                                         timeout=min(clamp_timeout(ai_call_timeout), 30.0),
                                     )
@@ -7666,11 +7878,129 @@ async def process():
                                     return None, ai_res
                                 return matched, ai_res
 
+                            concept_hint_candidates = _build_candidates_from_concept_context(
+                                concept_context_post,
+                                top_n=max(INDUSTRY_AI_TOP_N, 30),
+                            )
+                            fallback_ai_candidates = INDUSTRY_CLASSIFIER.build_ai_candidates(
+                                score_blocks,
+                                top_n=max(INDUSTRY_AI_TOP_N, 30),
+                            )
+                            fallback_minor_candidates: list[dict[str, str]] = []
+                            if concept_hint_candidates or fallback_ai_candidates:
+                                cand_map: dict[str, dict[str, str]] = {}
+                                for cand in (concept_hint_candidates + fallback_ai_candidates):
+                                    key = (
+                                        str(cand.get("minor_code") or "")
+                                        or str(cand.get("middle_code") or "")
+                                        or str(cand.get("major_code") or "")
+                                    )
+                                    if not key or key in cand_map:
+                                        continue
+                                    cand_map[key] = cand
+                                fallback_minor_candidates = list(cand_map.values())
+
+                            single_pass_attempted = False
+                            if INDUSTRY_AI_SINGLE_PASS and ai_allowed_now and has_time_for_ai():
+                                def _build_single_pass_candidates() -> tuple[list[dict[str, str]], str]:
+                                    level = "detail" if (use_detail and same_host_evidence_chars >= INDUSTRY_DETAIL_MIN_EVIDENCE_CHARS) else "minor"
+                                    base_candidates = INDUSTRY_CLASSIFIER.build_level_candidates(
+                                        level,
+                                        scores,
+                                        top_n=max(INDUSTRY_AI_TOP_N, 40),
+                                    )
+                                    if (not base_candidates) and level == "detail":
+                                        level = "minor"
+                                        base_candidates = INDUSTRY_CLASSIFIER.build_level_candidates(
+                                            "minor",
+                                            scores,
+                                            top_n=max(INDUSTRY_AI_TOP_N, 40),
+                                        )
+
+                                    tag_source = list(parsed_business_tags)
+                                    if not tag_source and business_tags_val:
+                                        tag_source = _sanitize_business_tags(_parse_business_tags_value(business_tags_val))
+                                    tag_candidates: list[dict[str, str]] = []
+                                    for tag in tag_source:
+                                        tag_candidates.extend(
+                                            INDUSTRY_CLASSIFIER.build_candidates_from_industry_name(
+                                                tag,
+                                                top_n=max(INDUSTRY_AI_TOP_N, 60),
+                                            )
+                                        )
+                                    if industry_hint_val:
+                                        tag_candidates.extend(
+                                            INDUSTRY_CLASSIFIER.build_candidates_from_industry_name(
+                                                industry_hint_val,
+                                                top_n=max(INDUSTRY_AI_TOP_N, 60),
+                                            )
+                                        )
+
+                                    cand_map: dict[str, dict[str, str]] = {}
+                                    for cand in (
+                                        base_candidates
+                                        + concept_hint_candidates
+                                        + fallback_ai_candidates
+                                        + tag_candidates
+                                    ):
+                                        key = (
+                                            str(cand.get("minor_code") or "")
+                                            or str(cand.get("middle_code") or "")
+                                            or str(cand.get("major_code") or "")
+                                        )
+                                        if not key or key in cand_map:
+                                            continue
+                                        cand_map[key] = cand
+                                    merged = list(cand_map.values())[: max(INDUSTRY_AI_TOP_N, 80)]
+                                    return merged, level
+
+                                single_candidates, single_level = _build_single_pass_candidates()
+                                single_pass_attempted = True
+                                try:
+                                    ai_res_single = await asyncio.wait_for(
+                                        verifier.judge_industry(
+                                            text=ai_text,
+                                            company_name=name,
+                                            candidates_text=INDUSTRY_CLASSIFIER.format_candidates_text(single_candidates),
+                                            concept_context=concept_context_post,
+                                            max_snippet_chars=INDUSTRY_AI_MAX_SNIPPET_CHARS,
+                                        ),
+                                        timeout=min(clamp_timeout(ai_call_timeout), 30.0),
+                                    )
+                                except Exception:
+                                    ai_res_single = None
+                                if isinstance(ai_res_single, dict):
+                                    matched_single = _match_candidate(ai_res_single, single_candidates, single_level)
+                                    if matched_single and _ai_accepts(
+                                        ai_res_single,
+                                        matched_single,
+                                        min_confidence=INDUSTRY_AI_MIN_CONFIDENCE,
+                                    ):
+                                        ai_industry_name = str(ai_res_single.get("industry") or "").strip()
+                                        industry_result_post = {
+                                            "major_code": str(matched_single.get("major_code") or ""),
+                                            "major_name": str(matched_single.get("major_name") or ""),
+                                            "middle_code": str(matched_single.get("middle_code") or ""),
+                                            "middle_name": str(matched_single.get("middle_name") or ""),
+                                            "minor_code": str(matched_single.get("minor_code") or ""),
+                                            "minor_name": str(matched_single.get("minor_name") or ""),
+                                            "confidence": _ai_confidence(ai_res_single),
+                                            "source": "ai_single_pass",
+                                        }
+                            if single_pass_attempted:
+                                # 単発AIで完結させるため、以降の追加AI呼び出しを抑止する。
+                                ai_allowed_now = False
+
                             major_candidates = INDUSTRY_CLASSIFIER.build_level_candidates(
                                 "major",
                                 scores,
                                 top_n=max(INDUSTRY_AI_TOP_N, 10),
                             )
+                            if (not major_candidates) and concept_hint_candidates:
+                                major_candidates = _majorize_candidates(
+                                    concept_hint_candidates,
+                                    top_n=max(INDUSTRY_AI_TOP_N, 10),
+                                )
                             if (not major_candidates) and industry_hint_val:
                                 hint_candidates = INDUSTRY_CLASSIFIER.build_candidates_from_industry_name(
                                     industry_hint_val,
@@ -7692,6 +8022,11 @@ async def process():
                                         "minor_name": "",
                                     }
                                 major_candidates = list(major_map.values())[: max(INDUSTRY_AI_TOP_N, 10)]
+                            if (not major_candidates) and fallback_minor_candidates:
+                                major_candidates = _majorize_candidates(
+                                    fallback_minor_candidates,
+                                    top_n=max(INDUSTRY_AI_TOP_N, 10),
+                                )
 
                             picked_major, _major_ai_res = await _judge_stage(
                                 "major",
@@ -7710,6 +8045,16 @@ async def process():
                                     top_n=2000,
                                     major_code=major_code_val,
                                 )
+                                if (not full_minor_candidates) and concept_hint_candidates:
+                                    dedup_minor: dict[str, dict[str, str]] = {}
+                                    for cand in concept_hint_candidates:
+                                        if str(cand.get("major_code") or "") != major_code_val:
+                                            continue
+                                        min_code = str(cand.get("minor_code") or "")
+                                        if not min_code or min_code in dedup_minor:
+                                            continue
+                                        dedup_minor[min_code] = cand
+                                    full_minor_candidates = list(dedup_minor.values())
                                 if (not full_minor_candidates) and industry_hint_val:
                                     hint_minor = INDUSTRY_CLASSIFIER.build_candidates_from_industry_name(
                                         industry_hint_val,
@@ -7724,6 +8069,12 @@ async def process():
                                             continue
                                         dedup_minor[min_code] = cand
                                     full_minor_candidates = list(dedup_minor.values())
+                                if (not full_minor_candidates) and fallback_minor_candidates:
+                                    full_minor_candidates = [
+                                        cand
+                                        for cand in fallback_minor_candidates
+                                        if str(cand.get("major_code") or "") == major_code_val
+                                    ]
 
                                 if full_minor_candidates:
                                     if len(full_minor_candidates) <= INDUSTRY_MINOR_DIRECT_MAX_CANDIDATES:
@@ -7812,7 +8163,8 @@ async def process():
                                             "source": "ai_detail_optional",
                                         }
 
-                            if (not industry_result_post) and (not INDUSTRY_REQUIRE_AI) and INDUSTRY_NAME_LOOKUP_ENABLED:
+                            fallback_allowed = allow_non_ai_fallback
+                            if (not industry_result_post) and fallback_allowed and INDUSTRY_NAME_LOOKUP_ENABLED:
                                 lookup_name = ai_industry_name or industry_hint_val or industry_val
                                 try:
                                     exact_candidate = INDUSTRY_CLASSIFIER.resolve_exact_candidate_from_name(lookup_name)
@@ -7830,7 +8182,7 @@ async def process():
                                         "source": "name_exact_post",
                                     }
 
-                            if (not industry_result_post) and (not INDUSTRY_REQUIRE_AI):
+                            if (not industry_result_post) and fallback_allowed:
                                 alias_business_tags: Any = parsed_business_tags if parsed_business_tags else (business_tags_val or "")
                                 try:
                                     industry_result_post = INDUSTRY_CLASSIFIER.classify_from_semantic_taxonomy(
@@ -7840,7 +8192,7 @@ async def process():
                                 except Exception:
                                     industry_result_post = None
 
-                            if (not industry_result_post) and (not INDUSTRY_REQUIRE_AI):
+                            if (not industry_result_post) and fallback_allowed:
                                 alias_business_tags: Any = parsed_business_tags if parsed_business_tags else (business_tags_val or "")
                                 try:
                                     industry_result_post = INDUSTRY_CLASSIFIER.classify_from_aliases(
@@ -7868,6 +8220,7 @@ async def process():
                                         tag_list = [business_tags_val.strip()]
                                 except Exception:
                                     tag_list = [business_tags_val.strip()]
+                                tag_list = _sanitize_business_tags(tag_list)
 
                                 if tag_list:
                                     cand_map: dict[str, dict[str, str]] = {}
@@ -7893,6 +8246,7 @@ async def process():
                                                     company_name=name,
                                                     candidates_text=INDUSTRY_CLASSIFIER.format_candidates_text(tag_candidates),
                                                     concept_context=concept_context_post,
+                                                    max_snippet_chars=INDUSTRY_AI_MAX_SNIPPET_CHARS,
                                                 ),
                                                 timeout=min(clamp_timeout(ai_call_timeout), 20.0),
                                             )
@@ -7927,6 +8281,7 @@ async def process():
                                         tag_list = [business_tags_val.strip()]
                                 except Exception:
                                     tag_list = [business_tags_val.strip()]
+                                tag_list = _sanitize_business_tags(tag_list)
 
                                 if tag_list:
                                     cand_map: dict[str, dict[str, str]] = {}
@@ -7952,6 +8307,7 @@ async def process():
                                                     company_name=name,
                                                     candidates_text=INDUSTRY_CLASSIFIER.format_candidates_text(tag_candidates),
                                                     concept_context=concept_context_post,
+                                                    max_snippet_chars=INDUSTRY_AI_MAX_SNIPPET_CHARS,
                                                 ),
                                                 timeout=min(clamp_timeout(ai_call_timeout), 20.0),
                                             )
@@ -7972,7 +8328,7 @@ async def process():
                                                 }
                                                 ai_industry_name = str(ai_res_tag.get("industry") or ai_industry_name)
 
-                            if (not industry_result_post) and (not INDUSTRY_REQUIRE_AI) and INDUSTRY_FORCE_CLASSIFY:
+                            if (not industry_result_post) and fallback_allowed and INDUSTRY_FORCE_CLASSIFY:
                                 taxonomy = INDUSTRY_CLASSIFIER.taxonomy
 
                                 def _candidate_from_code(code_val: str) -> dict[str, Any] | None:
@@ -8060,6 +8416,7 @@ async def process():
                                                     company_name=name,
                                                     candidates_text=INDUSTRY_CLASSIFIER.format_candidates_text(forced_candidates),
                                                     concept_context=concept_context_post,
+                                                    max_snippet_chars=INDUSTRY_AI_MAX_SNIPPET_CHARS,
                                                 ),
                                                 timeout=min(clamp_timeout(ai_call_timeout), 30.0),
                                             )
@@ -8231,8 +8588,8 @@ async def process():
                                     company["status"] = "review"
 
                             # business_tags を保険として使い、大分類の整合性を補正する
-                            tag_list_for_major = [] if INDUSTRY_REQUIRE_AI else (list(parsed_business_tags) if parsed_business_tags else [])
-                            if (not INDUSTRY_REQUIRE_AI) and (not tag_list_for_major) and business_tags_val:
+                            tag_list_for_major = list(parsed_business_tags) if (fallback_allowed and parsed_business_tags) else []
+                            if fallback_allowed and (not tag_list_for_major) and business_tags_val:
                                 try:
                                     if business_tags_val.strip().startswith("["):
                                         maybe = json.loads(business_tags_val)
@@ -8240,6 +8597,7 @@ async def process():
                                             tag_list_for_major = [str(t).strip() for t in maybe if str(t).strip()]
                                 except Exception:
                                     pass
+                            tag_list_for_major = _sanitize_business_tags(tag_list_for_major)
                             tag_major_code = ""
                             tag_major_name = ""
                             if TAG_HIERARCHY_FILL and tag_list_for_major:
@@ -8333,34 +8691,33 @@ async def process():
                             company["industry_minor"] = industry_minor or "不明"
 
                             # 名前ガード: 会社名に強い業種ヒントがあるのに異なる大分類になっている場合の補正/レビュー
-                            if not INDUSTRY_REQUIRE_AI:
-                                try:
-                                    name_hint_major = ""
-                                    for pat, major_hint in NAME_MAJOR_HINTS:
-                                        if pat.search(name):
-                                            name_hint_major = major_hint
-                                            break
-                                    if name_hint_major:
-                                        if company["industry_major"] not in {name_hint_major, "不明"}:
-                                            # 衝突時はレビュー送り or 名前優先で補正（保守的にレビューを選択）
-                                            company["industry"] = "不明"
-                                            company["industry_major_code"] = ""
-                                            company["industry_major"] = "不明"
-                                            company["industry_middle_code"] = ""
-                                            company["industry_middle"] = "不明"
-                                            company["industry_minor_code"] = ""
-                                            company["industry_minor"] = "不明"
-                                            company["industry_class_source"] = (company.get("industry_class_source") or "unclassified") + "|name_conflict"
-                                            company["industry_class_confidence"] = 0.0
-                                            if company.get("status") in (None, "", "pending", "done"):
-                                                company["status"] = "review"
-                                        elif company["industry_major"] == "不明":
-                                            # ヒントだけで補完（confidence控えめ）
-                                            company["industry_major"] = name_hint_major
-                                            company["industry_class_source"] = (company.get("industry_class_source") or "unclassified") + "|name_hint"
-                                            company["industry_class_confidence"] = max(float(company.get("industry_class_confidence") or 0.0), 0.45)
-                                except Exception:
-                                    pass
+                            try:
+                                name_hint_major = ""
+                                for pat, major_hint in NAME_MAJOR_HINTS:
+                                    if pat.search(name):
+                                        name_hint_major = major_hint
+                                        break
+                                if name_hint_major:
+                                    if company["industry_major"] not in {name_hint_major, "不明"}:
+                                        # 衝突時はレビュー送り（AI判定と矛盾するため安全側に倒す）
+                                        company["industry"] = "不明"
+                                        company["industry_major_code"] = ""
+                                        company["industry_major"] = "不明"
+                                        company["industry_middle_code"] = ""
+                                        company["industry_middle"] = "不明"
+                                        company["industry_minor_code"] = ""
+                                        company["industry_minor"] = "不明"
+                                        company["industry_class_source"] = (company.get("industry_class_source") or "unclassified") + "|name_conflict"
+                                        company["industry_class_confidence"] = 0.0
+                                        if company.get("status") in (None, "", "pending", "done"):
+                                            company["status"] = "review"
+                                    elif company["industry_major"] == "不明" and fallback_allowed:
+                                        # 非AIフォールバック時のみ補完（AI必須モードでは無効）
+                                        company["industry_major"] = name_hint_major
+                                        company["industry_class_source"] = (company.get("industry_class_source") or "unclassified") + "|name_hint"
+                                        company["industry_class_confidence"] = max(float(company.get("industry_class_confidence") or 0.0), 0.45)
+                            except Exception:
+                                pass
 
                             # タグが未生成なら、最終ブロックからローカル推定で埋める（2パス目での判定精度向上用）
                             if (not business_tags_val) and INFER_INDUSTRY_ALWAYS:

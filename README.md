@@ -96,6 +96,10 @@ COMPANIES_DB_PATH=data/companies_logistics.db python3 main.py
 - `RELATED_BASE_PAGES`, `RELATED_MAX_HOPS_BASE`（深掘りのページ数/ホップ上限。内部でも最大3にクランプ）
 - `INDUSTRY_FORCE_CLASSIFY`（`true` で未決定業種を強制補完）
 - `INDUSTRY_FORCE_DEFAULT_MINOR_CODES`（強制補完時の既定候補。現在の既定は `392,401`）
+- `INDUSTRY_REQUIRE_AI`（`true` の場合、AIで確定しない限り非AIフォールバックを抑制）
+- `INDUSTRY_RULE_FALLBACK_ENABLED`（`true` で明確スコア時の非AIフォールバックを許可。`INDUSTRY_REQUIRE_AI=true` 時でも有効）
+- `INDUSTRY_AI_UNCERTAIN_ONLY`（`true` で不確実ケースのみ業種AIを実行）
+- `INDUSTRY_RULE_FALLBACK_MIN_SCORE` / `INDUSTRY_RULE_FALLBACK_MARGIN`（非AIフォールバックの採用閾値）
   - 以前の既定値: `9599,9299,9999`
 
 業種分類の強制補完を有効化する例:
@@ -104,6 +108,15 @@ INDUSTRY_FORCE_CLASSIFY=true
 INDUSTRY_FORCE_DEFAULT_MINOR_CODES=392,401
 ```
 
+業種の未分類率を下げる推奨設定:
+```bash
+INDUSTRY_REQUIRE_AI=false
+INDUSTRY_RULE_FALLBACK_ENABLED=true
+INDUSTRY_AI_UNCERTAIN_ONLY=true
+```
+
+`INDUSTRY_REQUIRE_AI=true` のまま運用したい場合でも、`INDUSTRY_RULE_FALLBACK_ENABLED=true` を併用すると、ルールスコアが明確なケースのみ救済できます。
+
 ## 業種分類運用フロー
 
 1. `data/concepts.json` を更新（Concept/anchor_texts/industry_hints を追加）
@@ -111,6 +124,24 @@ INDUSTRY_FORCE_DEFAULT_MINOR_CODES=392,401
 3. `main.py` 実行時に、各 `business_tags` を Concept正規化してから業種AIへ渡す
 4. `logs/concept_hold.jsonl` の保留語を確認し、Conceptを育てる
 5. 必要なら `industry_aliases.csv` も補助的に更新（既存互換）
+
+### 未分類が多いときの確認手順
+
+1. レポートで `status` と `industry_class_source` を同時に確認する
+```bash
+python3 scripts/industry_classification_report.py --db data/companies.db
+```
+`industry_class_source空欄件数` が多い場合は、分類精度の問題ではなく未処理行が残っている可能性が高いです。
+
+2. `pending` を先に処理する
+```bash
+python3 main.py
+```
+
+3. `done/review` で `unclassified` が残る行を業種だけ再分類する
+```bash
+python3 scripts/backfill_industry_class.py --db data/companies.db --force --min-score 1
+```
 
 ### Concept定義ファイル
 

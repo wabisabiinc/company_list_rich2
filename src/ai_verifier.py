@@ -1428,12 +1428,14 @@ class AIVerifier:
         candidates_text: str,
         *,
         concept_context: Optional[Dict[str, Any]] = None,
+        max_snippet_chars: int = 3500,
     ) -> Optional[Dict[str, Any]]:
         if not self.model or not self.industry_prompt:
             return None
         snippet = (text or "").strip()
-        if len(snippet) > 3500:
-            snippet = snippet[:3500]
+        limit = max(1000, int(max_snippet_chars or 3500))
+        if len(snippet) > limit:
+            snippet = snippet[:limit]
         concept_json = ""
         topk_ids: list[str] = []
         if isinstance(concept_context, dict) and concept_context:
