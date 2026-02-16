@@ -1,23 +1,57 @@
 import csv
 import json
 import logging
+import math
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
 from src.text_normalizer import norm_text, norm_text_compact
+
+try:
+    import google.generativeai as _genai
+except Exception:
+    _genai = None  # type: ignore
 
 log = logging.getLogger(__name__)
 
 DEFAULT_JSIC_CSV_PATH = os.getenv("JSIC_CSV_PATH", "docs/industry_select.csv")
 DEFAULT_JSIC_JSON_PATH = os.getenv("JSIC_JSON_PATH", "docs/industry_select.json")
 DEFAULT_INDUSTRY_ALIASES_CSV_PATH = os.getenv("INDUSTRY_ALIASES_CSV_PATH", "industry_aliases.csv")
+DEFAULT_GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
+DEFAULT_ALIAS_EMBED_MODEL = (os.getenv("INDUSTRY_ALIAS_EMBED_MODEL") or "models/text-embedding-004").strip()
+ALIAS_SEMANTIC_ENABLED = os.getenv("INDUSTRY_ALIAS_SEMANTIC_ENABLED", "true").lower() == "true"
+ALIAS_SEMANTIC_PROVIDER = (os.getenv("INDUSTRY_ALIAS_SEMANTIC_PROVIDER", "auto") or "auto").strip().lower()
+ALIAS_SEMANTIC_MIN_SIM = float(os.getenv("INDUSTRY_ALIAS_SEMANTIC_MIN_SIM", "0.90"))
+ALIAS_SEMANTIC_MIN_MARGIN = float(os.getenv("INDUSTRY_ALIAS_SEMANTIC_MIN_MARGIN", "0.05"))
+ALIAS_SEMANTIC_STRONG_SIM = float(os.getenv("INDUSTRY_ALIAS_SEMANTIC_STRONG_SIM", "0.95"))
+ALIAS_SEMANTIC_STRONG_MARGIN = float(os.getenv("INDUSTRY_ALIAS_SEMANTIC_STRONG_MARGIN", "0.08"))
+ALIAS_SEMANTIC_MIN_PRIORITY = max(1, int(os.getenv("INDUSTRY_ALIAS_SEMANTIC_MIN_PRIORITY", "6")))
+ALIAS_SEMANTIC_MAX_PHRASES = max(1, int(os.getenv("INDUSTRY_ALIAS_SEMANTIC_MAX_PHRASES", "10")))
+ALIAS_SEMANTIC_MAX_HITS = max(1, int(os.getenv("INDUSTRY_ALIAS_SEMANTIC_MAX_HITS", "4")))
+SEMANTIC_TAXONOMY_ENABLED = os.getenv("INDUSTRY_SEMANTIC_TAXONOMY_ENABLED", "true").lower() == "true"
+SEMANTIC_TAXONOMY_MIN_SIM = float(os.getenv("INDUSTRY_SEMANTIC_TAXONOMY_MIN_SIM", "0.92"))
+SEMANTIC_TAXONOMY_MIN_MARGIN = float(os.getenv("INDUSTRY_SEMANTIC_TAXONOMY_MIN_MARGIN", "0.05"))
+SEMANTIC_TAXONOMY_MAX_HITS = max(1, int(os.getenv("INDUSTRY_SEMANTIC_TAXONOMY_MAX_HITS", "4")))
+DEFAULT_INDUSTRY_MEMORY_CSV_PATH = os.getenv("INDUSTRY_MEMORY_CSV_PATH", "data/industry_memory.csv")
+AUTO_LEARN_ENABLED = os.getenv("INDUSTRY_AUTO_LEARN_ENABLED", "true").lower() == "true"
+AUTO_LEARN_MIN_CONFIDENCE = float(os.getenv("INDUSTRY_AUTO_LEARN_MIN_CONFIDENCE", "0.78"))
+AUTO_LEARN_MIN_COUNT = max(1, int(os.getenv("INDUSTRY_AUTO_LEARN_MIN_COUNT", "2")))
+AUTO_LEARN_MAX_TERMS = max(1, int(os.getenv("INDUSTRY_AUTO_LEARN_MAX_TERMS", "6")))
+AUTO_LEARN_MIN_TERM_LEN = max(2, int(os.getenv("INDUSTRY_AUTO_LEARN_MIN_TERM_LEN", "2")))
+AUTO_LEARN_MAX_TERM_LEN = max(AUTO_LEARN_MIN_TERM_LEN, int(os.getenv("INDUSTRY_AUTO_LEARN_MAX_TERM_LEN", "20")))
 
 _GENERIC_TOKENS = {
     "事業", "業", "サービス", "製品", "商品", "販売", "製造", "提供", "運営", "管理",
     "開発", "加工", "設計", "施工", "保守", "メンテナンス", "関連", "その他", "附随",
 }
+_AUTO_LEARN_STOPWORDS = _GENERIC_TOKENS | {
+    "当社", "弊社", "会社", "企業", "公式", "情報", "サイト", "ホームページ", "お問い合わせ",
+    "コンサル", "コンサルティング", "ソリューション", "プラットフォーム", "システム", "サービス提供",
+}
+_AUTO_TERM_RE = re.compile(r"[一-龥ぁ-んァ-ンa-z0-9]{2,32}")
 
 # CSV が読めない場合の最小限fallback
 _ALIAS_TO_MINOR_FALLBACK: dict[str, tuple[str, int, int, str]] = {
@@ -85,6 +119,120 @@ _ALIAS_TO_MINOR_FALLBACK: dict[str, tuple[str, int, int, str]] = {
 }
 
 
+def _normalize_vector(vec: list[float] | tuple[float, ...] | None) -> list[float] | None:
+    if not vec:
+        return None
+    s = 0.0
+    out: list[float] = []
+    for v in vec:
+        try:
+            f = float(v)
+        except Exception:
+            continue
+        out.append(f)
+        s += f * f
+    if not out or s <= 0:
+        return None
+    norm = math.sqrt(s)
+    return [v / norm for v in out]
+
+
+def _cosine_similarity(v1: list[float] | None, v2: list[float] | None) -> float:
+    if not v1 or not v2:
+        return -1.0
+    if len(v1) != len(v2):
+        return -1.0
+    s = 0.0
+    for a, b in zip(v1, v2):
+        s += a * b
+    return float(s)
+
+
+class _SemanticEmbedder:
+    def embed_texts(self, texts: list[str]) -> list[list[float] | None]:
+        raise NotImplementedError
+
+
+class _GeminiSemanticEmbedder(_SemanticEmbedder):
+    def __init__(self, api_key: str, model: str) -> None:
+        self.api_key = (api_key or "").strip()
+        self.model = (model or DEFAULT_ALIAS_EMBED_MODEL).strip()
+        self.available = bool(self.api_key and self.model and _genai is not None)
+        if not self.available:
+            return
+        try:
+            _genai.configure(api_key=self.api_key)  # type: ignore[union-attr]
+        except Exception:
+            self.available = False
+
+    @staticmethod
+    def _extract_vector(resp: Any) -> list[float] | None:
+        if resp is None:
+            return None
+        if isinstance(resp, dict):
+            emb = resp.get("embedding")
+            if isinstance(emb, list) and emb and isinstance(emb[0], (int, float)):
+                return _normalize_vector(emb)
+            if isinstance(emb, dict):
+                values = emb.get("values")
+                if isinstance(values, list):
+                    return _normalize_vector(values)
+        emb_attr = getattr(resp, "embedding", None)
+        if isinstance(emb_attr, list):
+            return _normalize_vector(emb_attr)
+        vals_attr = getattr(emb_attr, "values", None)
+        if isinstance(vals_attr, list):
+            return _normalize_vector(vals_attr)
+        return None
+
+    def embed_texts(self, texts: list[str]) -> list[list[float] | None]:
+        if not self.available:
+            return [None for _ in texts]
+        out: list[list[float] | None] = []
+        for text in texts:
+            t = str(text or "").strip()
+            if not t:
+                out.append(None)
+                continue
+            try:
+                resp = _genai.embed_content(  # type: ignore[union-attr]
+                    model=self.model,
+                    content=t,
+                    task_type="SEMANTIC_SIMILARITY",
+                )
+            except Exception:
+                out.append(None)
+                continue
+            out.append(self._extract_vector(resp))
+        return out
+
+
+class _NgramSemanticEmbedder(_SemanticEmbedder):
+    def __init__(self, dim: int = 384) -> None:
+        self.dim = max(64, int(dim))
+
+    def _embed_one(self, text: str) -> list[float] | None:
+        compact = norm_text_compact(text)
+        if len(compact) < 2:
+            return None
+        vec = [0.0] * self.dim
+        grams: list[str] = []
+        for n in (2, 3):
+            if len(compact) < n:
+                continue
+            for i in range(0, len(compact) - n + 1):
+                grams.append(compact[i : i + n])
+        if not grams:
+            return None
+        for g in grams:
+            idx = (hash(g) & 0x7FFFFFFF) % self.dim
+            vec[idx] += 1.0
+        return _normalize_vector(vec)
+
+    def embed_texts(self, texts: list[str]) -> list[list[float] | None]:
+        return [self._embed_one(str(t or "")) for t in texts]
+
+
 @dataclass
 class IndustryEntry:
     level: str
@@ -105,6 +253,26 @@ class IndustryAliasEntry:
     allowed_major_codes: tuple[str, ...]
     notes: str
     alias_norm: str
+
+
+@dataclass
+class IndustryMemoryEntry:
+    term: str
+    target_minor_code: str
+    count: int
+    confidence: float
+    source: str
+    updated_at: str
+    term_norm: str
+
+
+@dataclass
+class SemanticTaxonomyCandidate:
+    minor_code: str
+    sim: float
+    margin: float
+    phrase: str
+    source: str
 
 
 class JSICTaxonomy:
@@ -599,16 +767,523 @@ class JSICTaxonomy:
 
 
 class IndustryClassifier:
-    def __init__(self, csv_path: str | None = None, aliases_csv_path: str | None = None) -> None:
+    def __init__(
+        self,
+        csv_path: str | None = None,
+        aliases_csv_path: str | None = None,
+        semantic_embedder: Optional[_SemanticEmbedder] = None,
+    ) -> None:
         self.csv_path = csv_path or DEFAULT_JSIC_CSV_PATH
         self.taxonomy = JSICTaxonomy(self.csv_path, DEFAULT_JSIC_JSON_PATH)
         self.loaded = self.taxonomy.load()
 
         self.aliases_csv_path = aliases_csv_path or DEFAULT_INDUSTRY_ALIASES_CSV_PATH
         self.alias_entries: list[IndustryAliasEntry] = []
+        self.learned_alias_entries: list[IndustryAliasEntry] = []
         self.alias_source = "fallback"
+        self.memory_csv_path = DEFAULT_INDUSTRY_MEMORY_CSV_PATH
+        self.auto_learn_enabled = bool(AUTO_LEARN_ENABLED)
+        self.auto_learn_min_confidence = float(max(0.0, min(1.0, AUTO_LEARN_MIN_CONFIDENCE)))
+        self.auto_learn_min_count = max(1, int(AUTO_LEARN_MIN_COUNT))
+        self.auto_learn_max_terms = max(1, int(AUTO_LEARN_MAX_TERMS))
+        self.auto_learn_min_term_len = max(2, int(AUTO_LEARN_MIN_TERM_LEN))
+        self.auto_learn_max_term_len = max(self.auto_learn_min_term_len, int(AUTO_LEARN_MAX_TERM_LEN))
+        self.memory_entries: dict[tuple[str, str], IndustryMemoryEntry] = {}
+        self.semantic_enabled = bool(ALIAS_SEMANTIC_ENABLED)
+        self.semantic_provider = ALIAS_SEMANTIC_PROVIDER
+        self.semantic_embedder = semantic_embedder
+        self.semantic_min_sim = float(max(0.0, min(1.0, ALIAS_SEMANTIC_MIN_SIM)))
+        self.semantic_min_margin = float(max(0.0, min(1.0, ALIAS_SEMANTIC_MIN_MARGIN)))
+        self.semantic_strong_sim = float(max(self.semantic_min_sim, min(1.0, ALIAS_SEMANTIC_STRONG_SIM)))
+        self.semantic_strong_margin = float(max(self.semantic_min_margin, min(1.0, ALIAS_SEMANTIC_STRONG_MARGIN)))
+        self.semantic_min_priority = max(1, int(ALIAS_SEMANTIC_MIN_PRIORITY))
+        self.semantic_max_phrases = max(1, int(ALIAS_SEMANTIC_MAX_PHRASES))
+        self.semantic_max_hits = max(1, int(ALIAS_SEMANTIC_MAX_HITS))
+        self._semantic_query_cache: dict[str, list[float] | None] = {}
+        self._semantic_alias_entries: list[IndustryAliasEntry] = []
+        self._semantic_alias_vectors: list[list[float]] = []
+        self.semantic_taxonomy_enabled = bool(SEMANTIC_TAXONOMY_ENABLED)
+        self.semantic_taxonomy_min_sim = float(max(0.0, min(1.0, SEMANTIC_TAXONOMY_MIN_SIM)))
+        self.semantic_taxonomy_min_margin = float(max(0.0, min(1.0, SEMANTIC_TAXONOMY_MIN_MARGIN)))
+        self.semantic_taxonomy_max_hits = max(1, int(SEMANTIC_TAXONOMY_MAX_HITS))
+        self._semantic_taxonomy_codes: list[str] = []
+        self._semantic_taxonomy_vectors: list[list[float]] = []
+        self._semantic_taxonomy_proto: dict[str, str] = {}
         if self.loaded:
             self._load_alias_entries()
+            self._load_memory_entries()
+            self._init_semantic_alias_matcher()
+
+    def _init_semantic_alias_matcher(self) -> None:
+        self._semantic_alias_entries = []
+        self._semantic_alias_vectors = []
+        self._semantic_query_cache = {}
+        self._semantic_taxonomy_codes = []
+        self._semantic_taxonomy_vectors = []
+        self._semantic_taxonomy_proto = {}
+
+        need_embedder = bool(self.semantic_enabled or self.semantic_taxonomy_enabled)
+        if not need_embedder:
+            return
+
+        if self.semantic_embedder is None:
+            provider = self.semantic_provider
+            if provider == "auto":
+                provider = "gemini" if (DEFAULT_GEMINI_API_KEY and _genai is not None) else "off"
+            if provider == "gemini":
+                emb = _GeminiSemanticEmbedder(DEFAULT_GEMINI_API_KEY, DEFAULT_ALIAS_EMBED_MODEL)
+                if emb.available:
+                    self.semantic_embedder = emb
+                else:
+                    log.warning("Industry semantic alias disabled: gemini embedder unavailable.")
+                    self.semantic_embedder = None
+            elif provider == "ngram":
+                self.semantic_embedder = _NgramSemanticEmbedder()
+            else:
+                self.semantic_embedder = None
+
+        if self.semantic_embedder is None:
+            return
+        if self.semantic_enabled:
+            self._build_semantic_alias_index()
+        if self.semantic_taxonomy_enabled:
+            self._build_semantic_taxonomy_index()
+
+    def _semantic_prototype_text(self, entry: IndustryAliasEntry) -> str:
+        target_name = (
+            self.taxonomy.detail_names.get(entry.target_minor_code)
+            or self.taxonomy.minor_names.get(entry.target_minor_code)
+            or ""
+        )
+        major_code = self._resolve_target_major_code(entry.target_minor_code)
+        major_name = self.taxonomy.major_names.get(major_code, "") if major_code else ""
+        parts = [entry.alias, target_name, major_name]
+        uniq: list[str] = []
+        seen: set[str] = set()
+        for p in parts:
+            t = str(p or "").strip()
+            if not t:
+                continue
+            n = norm_text_compact(t)
+            if not n or n in seen:
+                continue
+            seen.add(n)
+            uniq.append(t)
+        return " ".join(uniq)
+
+    def _build_semantic_alias_index(self) -> None:
+        self._semantic_alias_entries = []
+        self._semantic_alias_vectors = []
+        if self.semantic_embedder is None:
+            return
+
+        seed_entries: list[IndustryAliasEntry] = []
+        texts: list[str] = []
+        seen: set[tuple[str, str]] = set()
+        for entry in self._alias_corpus():
+            if not entry.target_minor_code:
+                continue
+            if int(entry.priority) < int(self.semantic_min_priority):
+                continue
+            key = (entry.alias_norm, entry.target_minor_code)
+            if key in seen:
+                continue
+            seen.add(key)
+            proto = self._semantic_prototype_text(entry)
+            if not proto:
+                continue
+            seed_entries.append(entry)
+            texts.append(proto)
+
+        if not seed_entries:
+            return
+
+        vectors = self.semantic_embedder.embed_texts(texts)
+        for entry, vec in zip(seed_entries, vectors):
+            if not vec:
+                continue
+            norm_vec = _normalize_vector(vec)
+            if not norm_vec:
+                continue
+            self._semantic_alias_entries.append(entry)
+            self._semantic_alias_vectors.append(norm_vec)
+
+        if self._semantic_alias_entries:
+            log.info(
+                "Industry semantic alias index ready: %s prototypes (provider=%s).",
+                len(self._semantic_alias_entries),
+                self.semantic_provider,
+            )
+
+    @staticmethod
+    def _dedupe_alias_hits(hits: list[IndustryAliasEntry]) -> list[IndustryAliasEntry]:
+        out: list[IndustryAliasEntry] = []
+        seen: set[tuple[str, str]] = set()
+        for h in hits:
+            key = (h.alias_norm, h.target_minor_code)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(h)
+        return out
+
+    def _extract_semantic_phrases(self, text: str) -> list[str]:
+        spaced = norm_text(text)
+        if not spaced:
+            return []
+        tokens = [t.strip() for t in spaced.split(" ") if 2 <= len(t.strip()) <= 24]
+        tokens = [t for t in tokens if t and t not in _GENERIC_TOKENS]
+        if not tokens:
+            return []
+        out: list[str] = []
+        seen: set[str] = set()
+
+        def push(phrase: str) -> None:
+            p = str(phrase or "").strip()
+            if len(p) < 2 or len(p) > 36:
+                return
+            n = norm_text_compact(p)
+            if not n or n in seen:
+                return
+            seen.add(n)
+            out.append(p)
+
+        compact = "".join(tokens)[:36]
+        push(compact)
+        for tok in tokens:
+            push(tok)
+        for i in range(0, len(tokens) - 1):
+            push(tokens[i] + tokens[i + 1])
+            if i + 2 < len(tokens):
+                push(tokens[i] + tokens[i + 1] + tokens[i + 2])
+            if len(out) >= self.semantic_max_phrases:
+                break
+
+        return out[: self.semantic_max_phrases]
+
+    def _embed_query_phrase(self, phrase: str) -> list[float] | None:
+        key = norm_text_compact(phrase)
+        if not key:
+            return None
+        if key in self._semantic_query_cache:
+            return self._semantic_query_cache[key]
+        if self.semantic_embedder is None:
+            self._semantic_query_cache[key] = None
+            return None
+        vecs = self.semantic_embedder.embed_texts([phrase])
+        vec = _normalize_vector(vecs[0] if vecs else None)
+        self._semantic_query_cache[key] = vec
+        return vec
+
+    def _semantic_alias_hits_for_text(self, text: str) -> list[IndustryAliasEntry]:
+        if (
+            not text
+            or not self.semantic_enabled
+            or self.semantic_embedder is None
+            or not self._semantic_alias_entries
+            or not self._semantic_alias_vectors
+        ):
+            return []
+
+        phrases = self._extract_semantic_phrases(text)
+        if not phrases:
+            return []
+
+        hits: list[IndustryAliasEntry] = []
+        for phrase in phrases:
+            qvec = self._embed_query_phrase(phrase)
+            if not qvec:
+                continue
+            best_idx = -1
+            best_sim = -1.0
+            second_sim = -1.0
+            for idx, avec in enumerate(self._semantic_alias_vectors):
+                sim = _cosine_similarity(qvec, avec)
+                if sim > best_sim:
+                    second_sim = best_sim
+                    best_sim = sim
+                    best_idx = idx
+                elif sim > second_sim:
+                    second_sim = sim
+
+            if best_idx < 0 or best_sim < self.semantic_min_sim:
+                continue
+            margin = best_sim - max(second_sim, -1.0)
+            if margin < self.semantic_min_margin:
+                continue
+
+            base = self._semantic_alias_entries[best_idx]
+            is_strong = (
+                best_sim >= self.semantic_strong_sim
+                and margin >= self.semantic_strong_margin
+                and int(base.priority) >= 8
+                and (not base.requires_review)
+            )
+            requires_review = (not is_strong) or bool(base.requires_review)
+            priority = int(base.priority) if is_strong else max(1, int(base.priority) - 2)
+            note_marker = f"semantic_match:{best_sim:.3f}"
+            notes = self._append_alias_note(base.notes, note_marker)
+            hits.append(
+                IndustryAliasEntry(
+                    alias=f"[semantic]{phrase}->{base.alias}",
+                    target_minor_code=base.target_minor_code,
+                    priority=priority,
+                    requires_review=requires_review,
+                    domain_tag=base.domain_tag,
+                    allowed_major_codes=base.allowed_major_codes,
+                    notes=notes,
+                    alias_norm=norm_text_compact(f"semantic:{phrase}:{base.alias_norm}:{base.target_minor_code}"),
+                )
+            )
+            if len(hits) >= self.semantic_max_hits:
+                break
+
+        hits.sort(
+            key=lambda x: (
+                int(x.requires_review),
+                -int(x.priority),
+                x.target_minor_code,
+                x.alias_norm,
+            )
+        )
+        return self._dedupe_alias_hits(hits)
+
+    def _semantic_taxonomy_prototype_text(self, minor_code: str) -> str:
+        major_code, major_name, _mid, middle_name, _minor_code, minor_name = self.taxonomy.resolve_hierarchy(minor_code)
+        parts = [minor_name, middle_name, major_name]
+        alias_candidates: list[IndustryAliasEntry] = []
+        for entry in self._alias_corpus():
+            target = str(entry.target_minor_code or "").strip()
+            if not target or entry.requires_review:
+                continue
+            if target in self.taxonomy.detail_names:
+                _m1, _m1n, _m2, _m2n, resolved_minor, _m3n, _dc, _dn = self.taxonomy.resolve_detail_hierarchy(target)
+                target = resolved_minor
+            if target != minor_code:
+                continue
+            alias_candidates.append(entry)
+        alias_candidates.sort(key=lambda x: (-int(x.priority), -len(x.alias_norm), x.alias_norm))
+        for entry in alias_candidates[:4]:
+            parts.append(entry.alias)
+
+        uniq: list[str] = []
+        seen: set[str] = set()
+        for part in parts:
+            t = str(part or "").strip()
+            if not t:
+                continue
+            n = norm_text_compact(t)
+            if not n or n in seen:
+                continue
+            seen.add(n)
+            uniq.append(t)
+        return " ".join(uniq)
+
+    def _build_semantic_taxonomy_index(self) -> None:
+        self._semantic_taxonomy_codes = []
+        self._semantic_taxonomy_vectors = []
+        self._semantic_taxonomy_proto = {}
+        if (
+            not self.semantic_taxonomy_enabled
+            or self.semantic_embedder is None
+            or not self.taxonomy.minor_names
+        ):
+            return
+
+        codes: list[str] = []
+        texts: list[str] = []
+        for code in sorted(self.taxonomy.minor_names.keys()):
+            proto = self._semantic_taxonomy_prototype_text(code)
+            if not proto:
+                continue
+            codes.append(code)
+            texts.append(proto)
+            self._semantic_taxonomy_proto[code] = proto
+        if not texts:
+            return
+
+        vecs = self.semantic_embedder.embed_texts(texts)
+        for code, vec in zip(codes, vecs):
+            norm_vec = _normalize_vector(vec)
+            if not norm_vec:
+                continue
+            self._semantic_taxonomy_codes.append(code)
+            self._semantic_taxonomy_vectors.append(norm_vec)
+        if self._semantic_taxonomy_codes:
+            log.info(
+                "Industry semantic taxonomy index ready: %s minors (provider=%s).",
+                len(self._semantic_taxonomy_codes),
+                self.semantic_provider,
+            )
+
+    def _semantic_taxonomy_hits_for_text(self, text: str, *, source: str) -> list[SemanticTaxonomyCandidate]:
+        if (
+            not text
+            or not self.semantic_taxonomy_enabled
+            or self.semantic_embedder is None
+            or not self._semantic_taxonomy_codes
+            or not self._semantic_taxonomy_vectors
+        ):
+            return []
+        phrases = self._extract_semantic_phrases(text)
+        if not phrases:
+            return []
+        best_by_minor: dict[str, SemanticTaxonomyCandidate] = {}
+        for phrase in phrases:
+            qvec = self._embed_query_phrase(phrase)
+            if not qvec:
+                continue
+            best_idx = -1
+            best_sim = -1.0
+            second_sim = -1.0
+            for idx, avec in enumerate(self._semantic_taxonomy_vectors):
+                sim = _cosine_similarity(qvec, avec)
+                if sim > best_sim:
+                    second_sim = best_sim
+                    best_sim = sim
+                    best_idx = idx
+                elif sim > second_sim:
+                    second_sim = sim
+            if best_idx < 0 or best_sim < self.semantic_taxonomy_min_sim:
+                continue
+            margin = best_sim - max(second_sim, -1.0)
+            if margin < self.semantic_taxonomy_min_margin:
+                continue
+            code = self._semantic_taxonomy_codes[best_idx]
+            cand = SemanticTaxonomyCandidate(
+                minor_code=code,
+                sim=float(best_sim),
+                margin=float(margin),
+                phrase=phrase,
+                source=source,
+            )
+            prev = best_by_minor.get(code)
+            if prev is None or cand.sim > prev.sim:
+                best_by_minor[code] = cand
+        if not best_by_minor:
+            return []
+        ranked = sorted(
+            best_by_minor.values(),
+            key=lambda x: (-float(x.sim), -float(x.margin), x.minor_code),
+        )
+        return ranked[: self.semantic_taxonomy_max_hits]
+
+    def classify_from_semantic_taxonomy(self, description: str, business_tags: Any) -> Optional[dict[str, Any]]:
+        if (
+            not self.loaded
+            or not self.semantic_taxonomy_enabled
+            or self.semantic_embedder is None
+            or not self._semantic_taxonomy_codes
+        ):
+            return None
+        desc_hits = self._semantic_taxonomy_hits_for_text(str(description or ""), source="desc")
+        tag_values = self._iter_tag_values(business_tags)
+        tag_hits: list[SemanticTaxonomyCandidate] = []
+        for tag in tag_values:
+            tag_hits.extend(self._semantic_taxonomy_hits_for_text(tag, source="tag"))
+        if not desc_hits and not tag_hits:
+            return None
+
+        context_text = "\n".join([str(description or "")] + tag_values).strip()
+        best_major, best_major_score, best_major_margin = self._infer_major_context_from_text(context_text)
+        if best_major and best_major_score >= 3 and best_major_margin >= 2:
+            desc_hits = [
+                h
+                for h in desc_hits
+                if self._resolve_target_major_code(h.minor_code) in {"", best_major}
+            ]
+            tag_hits = [
+                h
+                for h in tag_hits
+                if self._resolve_target_major_code(h.minor_code) in {"", best_major}
+            ]
+            if not desc_hits and not tag_hits:
+                return None
+
+        scores: dict[str, dict[str, Any]] = {}
+
+        def apply_hit(hit: SemanticTaxonomyCandidate) -> None:
+            slot = scores.setdefault(
+                hit.minor_code,
+                {
+                    "score": 0.0,
+                    "desc_hits": 0,
+                    "tag_hits": 0,
+                    "best_sim": 0.0,
+                    "best_margin": 0.0,
+                    "phrases": set(),
+                },
+            )
+            boost = float(hit.sim) + (float(hit.margin) * 0.45)
+            if hit.source == "tag":
+                boost += 0.06
+                slot["tag_hits"] = int(slot.get("tag_hits") or 0) + 1
+            else:
+                slot["desc_hits"] = int(slot.get("desc_hits") or 0) + 1
+            slot["score"] = float(slot.get("score") or 0.0) + boost
+            slot["best_sim"] = max(float(slot.get("best_sim") or 0.0), float(hit.sim))
+            slot["best_margin"] = max(float(slot.get("best_margin") or 0.0), float(hit.margin))
+            phrase_set = slot.get("phrases")
+            if isinstance(phrase_set, set):
+                phrase_set.add(str(hit.phrase))
+
+        for hit in desc_hits:
+            apply_hit(hit)
+        for hit in tag_hits:
+            apply_hit(hit)
+        if not scores:
+            return None
+
+        ranked = sorted(
+            scores.items(),
+            key=lambda x: (
+                -float(x[1].get("score") or 0.0),
+                -float(x[1].get("best_sim") or 0.0),
+                -int(x[1].get("tag_hits") or 0),
+                x[0],
+            ),
+        )
+        best_code, best_meta = ranked[0]
+        candidate = self._resolve_candidate_from_code(best_code)
+        if not candidate:
+            return None
+
+        second_score = float(ranked[1][1].get("score") or 0.0) if len(ranked) >= 2 else 0.0
+        best_score = float(best_meta.get("score") or 0.0)
+        score_margin = max(0.0, best_score - second_score)
+        desc_count = int(best_meta.get("desc_hits") or 0)
+        tag_count = int(best_meta.get("tag_hits") or 0)
+        both_sources = desc_count > 0 and tag_count > 0
+        best_sim = float(best_meta.get("best_sim") or 0.0)
+        best_margin = float(best_meta.get("best_margin") or 0.0)
+
+        confidence = 0.38 + min(0.30, best_score * 0.20) + min(0.12, score_margin * 0.30)
+        if both_sources:
+            confidence += 0.06
+        if best_sim >= 0.97:
+            confidence += 0.04
+        confidence = float(max(0.0, min(0.85, confidence)))
+
+        ambiguous = score_margin < 0.08 or best_margin < (self.semantic_taxonomy_min_margin + 0.02)
+        review_required = bool((not both_sources) or ambiguous or confidence <= 0.56)
+        if review_required:
+            confidence = min(confidence, 0.56 if both_sources else 0.50)
+
+        source_name = "semantic_taxonomy_desc_tags" if both_sources else "semantic_taxonomy_single"
+        return {
+            **candidate,
+            "confidence": confidence,
+            "source": source_name,
+            "review_required": review_required,
+            "semantic_taxonomy_only": True,
+            "semantic_taxonomy_score": best_score,
+            "semantic_taxonomy_score_margin": score_margin,
+            "semantic_taxonomy_best_sim": best_sim,
+            "semantic_taxonomy_best_margin": best_margin,
+            "semantic_taxonomy_phrases": sorted(list(best_meta.get("phrases") or [])),
+            "semantic_taxonomy_desc_hits": desc_count,
+            "semantic_taxonomy_tag_hits": tag_count,
+        }
 
     def _read_alias_rows(self, path: str) -> list[dict[str, str]]:
         for enc in ("utf-8-sig", "cp932", "shift_jis"):
@@ -756,8 +1431,307 @@ class IndustryClassifier:
         self.alias_entries = entries
         log.info("Industry aliases loaded: %s entries (source=%s)", len(entries), self.alias_source)
 
+    def _alias_corpus(self) -> list[IndustryAliasEntry]:
+        if not self.learned_alias_entries:
+            return self.alias_entries
+        return self.alias_entries + self.learned_alias_entries
+
+    def _known_alias_norms(self) -> set[str]:
+        norms = {e.alias_norm for e in self._alias_corpus() if e.alias_norm}
+        norms.update(self.taxonomy.normalized_name_index.keys())
+        return norms
+
+    def _load_memory_entries(self) -> None:
+        self.memory_entries = {}
+        self.learned_alias_entries = []
+        path = str(self.memory_csv_path or "").strip()
+        if not path or (not os.path.exists(path)):
+            return
+
+        rows: list[dict[str, str]] = []
+        for enc in ("utf-8-sig", "cp932", "shift_jis"):
+            try:
+                with open(path, "r", encoding=enc, newline="") as f:
+                    reader = csv.DictReader(f)
+                    rows = [dict(row) for row in reader]
+                    break
+            except Exception:
+                continue
+        if not rows:
+            return
+
+        for row in rows:
+            term = str(row.get("term") or row.get("alias") or "").strip()
+            term_norm = norm_text_compact(term)
+            target = str(row.get("target_minor_code") or "").strip()
+            if not term_norm or not target:
+                continue
+            if target in self.taxonomy.detail_names:
+                _maj, _maj_name, _mid, _mid_name, resolved_minor, _minor_name, _d, _dn = self.taxonomy.resolve_detail_hierarchy(target)
+                if resolved_minor:
+                    target = resolved_minor
+            if target not in self.taxonomy.minor_names:
+                continue
+            try:
+                count = int(str(row.get("count") or "1").strip())
+            except Exception:
+                count = 1
+            try:
+                confidence = float(str(row.get("confidence") or row.get("last_confidence") or "0.0").strip())
+            except Exception:
+                confidence = 0.0
+            source = str(row.get("source") or row.get("last_source") or "auto").strip()
+            updated_at = str(row.get("updated_at") or "").strip() or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            key = (term_norm, target)
+            existing = self.memory_entries.get(key)
+            if existing:
+                existing.count = max(existing.count, max(1, count))
+                existing.confidence = max(existing.confidence, confidence)
+                if term and (len(term) > len(existing.term)):
+                    existing.term = term
+                if source and source != "auto":
+                    existing.source = source
+                existing.updated_at = updated_at
+            else:
+                self.memory_entries[key] = IndustryMemoryEntry(
+                    term=term,
+                    target_minor_code=target,
+                    count=max(1, count),
+                    confidence=float(max(0.0, min(1.0, confidence))),
+                    source=source or "auto",
+                    updated_at=updated_at,
+                    term_norm=term_norm,
+                )
+        self._rebuild_learned_alias_entries()
+        if self.learned_alias_entries:
+            log.info("Industry auto-learn memory loaded: %s entries", len(self.learned_alias_entries))
+
+    def _rebuild_learned_alias_entries(self) -> None:
+        entries: list[IndustryAliasEntry] = []
+        for mem in self.memory_entries.values():
+            if not mem.target_minor_code:
+                continue
+            target_major = self._resolve_target_major_code(mem.target_minor_code)
+            requires_review = bool(
+                mem.count < self.auto_learn_min_count
+                or mem.confidence < max(0.65, self.auto_learn_min_confidence - 0.08)
+            )
+            priority = 2 + min(4, int(mem.count))
+            if mem.confidence >= 0.90:
+                priority += 1
+            if not requires_review:
+                priority = max(priority, 5)
+            priority = int(max(1, min(8, priority)))
+            notes = f"auto_learn|count:{int(mem.count)}|conf:{float(mem.confidence):.3f}|src:{mem.source}"
+            entries.append(
+                IndustryAliasEntry(
+                    alias=mem.term,
+                    target_minor_code=mem.target_minor_code,
+                    priority=priority,
+                    requires_review=requires_review,
+                    domain_tag="auto",
+                    allowed_major_codes=(target_major,) if target_major else (),
+                    notes=notes,
+                    alias_norm=mem.term_norm,
+                )
+            )
+        entries.sort(key=lambda x: (-x.priority, -len(x.alias_norm), x.alias_norm, x.target_minor_code))
+        self.learned_alias_entries = entries
+
+    def _flush_memory_entries(self) -> None:
+        path = str(self.memory_csv_path or "").strip()
+        if not path:
+            return
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+
+        rows = sorted(
+            self.memory_entries.values(),
+            key=lambda x: (-int(x.count), -float(x.confidence), x.target_minor_code, x.term_norm),
+        )
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["term", "target_minor_code", "count", "confidence", "source", "updated_at"])
+            for mem in rows:
+                w.writerow(
+                    [
+                        mem.term,
+                        mem.target_minor_code,
+                        int(mem.count),
+                        f"{float(mem.confidence):.4f}",
+                        mem.source,
+                        mem.updated_at,
+                    ]
+                )
+
+    @staticmethod
+    def _is_auto_learn_source_allowed(source: str) -> bool:
+        s = str(source or "").strip().lower()
+        if not s:
+            return False
+        if "unclassified" in s:
+            return False
+        if s.startswith("alias"):
+            return False
+        if s.startswith("forced"):
+            return False
+        if "semantic" in s:
+            return False
+        return True
+
+    def _extract_auto_learn_terms(self, text_blocks: list[str]) -> list[str]:
+        if not text_blocks:
+            return []
+        known_aliases = self._known_alias_norms()
+        token_counts: dict[str, int] = {}
+        token_surface: dict[str, str] = {}
+        for block in text_blocks:
+            text = norm_text(block)
+            if not text:
+                continue
+            for m in _AUTO_TERM_RE.finditer(text):
+                term = str(m.group(0) or "").strip()
+                if not term:
+                    continue
+                if term.isdigit():
+                    continue
+                if term in _AUTO_LEARN_STOPWORDS:
+                    continue
+                term_norm = norm_text_compact(term)
+                if not term_norm:
+                    continue
+                if len(term_norm) < self.auto_learn_min_term_len or len(term_norm) > self.auto_learn_max_term_len:
+                    continue
+                if term_norm in _AUTO_LEARN_STOPWORDS:
+                    continue
+                if term_norm in known_aliases:
+                    continue
+                token_counts[term_norm] = token_counts.get(term_norm, 0) + 1
+                prev = token_surface.get(term_norm, "")
+                if not prev or len(term) > len(prev):
+                    token_surface[term_norm] = term
+        if not token_counts:
+            return []
+        ranked = sorted(
+            token_counts.items(),
+            key=lambda x: (-int(x[1]), -len(x[0]), x[0]),
+        )
+        out: list[str] = []
+        for term_norm, _count in ranked:
+            term = token_surface.get(term_norm) or term_norm
+            out.append(term)
+            if len(out) >= self.auto_learn_max_terms:
+                break
+        return out
+
+    def auto_learn_from_result(
+        self,
+        *,
+        description: str,
+        business_tags: Any,
+        result: dict[str, Any] | None,
+        company_name: str = "",
+    ) -> int:
+        if not self.loaded or not self.auto_learn_enabled:
+            return 0
+        if not isinstance(result, dict):
+            return 0
+        if bool(result.get("review_required")):
+            return 0
+        source = str(result.get("source") or "").strip()
+        if not self._is_auto_learn_source_allowed(source):
+            return 0
+
+        target_minor_code = str(result.get("minor_code") or "").strip()
+        if not target_minor_code:
+            return 0
+        if target_minor_code in self.taxonomy.detail_names:
+            _maj, _maj_name, _mid, _mid_name, resolved_minor, _minor_name, _d, _dn = self.taxonomy.resolve_detail_hierarchy(target_minor_code)
+            if resolved_minor:
+                target_minor_code = resolved_minor
+        if target_minor_code not in self.taxonomy.minor_names:
+            return 0
+
+        try:
+            confidence = float(result.get("confidence") or 0.0)
+        except Exception:
+            confidence = 0.0
+        confidence = float(max(0.0, min(1.0, confidence)))
+        if confidence < self.auto_learn_min_confidence:
+            return 0
+
+        blocks: list[str] = []
+        if description:
+            blocks.append(str(description))
+        tag_values = self._iter_tag_values(business_tags)
+        if tag_values:
+            blocks.extend(tag_values)
+        terms = self._extract_auto_learn_terms(blocks)
+        if not terms:
+            return 0
+
+        changed = 0
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        for term in terms:
+            term_norm = norm_text_compact(term)
+            if not term_norm:
+                continue
+            key = (term_norm, target_minor_code)
+            existing = self.memory_entries.get(key)
+            if existing is None:
+                self.memory_entries[key] = IndustryMemoryEntry(
+                    term=term,
+                    target_minor_code=target_minor_code,
+                    count=1,
+                    confidence=confidence,
+                    source=source,
+                    updated_at=now,
+                    term_norm=term_norm,
+                )
+                changed += 1
+                continue
+
+            existing.count = max(1, int(existing.count) + 1)
+            if confidence >= existing.confidence:
+                existing.source = source
+            existing.confidence = max(existing.confidence, confidence)
+            if len(term) > len(existing.term):
+                existing.term = term
+            existing.updated_at = now
+            changed += 1
+
+        if changed > 0:
+            self._rebuild_learned_alias_entries()
+            self._flush_memory_entries()
+            self._build_semantic_taxonomy_index()
+        return changed
+
+    def auto_learn_from_company(self, company: dict[str, Any], *, status: str = "") -> int:
+        if not isinstance(company, dict):
+            return 0
+        if status and status != "done":
+            return 0
+        try:
+            confidence = float(company.get("industry_class_confidence") or 0.0)
+        except Exception:
+            confidence = 0.0
+        result = {
+            "minor_code": str(company.get("industry_minor_code") or "").strip(),
+            "confidence": confidence,
+            "source": str(company.get("industry_class_source") or "").strip(),
+            "review_required": bool(status == "review"),
+        }
+        return self.auto_learn_from_result(
+            description=str(company.get("description") or ""),
+            business_tags=company.get("business_tags"),
+            result=result,
+            company_name=str(company.get("company_name") or ""),
+        )
+
     def _alias_hits_for_text(self, text: str) -> list[IndustryAliasEntry]:
-        if not text or not self.alias_entries:
+        entries = self._alias_corpus()
+        if not text or not entries:
             return []
         spaced = norm_text(text)
         compact = spaced.replace(" ", "")
@@ -766,7 +1740,7 @@ class IndustryClassifier:
 
         hits: list[IndustryAliasEntry] = []
         seen: set[tuple[str, str]] = set()
-        for entry in self.alias_entries:
+        for entry in entries:
             if not entry.alias_norm:
                 continue
             if re.fullmatch(r"[a-z0-9]+", entry.alias_norm):
@@ -890,10 +1864,14 @@ class IndustryClassifier:
             return None
 
         desc_hits = self._alias_hits_for_text(description or "")
+        desc_hits.extend(self._semantic_alias_hits_for_text(description or ""))
         tag_values = self._iter_tag_values(business_tags)
         tag_hits: list[IndustryAliasEntry] = []
         for tag in tag_values:
             tag_hits.extend(self._alias_hits_for_text(tag))
+            tag_hits.extend(self._semantic_alias_hits_for_text(tag))
+        desc_hits = self._dedupe_alias_hits(desc_hits)
+        tag_hits = self._dedupe_alias_hits(tag_hits)
         context_text = "\n".join([description or ""] + tag_values).strip()
         desc_hits = self._filter_alias_hits_by_major_context(desc_hits, context_text)
         tag_hits = self._filter_alias_hits_by_major_context(tag_hits, context_text)
@@ -903,12 +1881,14 @@ class IndustryClassifier:
         def apply_hit(entry: IndustryAliasEntry, source: str) -> None:
             if not entry.target_minor_code:
                 return
+            is_semantic = str(entry.alias or "").startswith("[semantic]")
             slot = scores.setdefault(
                 entry.target_minor_code,
                 {
                     "score": 0,
                     "desc_hits": 0,
                     "tag_hits": 0,
+                    "semantic_hits": 0,
                     "max_priority": 0,
                     "requires_review": False,
                     "aliases": set(),
@@ -918,6 +1898,8 @@ class IndustryClassifier:
             boost = max(1, int(entry.priority))
             if source == "tag":
                 boost += 1
+            if is_semantic:
+                boost = min(boost, 3)
             if entry.requires_review:
                 # Review-required aliases are intentionally weak to reduce false positives.
                 boost = min(boost, 2)
@@ -925,6 +1907,8 @@ class IndustryClassifier:
                 slot["tag_hits"] = int(slot.get("tag_hits") or 0) + 1
             else:
                 slot["desc_hits"] = int(slot.get("desc_hits") or 0) + 1
+            if is_semantic:
+                slot["semantic_hits"] = int(slot.get("semantic_hits") or 0) + 1
             slot["score"] = int(slot.get("score") or 0) + boost
             slot["max_priority"] = max(int(slot.get("max_priority") or 0), int(entry.priority))
             if entry.requires_review:
@@ -961,6 +1945,9 @@ class IndustryClassifier:
 
         desc_count = int(best_meta.get("desc_hits") or 0)
         tag_count = int(best_meta.get("tag_hits") or 0)
+        semantic_hits = int(best_meta.get("semantic_hits") or 0)
+        lexical_hits = max(0, int(desc_count + tag_count - semantic_hits))
+        semantic_only = semantic_hits > 0 and lexical_hits == 0
         both_sources = desc_count > 0 and tag_count > 0
         best_score = int(best_meta.get("score") or 0)
         best_domain_tags = {str(v) for v in (best_meta.get("domain_tags") or set()) if str(v)}
@@ -989,21 +1976,28 @@ class IndustryClassifier:
             confidence = min(0.72, max(0.55, base_conf))
         else:
             confidence = min(0.5, base_conf)
+        if semantic_only:
+            # semantic-only は誤爆防止を優先し、単独確信を抑える。
+            confidence = min(confidence, 0.54 if both_sources else 0.46)
         if domain_conflict:
             confidence = min(confidence, 0.58)
 
-        review_required = bool(best_meta.get("requires_review") or confidence <= 0.5 or domain_conflict)
+        review_required = bool(best_meta.get("requires_review") or confidence <= 0.5 or domain_conflict or semantic_only)
+        source_name = "alias_desc_tags" if both_sources else "alias_single"
+        if semantic_only:
+            source_name = "alias_semantic"
 
         return {
             **candidate,
             "confidence": float(max(0.0, min(1.0, confidence))),
-            "source": "alias_desc_tags" if both_sources else "alias_single",
+            "source": source_name,
             "review_required": review_required,
             "alias_only": True,
             "alias_domain_conflict": domain_conflict,
             "alias_match_count": int(desc_count + tag_count),
             "alias_desc_hits": desc_count,
             "alias_tag_hits": tag_count,
+            "alias_semantic_hits": semantic_hits,
             "alias_matches": sorted(list(best_meta.get("aliases") or [])),
             "alias_domain_tags": sorted(list(best_meta.get("domain_tags") or [])),
         }
@@ -1079,11 +2073,15 @@ class IndustryClassifier:
             boost_scores(detail_scores, self.taxonomy.detail_names)
 
         alias_hits = self._alias_hits_for_text(text)
+        alias_hits.extend(self._semantic_alias_hits_for_text(text))
+        alias_hits = self._dedupe_alias_hits(alias_hits)
         alias_hits = self._filter_alias_hits_by_major_context(alias_hits, text)
         for hit in alias_hits:
             if not hit.target_minor_code:
                 continue
             boost = max(1, int(hit.priority))
+            if str(hit.alias or "").startswith("[semantic]"):
+                boost = min(boost, 3)
             if hit.requires_review:
                 boost = min(boost, 2)
             target = hit.target_minor_code

@@ -1,3 +1,4 @@
+import asyncio
 import re
 import pytest
 from unittest.mock import patch, MagicMock
@@ -42,6 +43,13 @@ STARTPAGE_SAMPLE_HTML = """
     </article>
   </body>
 </html>
+"""
+STARTPAGE_PROXY_TEXT = """
+Title: Startpage Search Results
+
+- https://www.startpage.com/sp/click?url=https%3A%2F%2Fwww.tawaraya-official.co.jp%2F
+- https://www.startpage.com/sp/search?query=%E6%A4%9C%E7%B4%A2
+- https://www.example.co.jp/company
 """
 @pytest.fixture
 def scraper(monkeypatch):
@@ -149,7 +157,7 @@ def test_is_likely_official_site_true(scraper):
     )
 
 def test_clean_candidate_url_relative(scraper):
-    assert scraper._clean_candidate_url("/relative/path") == "https://duckduckgo.com/relative/path"
+    assert scraper._clean_candidate_url("/relative/path") is None
     assert scraper._clean_candidate_url("//bar.com/page").startswith("https://")
 
 
@@ -159,6 +167,13 @@ def test_extract_startpage_urls_decodes_redirect(scraper):
     assert "https://www.example.co.jp/about" in urls
     assert not any("startpage.com/sp/click" in u for u in urls)
     assert not any("facebook.com" in u for u in urls)
+
+
+def test_extract_startpage_urls_from_proxy_text(scraper):
+    urls = list(scraper._extract_startpage_urls(STARTPAGE_PROXY_TEXT))
+    assert "https://www.tawaraya-official.co.jp/" in urls
+    assert "https://www.example.co.jp/company" in urls
+    assert not any("startpage.com/sp/search" in u for u in urls)
 
 
 @pytest.mark.asyncio
@@ -185,6 +200,27 @@ async def test_search_company_uses_startpage(monkeypatch):
     assert called_queries
     expected_queries = set(scraper._build_company_queries("株式会社オフィス俵屋", "茨城県つくば市"))
     assert set(called_queries).issubset(expected_queries)
+
+
+@pytest.mark.asyncio
+async def test_search_company_fallbacks_to_ddg_when_startpage_times_out(monkeypatch):
+    monkeypatch.setenv("SEARCH_ENGINES", "startpage,ddg")
+    monkeypatch.setenv("SEARCH_ENGINE_TIMEOUT_SEC", "0.01")
+    scraper = CompanyScraper(headless=True)
+
+    async def _slow_startpage_fetch(_query: str) -> str:
+        await asyncio.sleep(0.05)
+        return STARTPAGE_SAMPLE_HTML
+
+    async def _fake_ddg_fetch(_query: str) -> str:
+        return SAMPLE_HTML
+
+    scraper._fetch_startpage = _slow_startpage_fetch  # type: ignore[method-assign]
+    scraper._fetch_duckduckgo = _fake_ddg_fetch  # type: ignore[method-assign]
+
+    urls = await scraper.search_company("株式会社オフィス俵屋", "茨城県つくば市", num_results=3)
+    assert "https://example.com/home" in urls
+    assert any(u.startswith("https://abs.co.jp") for u in urls)
 
 
 

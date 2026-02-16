@@ -166,6 +166,8 @@ INDUSTRY_RULE_MIN_SCORE = max(1, int(os.getenv("INDUSTRY_RULE_MIN_SCORE", "2")))
 INDUSTRY_AI_ENABLED = os.getenv("INDUSTRY_AI_ENABLED", "true").lower() == "true"
 INDUSTRY_AI_TOP_N = max(5, int(os.getenv("INDUSTRY_AI_TOP_N", "12")))
 INDUSTRY_AI_MIN_CONFIDENCE = float(os.getenv("INDUSTRY_AI_MIN_CONFIDENCE", "0.50"))
+# true の場合、業種AIは「不明/怪しいケース」に限定して実行する。
+INDUSTRY_AI_UNCERTAIN_ONLY = os.getenv("INDUSTRY_AI_UNCERTAIN_ONLY", "true").lower() == "true"
 INDUSTRY_MAJOR_MIN_CONFIDENCE = float(os.getenv("INDUSTRY_MAJOR_MIN_CONFIDENCE", "0.50"))
 INDUSTRY_MINOR_DIRECT_MAX_CANDIDATES = max(20, int(os.getenv("INDUSTRY_MINOR_DIRECT_MAX_CANDIDATES", "60")))
 INDUSTRY_DETAIL_MIN_CONFIDENCE = float(os.getenv("INDUSTRY_DETAIL_MIN_CONFIDENCE", "0.72"))
@@ -2138,6 +2140,96 @@ def extract_business_keywords(blocks: list[str], max_tags: int = 0) -> list[str]
         if max_tags > 0 and len(tags) >= max_tags:
             break
     return tags
+
+
+def _score_top_and_margin(score_map: dict[str, Any]) -> tuple[int, int]:
+    if not isinstance(score_map, dict) or not score_map:
+        return 0, 0
+    vals: list[int] = []
+    for v in score_map.values():
+        try:
+            vals.append(int(v))
+        except Exception:
+            continue
+    if not vals:
+        return 0, 0
+    vals.sort(reverse=True)
+    top = vals[0]
+    second = vals[1] if len(vals) > 1 else 0
+    return top, max(0, top - second)
+
+
+def _needs_industry_ai_escalation(
+    scores: dict[str, Any],
+    *,
+    min_score: int = INDUSTRY_RULE_FALLBACK_MIN_SCORE,
+    min_margin: int = INDUSTRY_RULE_FALLBACK_MARGIN,
+) -> bool:
+    """
+    不明/怪しいケースかどうかをスコアで判定する。
+    - minor 上位スコアが弱い
+    - 上位と次点の差が小さい（曖昧）
+    - aliasに review 必須フラグが立っている
+    """
+    if not isinstance(scores, dict):
+        return True
+    top, margin = _score_top_and_margin(scores.get("minor_scores") or {})
+    if top <= 0:
+        return True
+    if top < max(1, int(min_score)):
+        return True
+    if margin < max(1, int(min_margin)):
+        return True
+    alias_matches = scores.get("alias_matches") or []
+    if isinstance(alias_matches, list):
+        for m in alias_matches:
+            if not isinstance(m, dict):
+                continue
+            alias_name = str(m.get("alias") or "")
+            notes = str(m.get("notes") or "")
+            if alias_name.startswith("[semantic]") or ("semantic_match:" in notes):
+                return True
+    if bool(scores.get("alias_requires_review")):
+        return True
+    return False
+
+
+def _build_rule_industry_result_from_scores(
+    scores: dict[str, Any],
+    *,
+    source: str,
+    min_score: int = INDUSTRY_RULE_FALLBACK_MIN_SCORE,
+    min_margin: int = INDUSTRY_RULE_FALLBACK_MARGIN,
+) -> dict[str, Any] | None:
+    """
+    ルールスコアが十分に明確な場合のみ minor を直接採用する。
+    """
+    if not INDUSTRY_CLASSIFIER.loaded:
+        return None
+    if not isinstance(scores, dict):
+        return None
+    top, margin = _score_top_and_margin(scores.get("minor_scores") or {})
+    if top < max(1, int(min_score)) or margin < max(1, int(min_margin)):
+        return None
+    if bool(scores.get("alias_requires_review")):
+        return None
+
+    cands = INDUSTRY_CLASSIFIER.build_level_candidates("minor", scores, top_n=2)
+    if not cands:
+        return None
+    best = cands[0]
+    confidence = min(0.86, 0.55 + 0.03 * min(10, top) + 0.02 * min(4, margin))
+    return {
+        "major_code": str(best.get("major_code") or ""),
+        "major_name": str(best.get("major_name") or ""),
+        "middle_code": str(best.get("middle_code") or ""),
+        "middle_name": str(best.get("middle_name") or ""),
+        "minor_code": str(best.get("minor_code") or ""),
+        "minor_name": str(best.get("minor_name") or ""),
+        "confidence": float(max(0.0, min(1.0, confidence))),
+        "source": source,
+        "review_required": False,
+    }
 
 def _major_from_business_tags(tags: list[str]) -> tuple[str, str, int, int]:
     """
@@ -6598,22 +6690,6 @@ async def process():
                                 and getattr(verifier, "industry_prompt", None)
                             )
 
-                            def _top_and_margin(score_map: dict[str, Any]) -> tuple[int, int]:
-                                if not isinstance(score_map, dict) or not score_map:
-                                    return 0, 0
-                                vals: list[int] = []
-                                for v in score_map.values():
-                                    try:
-                                        vals.append(int(v))
-                                    except Exception:
-                                        continue
-                                if not vals:
-                                    return 0, 0
-                                vals.sort(reverse=True)
-                                top = vals[0]
-                                second = vals[1] if len(vals) > 1 else 0
-                                return top, max(0, top - second)
-
                             def _ai_accepts(
                                 ai_res: dict[str, Any],
                                 final_candidate: dict[str, str],
@@ -6693,8 +6769,18 @@ async def process():
                             else:
                                 ai_text = "\n".join([b for b in blocks if b])
                             class_candidates = _build_classification_candidates(scores)
+                            rule_result = None
+                            needs_ai_escalation = _needs_industry_ai_escalation(scores)
+                            if INDUSTRY_AI_UNCERTAIN_ONLY and (not needs_ai_escalation):
+                                rule_result = _build_rule_industry_result_from_scores(
+                                    scores,
+                                    source="rule_clear_pre",
+                                )
+                            ai_allowed_now = ai_available and (
+                                (not INDUSTRY_AI_UNCERTAIN_ONLY) or needs_ai_escalation
+                            )
 
-                            if ai_available and class_candidates and has_time_for_ai():
+                            if ai_allowed_now and class_candidates and has_time_for_ai() and (not rule_result):
                                 ai_attempted = True
                                 try:
                                     ai_res = await asyncio.wait_for(
@@ -6727,7 +6813,7 @@ async def process():
                                             "source": "ai",
                                         }
 
-                            industry_result = industry_result_ai
+                            industry_result = industry_result_ai or rule_result
 
                             lookup_name = ai_industry_val or industry_hint_val or industry_val
                             if (not industry_result) and INDUSTRY_NAME_LOOKUP_ENABLED and lookup_name:
@@ -6746,6 +6832,15 @@ async def process():
                                         "confidence": 0.7,
                                         "source": "name_exact",
                                     }
+
+                            if not industry_result:
+                                try:
+                                    industry_result = INDUSTRY_CLASSIFIER.classify_from_semantic_taxonomy(
+                                        description_val or "",
+                                        business_tags_val or "",
+                                    )
+                                except Exception:
+                                    industry_result = None
 
                             if not industry_result:
                                 try:
@@ -7229,22 +7324,6 @@ async def process():
                                     host_val = host_val[4:]
                                 return host_val
 
-                            def _top_and_margin(score_map: dict[str, Any]) -> tuple[int, int]:
-                                if not isinstance(score_map, dict) or not score_map:
-                                    return 0, 0
-                                vals: list[int] = []
-                                for v in score_map.values():
-                                    try:
-                                        vals.append(int(v))
-                                    except Exception:
-                                        continue
-                                if not vals:
-                                    return 0, 0
-                                vals.sort(reverse=True)
-                                top = vals[0]
-                                second = vals[1] if len(vals) > 1 else 0
-                                return top, max(0, top - second)
-
                             target_hosts = {_normalized_host(u) for u in target_urls if isinstance(u, str) and u.strip()}
                             target_hosts = {h for h in target_hosts if h}
 
@@ -7329,7 +7408,14 @@ async def process():
 
                             scores = INDUSTRY_CLASSIFIER.score_levels(score_blocks)
                             use_detail = bool(scores.get("use_detail"))
-                            industry_result_post: dict[str, Any] | None = None
+                            needs_ai_escalation = _needs_industry_ai_escalation(scores)
+                            rule_result_post = None
+                            if INDUSTRY_AI_UNCERTAIN_ONLY and (not needs_ai_escalation):
+                                rule_result_post = _build_rule_industry_result_from_scores(
+                                    scores,
+                                    source="rule_clear_post",
+                                )
+                            industry_result_post: dict[str, Any] | None = rule_result_post
                             detail_result_post: dict[str, Any] | None = None
                             ai_industry_name = ""
                             ai_attempted = False
@@ -7338,6 +7424,9 @@ async def process():
                                 and verifier is not None
                                 and hasattr(verifier, "judge_industry")
                                 and getattr(verifier, "industry_prompt", None)
+                            )
+                            ai_allowed_now = ai_available and (
+                                (not INDUSTRY_AI_UNCERTAIN_ONLY) or needs_ai_escalation
                             )
                             if description_val:
                                 ai_text = description_val
@@ -7441,7 +7530,7 @@ async def process():
                                 min_confidence: float,
                             ) -> tuple[dict[str, str] | None, dict[str, Any] | None]:
                                 nonlocal ai_attempted
-                                if not (ai_available and candidates and has_time_for_ai()):
+                                if not (ai_allowed_now and candidates and has_time_for_ai()):
                                     return None, None
                                 ai_attempted = True
                                 try:
@@ -7631,6 +7720,16 @@ async def process():
                             if not industry_result_post:
                                 alias_business_tags: Any = parsed_business_tags if parsed_business_tags else (business_tags_val or "")
                                 try:
+                                    industry_result_post = INDUSTRY_CLASSIFIER.classify_from_semantic_taxonomy(
+                                        description_val or "",
+                                        alias_business_tags,
+                                    )
+                                except Exception:
+                                    industry_result_post = None
+
+                            if not industry_result_post:
+                                alias_business_tags: Any = parsed_business_tags if parsed_business_tags else (business_tags_val or "")
+                                try:
                                     industry_result_post = INDUSTRY_CLASSIFIER.classify_from_aliases(
                                         description_val or "",
                                         alias_business_tags,
@@ -7642,7 +7741,7 @@ async def process():
                             if (
                                 industry_result_post
                                 and business_tags_val
-                                and ai_available
+                                and ai_allowed_now
                                 and has_time_for_ai()
                                 and float(industry_result_post.get("confidence") or 0.0) < 0.7
                             ):
@@ -7703,7 +7802,7 @@ async def process():
                                                 ai_industry_name = str(ai_res_tag.get("industry") or ai_industry_name)
 
                             # business_tags を強いヒントにして追加AI判定（最小限の再呼び出し）
-                            if (not industry_result_post) and ai_available and has_time_for_ai() and business_tags_val:
+                            if (not industry_result_post) and ai_allowed_now and has_time_for_ai() and business_tags_val:
                                 tag_list: list[str] = []
                                 try:
                                     if business_tags_val.strip().startswith("["):
@@ -7826,7 +7925,7 @@ async def process():
                                         if forced_candidate:
                                             forced_confidence = 0.45
 
-                                if (not forced_candidate) and ai_available and has_time_for_ai():
+                                if (not forced_candidate) and ai_allowed_now and has_time_for_ai():
                                     forced_candidates = INDUSTRY_CLASSIFIER.build_level_candidates(
                                         "minor",
                                         scores,
@@ -8330,6 +8429,16 @@ async def process():
                                     f.write(json.dumps(debug_payload, ensure_ascii=False) + "\n")
                             except Exception:
                                 log.debug("extract debug log skipped", exc_info=True)
+
+                        if INDUSTRY_CLASSIFY_ENABLED and INDUSTRY_CLASSIFIER.loaded:
+                            try:
+                                if name and not str(company.get("company_name") or "").strip():
+                                    company["company_name"] = name
+                                learned = INDUSTRY_CLASSIFIER.auto_learn_from_company(company, status=status)
+                                if learned > 0:
+                                    log.info("[%s] industry auto-learn updated terms=%s", cid, learned)
+                            except Exception:
+                                log.debug("[%s] industry auto-learn skipped", cid, exc_info=True)
 
                         manager.save_company_data(company, status=status)
                         log.info("[%s] 保存完了: status=%s elapsed=%.1fs (worker=%s)", cid, status, elapsed(), WORKER_ID)

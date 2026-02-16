@@ -735,6 +735,13 @@ class CompanyScraper:
             if token not in engines:
                 engines.append(token)
         self.search_engines = engines or ["startpage"]
+        # 1エンジンに長く張り付き過ぎると次エンジンへ進めず search_timeout になるため、上限秒を設ける。
+        try:
+            self.search_engine_timeout_sec = float(os.getenv("SEARCH_ENGINE_TIMEOUT_SEC", "12"))
+        except Exception:
+            self.search_engine_timeout_sec = 12.0
+        if self.search_engine_timeout_sec <= 0:
+            self.search_engine_timeout_sec = 0.0
         # 代表者は構造化ソース（テーブル/ラベル/JSON-LD）のみ許可するか
         self.rep_strict_sources = os.getenv("REP_STRICT_SOURCES", "true").lower() == "true"
         # ブラウザ操作専用セマフォ（HTTPとは別枠で制御し渋滞を防ぐ）
@@ -2000,18 +2007,14 @@ class CompanyScraper:
             return False
         host = (parsed.netloc or "").lower().split(":")[0]
         path = (parsed.path or "").lower()
+        # 検索エンジン自身のドメインは候補URLとして採用しない。
+        # CAPTCHA/ヘルプページが混入すると公式判定を誤らせるため、ホスト単位で除外する。
         if host.endswith("duckduckgo.com"):
-            return path.startswith("/l") or path.startswith("/html") or path.startswith("/anomaly")
+            return True
         if host.endswith("startpage.com"):
-            return (
-                path.startswith("/sp/search")
-                or path.startswith("/do/search")
-                or path.startswith("/do/asearch")
-                or path.startswith("/sp/click")
-                or path in {"", "/"}
-            )
+            return True
         if host.endswith("bing.com"):
-            return path.startswith("/search") or path.startswith("/ck/a")
+            return True
         return False
 
     def _clean_candidate_url(self, raw: str, source_base: str = "https://duckduckgo.com") -> Optional[str]:
@@ -2094,6 +2097,25 @@ class CompanyScraper:
             and ("are you human" in lowered or "verify you are human" in lowered or "robot" in lowered)
         ) or "captcha-delivery.com" in lowered
 
+    async def _fetch_startpage_via_proxy(self, query: str) -> str:
+        """
+        StartpageがBot対策/JS構成で通常取得できない場合の退避経路。
+        r.jina.ai 経由でテキスト化された検索結果を取得する。
+        """
+        try:
+            proxy_url = "https://r.jina.ai/https://www.startpage.com/sp/search"
+            resp = await asyncio.to_thread(
+                self._session_get,
+                proxy_url,
+                params={"query": query, "cat": "web", "language": "japanese"},
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=(5, 30),
+            )
+            resp.raise_for_status()
+            return resp.text or ""
+        except Exception:
+            return ""
+
     async def _fetch_startpage(self, query: str) -> str:
         headers = {
             "User-Agent": "Mozilla/5.0",
@@ -2103,6 +2125,7 @@ class CompanyScraper:
         endpoint_params = (
             ("https://www.startpage.com/sp/search", {"query": query, "cat": "web", "language": "japanese"}),
             ("https://www.startpage.com/do/search", {"query": query}),
+            ("https://www.startpage.com/search", {"query": query}),
         )
         for attempt in range(3):
             for endpoint, params in endpoint_params:
@@ -2119,6 +2142,7 @@ class CompanyScraper:
                     resp.raise_for_status()
                     text = resp.text or ""
                     if self._is_startpage_challenge(text):
+                        log.info("[search] startpage challenge detected endpoint=%s", endpoint)
                         continue
                     if text:
                         return text
@@ -2126,7 +2150,7 @@ class CompanyScraper:
                     continue
             if attempt < 2:
                 await asyncio.sleep(0.8 * (2 ** attempt))
-        return ""
+        return await self._fetch_startpage_via_proxy(query)
 
     async def _fetch_duckduckgo_via_proxy(self, query: str) -> str:
         try:
@@ -2182,6 +2206,17 @@ class CompanyScraper:
         # HTML構造変更時の保険として、StartpageのリダイレクトURLを生文字列から拾う
         for match in re.findall(r"(?:https?://(?:www\.)?startpage\.com)?/sp/click\?[^\s\"'<>]+", html or "", flags=re.IGNORECASE):
             cleaned = self._clean_candidate_url(match, source_base="https://www.startpage.com")
+            if not cleaned or self._is_excluded(cleaned):
+                continue
+            if cleaned in seen_cleaned:
+                continue
+            seen_cleaned.add(cleaned)
+            yield cleaned
+
+        # Proxy経由のMarkdown/テキスト結果から外部URLを直接抽出
+        for match in re.findall(r"https?://[^\s\"'<>]+", html or "", flags=re.IGNORECASE):
+            candidate = match.rstrip(").,;]")
+            cleaned = self._clean_candidate_url(candidate, source_base="https://www.startpage.com")
             if not cleaned or self._is_excluded(cleaned):
                 continue
             if cleaned in seen_cleaned:
@@ -3804,16 +3839,21 @@ class CompanyScraper:
         """
         検索エンジンで検索し、候補URLを返す（会社概要/企業情報/会社情報の固定クエリ）。
         """
+        debug_search = os.getenv("SEARCH_QUERY_DEBUG", "false").lower() == "true"
         key = (
             unicodedata.normalize("NFKC", company_name or "").strip(),
             unicodedata.normalize("NFKC", address or "").strip(),
         )
         cached = self.search_cache.get(key)
         if cached:
+            if debug_search:
+                log.info("[search_debug] cache_hit company=%s count=%d", company_name, len(cached))
             return list(cached)
         queries = self._build_company_queries(company_name, address)
         if not queries:
             return []
+        if debug_search:
+            log.info("[search_debug] company=%s queries=%s engines=%s", company_name, queries, self.search_engines)
 
         def _unique_queries(qs: list[str]) -> list[str]:
             seen: set[str] = set()
@@ -3835,10 +3875,25 @@ class CompanyScraper:
 
             async def run_engine(engine: str, q_idx: int, query: str) -> str:
                 if engine == "bing":
-                    return await self._fetch_bing(query)
-                if engine == "ddg":
-                    return await self._fetch_duckduckgo(query)
-                return await self._fetch_startpage(query)
+                    fetcher = self._fetch_bing
+                elif engine == "ddg":
+                    fetcher = self._fetch_duckduckgo
+                else:
+                    fetcher = self._fetch_startpage
+                timeout_sec = float(getattr(self, "search_engine_timeout_sec", 12.0) or 0.0)
+                if timeout_sec > 0:
+                    try:
+                        return await asyncio.wait_for(fetcher(query), timeout=timeout_sec)
+                    except asyncio.TimeoutError:
+                        log.info(
+                            "[search] engine timeout engine=%s qidx=%d timeout=%.1fs query=%s",
+                            engine,
+                            q_idx,
+                            timeout_sec,
+                            query,
+                        )
+                        return ""
+                return await fetcher(query)
 
             for q_idx, query in enumerate(qs):
                 for eng in engines:
@@ -3854,7 +3909,17 @@ class CompanyScraper:
                         extractor = self._extract_search_urls
                     else:
                         extractor = self._extract_startpage_urls
-                    for rank, url in enumerate(extractor(html)):
+                    extracted_urls = list(extractor(html))
+                    if debug_search:
+                        log.info(
+                            "[search_debug] company=%s engine=%s qidx=%d extracted=%d query=%s",
+                            company_name,
+                            eng,
+                            q_idx,
+                            len(extracted_urls),
+                            query,
+                        )
+                    for rank, url in enumerate(extracted_urls):
                         if url in seen:
                             continue
                         seen.add(url)
