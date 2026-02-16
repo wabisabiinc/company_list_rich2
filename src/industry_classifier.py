@@ -31,12 +31,14 @@ ALIAS_SEMANTIC_STRONG_MARGIN = float(os.getenv("INDUSTRY_ALIAS_SEMANTIC_STRONG_M
 ALIAS_SEMANTIC_MIN_PRIORITY = max(1, int(os.getenv("INDUSTRY_ALIAS_SEMANTIC_MIN_PRIORITY", "6")))
 ALIAS_SEMANTIC_MAX_PHRASES = max(1, int(os.getenv("INDUSTRY_ALIAS_SEMANTIC_MAX_PHRASES", "10")))
 ALIAS_SEMANTIC_MAX_HITS = max(1, int(os.getenv("INDUSTRY_ALIAS_SEMANTIC_MAX_HITS", "4")))
+ALIAS_SEMANTIC_ALLOW_STANDALONE = os.getenv("INDUSTRY_ALIAS_SEMANTIC_ALLOW_STANDALONE", "false").lower() == "true"
 SEMANTIC_TAXONOMY_ENABLED = os.getenv("INDUSTRY_SEMANTIC_TAXONOMY_ENABLED", "true").lower() == "true"
 SEMANTIC_TAXONOMY_MIN_SIM = float(os.getenv("INDUSTRY_SEMANTIC_TAXONOMY_MIN_SIM", "0.92"))
 SEMANTIC_TAXONOMY_MIN_MARGIN = float(os.getenv("INDUSTRY_SEMANTIC_TAXONOMY_MIN_MARGIN", "0.05"))
 SEMANTIC_TAXONOMY_MAX_HITS = max(1, int(os.getenv("INDUSTRY_SEMANTIC_TAXONOMY_MAX_HITS", "4")))
+SEMANTIC_TAXONOMY_REQUIRE_BOTH = os.getenv("INDUSTRY_SEMANTIC_TAXONOMY_REQUIRE_BOTH", "true").lower() == "true"
 DEFAULT_INDUSTRY_MEMORY_CSV_PATH = os.getenv("INDUSTRY_MEMORY_CSV_PATH", "data/industry_memory.csv")
-AUTO_LEARN_ENABLED = os.getenv("INDUSTRY_AUTO_LEARN_ENABLED", "true").lower() == "true"
+AUTO_LEARN_ENABLED = os.getenv("INDUSTRY_AUTO_LEARN_ENABLED", "false").lower() == "true"
 AUTO_LEARN_MIN_CONFIDENCE = float(os.getenv("INDUSTRY_AUTO_LEARN_MIN_CONFIDENCE", "0.78"))
 AUTO_LEARN_MIN_COUNT = max(1, int(os.getenv("INDUSTRY_AUTO_LEARN_MIN_COUNT", "2")))
 AUTO_LEARN_MAX_TERMS = max(1, int(os.getenv("INDUSTRY_AUTO_LEARN_MAX_TERMS", "6")))
@@ -1257,6 +1259,9 @@ class IndustryClassifier:
         best_sim = float(best_meta.get("best_sim") or 0.0)
         best_margin = float(best_meta.get("best_margin") or 0.0)
 
+        if SEMANTIC_TAXONOMY_REQUIRE_BOTH and not both_sources:
+            return None
+
         confidence = 0.38 + min(0.30, best_score * 0.20) + min(0.12, score_margin * 0.30)
         if both_sources:
             confidence += 0.06
@@ -1952,6 +1957,9 @@ class IndustryClassifier:
         best_score = int(best_meta.get("score") or 0)
         best_domain_tags = {str(v) for v in (best_meta.get("domain_tags") or set()) if str(v)}
 
+        if semantic_only and not ALIAS_SEMANTIC_ALLOW_STANDALONE:
+            return None
+
         # aliasヒットが複数ドメインをまたぐ/僅差で競合する場合は誤分類リスクが高い。
         domain_conflict = len(best_domain_tags) >= 2
         if len(ranked) >= 2:
@@ -2001,6 +2009,49 @@ class IndustryClassifier:
             "alias_matches": sorted(list(best_meta.get("aliases") or [])),
             "alias_domain_tags": sorted(list(best_meta.get("domain_tags") or [])),
         }
+
+    def match_tags_to_taxonomy(
+        self,
+        business_tags: Any,
+        *,
+        min_sim: float = 0.95,
+        min_margin: float = 0.08,
+        max_per_tag: int = 1,
+    ) -> list[dict[str, Any]]:
+        if (
+            not self.loaded
+            or not self.semantic_taxonomy_enabled
+            or self.semantic_embedder is None
+            or not self._semantic_taxonomy_codes
+        ):
+            return []
+        tag_values = self._iter_tag_values(business_tags)
+        if not tag_values:
+            return []
+        out: list[dict[str, Any]] = []
+        for tag in tag_values:
+            hits = self._semantic_taxonomy_hits_for_text(tag, source="tag")
+            if not hits:
+                continue
+            picked = 0
+            for hit in hits:
+                if hit.sim < min_sim or hit.margin < min_margin:
+                    continue
+                candidate = self._resolve_candidate_from_code(hit.minor_code)
+                if not candidate:
+                    continue
+                out.append(
+                    {
+                        "tag": str(tag),
+                        **candidate,
+                        "sim": float(hit.sim),
+                        "margin": float(hit.margin),
+                    }
+                )
+                picked += 1
+                if picked >= max_per_tag:
+                    break
+        return out
 
     def score_levels(self, text_blocks: list[str]) -> dict[str, Any]:
         if not self.loaded:

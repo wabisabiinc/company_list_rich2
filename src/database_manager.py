@@ -409,6 +409,39 @@ class DatabaseManager:
         if "industry_class_confidence" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN industry_class_confidence REAL;")
             cols.add("industry_class_confidence")
+        if "industry_suggested_major_code" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_suggested_major_code TEXT;")
+            cols.add("industry_suggested_major_code")
+        if "industry_suggested_major" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_suggested_major TEXT;")
+            cols.add("industry_suggested_major")
+        if "industry_suggested_middle_code" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_suggested_middle_code TEXT;")
+            cols.add("industry_suggested_middle_code")
+        if "industry_suggested_middle" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_suggested_middle TEXT;")
+            cols.add("industry_suggested_middle")
+        if "industry_suggested_minor_code" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_suggested_minor_code TEXT;")
+            cols.add("industry_suggested_minor_code")
+        if "industry_suggested_minor" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_suggested_minor TEXT;")
+            cols.add("industry_suggested_minor")
+        if "industry_suggested_minor_item_code" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_suggested_minor_item_code TEXT;")
+            cols.add("industry_suggested_minor_item_code")
+        if "industry_suggested_minor_item" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_suggested_minor_item TEXT;")
+            cols.add("industry_suggested_minor_item")
+        if "industry_suggested_source" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_suggested_source TEXT;")
+            cols.add("industry_suggested_source")
+        if "industry_suggested_confidence" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_suggested_confidence REAL;")
+            cols.add("industry_suggested_confidence")
+        if "industry_tag_matches" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_tag_matches TEXT;")
+            cols.add("industry_tag_matches")
         if "contact_url" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN contact_url TEXT;")
             cols.add("contact_url")
@@ -1340,6 +1373,17 @@ class DatabaseManager:
         set_value("industry_minor_item", company.get("industry_minor_item", "") or "")
         set_value("industry_class_source", company.get("industry_class_source", "") or "")
         set_value("industry_class_confidence", company.get("industry_class_confidence"))
+        set_value("industry_suggested_major_code", company.get("industry_suggested_major_code", "") or "")
+        set_value("industry_suggested_major", company.get("industry_suggested_major", "") or "")
+        set_value("industry_suggested_middle_code", company.get("industry_suggested_middle_code", "") or "")
+        set_value("industry_suggested_middle", company.get("industry_suggested_middle", "") or "")
+        set_value("industry_suggested_minor_code", company.get("industry_suggested_minor_code", "") or "")
+        set_value("industry_suggested_minor", company.get("industry_suggested_minor", "") or "")
+        set_value("industry_suggested_minor_item_code", company.get("industry_suggested_minor_item_code", "") or "")
+        set_value("industry_suggested_minor_item", company.get("industry_suggested_minor_item", "") or "")
+        set_value("industry_suggested_source", company.get("industry_suggested_source", "") or "")
+        set_value("industry_suggested_confidence", company.get("industry_suggested_confidence"))
+        set_value("industry_tag_matches", company.get("industry_tag_matches", "") or "")
         set_value("contact_url", company.get("contact_url", "") or "")
         set_value("contact_url_source", company.get("contact_url_source", "") or "")
         set_value("contact_url_score", company.get("contact_url_score"))

@@ -166,7 +166,7 @@ INDUSTRY_CLASSIFY_AFTER_HOMEPAGE = os.getenv("INDUSTRY_CLASSIFY_AFTER_HOMEPAGE",
 INDUSTRY_RULE_MIN_SCORE = max(1, int(os.getenv("INDUSTRY_RULE_MIN_SCORE", "2")))
 INDUSTRY_AI_ENABLED = os.getenv("INDUSTRY_AI_ENABLED", "true").lower() == "true"
 INDUSTRY_AI_TOP_N = max(5, int(os.getenv("INDUSTRY_AI_TOP_N", "12")))
-INDUSTRY_AI_MIN_CONFIDENCE = float(os.getenv("INDUSTRY_AI_MIN_CONFIDENCE", "0.50"))
+INDUSTRY_AI_MIN_CONFIDENCE = float(os.getenv("INDUSTRY_AI_MIN_CONFIDENCE", "0.60"))
 # AI分類を1回のプロンプトで完結させる（候補を絞って単発で判定）
 INDUSTRY_AI_SINGLE_PASS = (os.getenv("INDUSTRY_AI_SINGLE_PASS", "true") or "true").strip().lower() == "true"
 # 業種AIの本文スニペット最大長（description + tags + 会社概要ページ）
@@ -196,14 +196,22 @@ CONTACT_URL_AI_MIN_CONFIDENCE = float(os.getenv("CONTACT_URL_AI_MIN_CONFIDENCE",
 BUSINESS_TAGS_MODE = (os.getenv("BUSINESS_TAGS_MODE", "extract") or "extract").strip().lower()
 # business_tags から業種階層を補完するか
 TAG_HIERARCHY_FILL = (os.getenv("TAG_HIERARCHY_FILL", "true") or "true").strip().lower() == "true"
+# TAG_HIERARCHY_FILL を弱める（閾値を厳しめにする）
+TAG_HIERARCHY_STRICT = os.getenv("TAG_HIERARCHY_STRICT", "true").lower() == "true"
 # business_tags をAIで関連度フィルタするか
 BUSINESS_TAGS_AI_FILTER = (os.getenv("BUSINESS_TAGS_AI_FILTER", "true") or "true").strip().lower() == "true"
 # ノイズが多いときにAIでタグを置き換え/整形するか（新規タグ許可）
-BUSINESS_TAGS_AI_REWRITE = (os.getenv("BUSINESS_TAGS_AI_REWRITE", "true") or "true").strip().lower() == "true"
+BUSINESS_TAGS_AI_REWRITE = (os.getenv("BUSINESS_TAGS_AI_REWRITE", "false") or "false").strip().lower() == "true"
 # business_tags は必ずAIを通すか（AI不可なら空欄にする）
 BUSINESS_TAGS_REQUIRE_AI = (os.getenv("BUSINESS_TAGS_REQUIRE_AI", "true") or "true").strip().lower() == "true"
 # business_tags の上限（0以下なら無制限）
 BUSINESS_TAGS_LIMIT = int(os.getenv("BUSINESS_TAGS_LIMIT", "0") or "0")
+INDUSTRY_EVIDENCE_MIN_CHARS = max(0, int(os.getenv("INDUSTRY_EVIDENCE_MIN_CHARS", "220")))
+INDUSTRY_EVIDENCE_MIN_DESC_CHARS = max(0, int(os.getenv("INDUSTRY_EVIDENCE_MIN_DESC_CHARS", "40")))
+INDUSTRY_TAG_MATCH_MIN_SIM = float(os.getenv("INDUSTRY_TAG_MATCH_MIN_SIM", "0.95"))
+INDUSTRY_TAG_MATCH_MIN_MARGIN = float(os.getenv("INDUSTRY_TAG_MATCH_MIN_MARGIN", "0.08"))
+INDUSTRY_TAG_MATCH_MIN_MAJOR_COUNT = max(1, int(os.getenv("INDUSTRY_TAG_MATCH_MIN_MAJOR_COUNT", "2")))
+INDUSTRY_TAG_MATCH_REQUIRE_UNIQUE_MAJOR = os.getenv("INDUSTRY_TAG_MATCH_REQUIRE_UNIQUE_MAJOR", "true").lower() == "true"
 
 # 暫定URL（provisional_*）を homepage として保存するかどうか。
 # - false の場合でも provisional_homepage/final_homepage には記録する。
@@ -2379,6 +2387,18 @@ _BAD_BUSINESS_TAG_PATTERNS = re.compile(
     r"(bad request|not found|forbidden|access denied|timeout|timed out|error|エラー|タイムアウト|アクセス拒否)",
     re.IGNORECASE,
 )
+_BUSINESS_TAGS_NOISE_TERMS: set[str] = {
+    "事業", "サービス", "製品", "商品", "提供", "運営", "管理",
+    "開発", "販売", "設計", "施工", "製造", "加工", "保守",
+    "メンテナンス", "サポート", "支援", "企画", "制作", "運用",
+    "コンサル", "コンサルティング", "ソリューション", "システム",
+    "プラットフォーム",
+}
+_BUSINESS_TAGS_NOISE_TERMS_NORM = {norm_text_compact(t) for t in _BUSINESS_TAGS_NOISE_TERMS if t}
+_BUSINESS_TAGS_NOISE_PATTERNS = re.compile(
+    r"(会社概要|企業情報|会社情報|お問い合わせ|お問合せ|採用|求人|アクセス|プライバシー|サイトマップ|利用規約|免責|ニュース|お知らせ|ブログ|IR|CSR|沿革|代表挨拶)",
+    re.IGNORECASE,
+)
 
 
 def _sanitize_business_tags(tags: list[str]) -> list[str]:
@@ -2392,12 +2412,119 @@ def _sanitize_business_tags(tags: list[str]) -> list[str]:
             continue
         if _BAD_BUSINESS_TAG_PATTERNS.search(t):
             continue
+        if _BUSINESS_TAGS_NOISE_PATTERNS.search(t):
+            continue
         key = norm_text_compact(t)
         if not key or key in seen:
+            continue
+        if key in _BUSINESS_TAGS_NOISE_TERMS_NORM:
             continue
         seen.add(key)
         out.append(t)
     return out
+
+
+def _build_industry_suggested_fields(
+    industry_result: dict[str, Any] | None,
+    detail_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    out = {
+        "industry_suggested_major_code": "",
+        "industry_suggested_major": "",
+        "industry_suggested_middle_code": "",
+        "industry_suggested_middle": "",
+        "industry_suggested_minor_code": "",
+        "industry_suggested_minor": "",
+        "industry_suggested_minor_item_code": "",
+        "industry_suggested_minor_item": "",
+        "industry_suggested_source": "",
+        "industry_suggested_confidence": 0.0,
+    }
+    if not industry_result:
+        return out
+
+    out["industry_suggested_source"] = str(industry_result.get("source") or "")
+    try:
+        out["industry_suggested_confidence"] = float(industry_result.get("confidence") or 0.0)
+    except Exception:
+        out["industry_suggested_confidence"] = 0.0
+
+    minor_item_code = ""
+    minor_item_name = ""
+    minor_code_raw = str(industry_result.get("minor_code") or "").strip()
+    if minor_code_raw and minor_code_raw in INDUSTRY_CLASSIFIER.taxonomy.detail_names:
+        (
+            major_code,
+            major_name,
+            middle_code,
+            middle_name,
+            minor_code,
+            minor_name,
+            detail_code,
+            detail_name,
+        ) = INDUSTRY_CLASSIFIER.taxonomy.resolve_detail_hierarchy(minor_code_raw)
+        out["industry_suggested_major_code"] = major_code
+        out["industry_suggested_major"] = major_name
+        out["industry_suggested_middle_code"] = middle_code
+        out["industry_suggested_middle"] = middle_name
+        out["industry_suggested_minor_code"] = minor_code
+        out["industry_suggested_minor"] = minor_name
+        minor_item_code = detail_code
+        minor_item_name = detail_name
+    else:
+        out["industry_suggested_major_code"] = str(industry_result.get("major_code") or "")
+        out["industry_suggested_major"] = str(industry_result.get("major_name") or "")
+        out["industry_suggested_middle_code"] = str(industry_result.get("middle_code") or "")
+        out["industry_suggested_middle"] = str(industry_result.get("middle_name") or "")
+        out["industry_suggested_minor_code"] = str(industry_result.get("minor_code") or "")
+        out["industry_suggested_minor"] = str(industry_result.get("minor_name") or "")
+
+    if detail_result and not minor_item_code:
+        detail_code_raw = str(detail_result.get("minor_code") or "").strip()
+        if detail_code_raw and detail_code_raw in INDUSTRY_CLASSIFIER.taxonomy.detail_names:
+            (
+                _d_major_code,
+                _d_major_name,
+                _d_middle_code,
+                _d_middle_name,
+                d_minor_code,
+                _d_minor_name,
+                d_detail_code,
+                d_detail_name,
+            ) = INDUSTRY_CLASSIFIER.taxonomy.resolve_detail_hierarchy(detail_code_raw)
+            if d_minor_code and d_minor_code == out.get("industry_suggested_minor_code"):
+                minor_item_code = d_detail_code
+                minor_item_name = d_detail_name
+
+    if minor_item_code:
+        out["industry_suggested_minor_item_code"] = minor_item_code
+        out["industry_suggested_minor_item"] = minor_item_name
+    elif out["industry_suggested_minor_code"] and out["industry_suggested_minor"]:
+        out["industry_suggested_minor_item_code"] = out["industry_suggested_minor_code"]
+        out["industry_suggested_minor_item"] = out["industry_suggested_minor"]
+
+    return out
+
+
+def _filter_tag_matches_by_major(matches: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not matches:
+        return []
+    counts: dict[str, int] = {}
+    for m in matches:
+        major_code = str(m.get("major_code") or "").strip()
+        if not major_code:
+            continue
+        counts[major_code] = counts.get(major_code, 0) + 1
+    if not counts:
+        return []
+    ranked = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+    best_major, best_count = ranked[0]
+    if INDUSTRY_TAG_MATCH_REQUIRE_UNIQUE_MAJOR:
+        if len(ranked) >= 2 and ranked[1][1] == best_count:
+            return []
+    if best_count < INDUSTRY_TAG_MATCH_MIN_MAJOR_COUNT:
+        return []
+    return [m for m in matches if str(m.get("major_code") or "").strip() == best_major]
 
 
 def _build_candidates_from_concept_context(
@@ -3263,6 +3390,17 @@ async def process():
             industry_minor_code = ""
             industry_class_source = ""
             industry_class_confidence = 0.0
+            industry_suggested_major_code = ""
+            industry_suggested_major = ""
+            industry_suggested_middle_code = ""
+            industry_suggested_middle = ""
+            industry_suggested_minor_code = ""
+            industry_suggested_minor = ""
+            industry_suggested_minor_item_code = ""
+            industry_suggested_minor_item = ""
+            industry_suggested_source = ""
+            industry_suggested_confidence = 0.0
+            industry_tag_matches_val = ""
             contact_url = ""
             contact_url_source = ""
             contact_url_score = 0.0
@@ -6904,7 +7042,7 @@ async def process():
                                         verifier.filter_business_tags(
                                             ai_text,
                                             tag_candidates,
-                                            allow_new=bool(BUSINESS_TAGS_AI_REWRITE or not tag_candidates),
+                                            allow_new=bool(BUSINESS_TAGS_AI_REWRITE),
                                         ),
                                         timeout=clamp_timeout(ai_call_timeout),
                                     )
@@ -6974,6 +7112,14 @@ async def process():
                                 blocks.extend(extra_blocks_pre)
                             if parsed_business_tags_pre:
                                 blocks.extend(parsed_business_tags_pre)
+
+                            evidence_chars_pre = sum(len(b) for b in blocks if isinstance(b, str))
+                            desc_chars_pre = len(description_val or "")
+                            low_evidence_pre = (
+                                INDUSTRY_EVIDENCE_MIN_CHARS > 0
+                                and evidence_chars_pre < INDUSTRY_EVIDENCE_MIN_CHARS
+                                and desc_chars_pre < INDUSTRY_EVIDENCE_MIN_DESC_CHARS
+                            )
 
                             concept_context_pre = _build_concept_context_for_industry(
                                 company_id=cid,
@@ -7081,6 +7227,8 @@ async def process():
                             rule_result = None
                             needs_ai_escalation = _needs_industry_ai_escalation(scores)
                             allow_non_ai_fallback = (not INDUSTRY_REQUIRE_AI) and INDUSTRY_RULE_FALLBACK_ENABLED
+                            if low_evidence_pre:
+                                allow_non_ai_fallback = False
                             if (
                                 allow_non_ai_fallback
                                 and INDUSTRY_AI_UNCERTAIN_ONLY
@@ -7094,6 +7242,8 @@ async def process():
                             ai_allowed_now = ai_available and (
                                 INDUSTRY_REQUIRE_AI or (not INDUSTRY_AI_UNCERTAIN_ONLY) or needs_ai_escalation
                             )
+                            if low_evidence_pre:
+                                ai_allowed_now = False
 
                             if ai_allowed_now and class_candidates and has_time_for_ai() and (not rule_result):
                                 ai_attempted = True
@@ -7131,6 +7281,11 @@ async def process():
                                         }
 
                             industry_result = industry_result_ai or rule_result
+                            if low_evidence_pre:
+                                industry_result = None
+                                industry_class_source = (industry_class_source or "unclassified") + "|low_evidence"
+                                industry_class_confidence = 0.0
+                                force_review = True
 
                             lookup_name = ai_industry_val or industry_hint_val or industry_val
                             fallback_allowed = allow_non_ai_fallback
@@ -7207,6 +7362,23 @@ async def process():
                                     industry_class_source = (industry_class_source or "unclassified") + "|major_unconfirmed"
                                     industry_class_confidence = 0.0
                                     force_review = True
+
+                            if industry_result and bool(industry_result.get("review_required")):
+                                suggested = _build_industry_suggested_fields(industry_result)
+                                industry_suggested_major_code = suggested.get("industry_suggested_major_code", "")
+                                industry_suggested_major = suggested.get("industry_suggested_major", "")
+                                industry_suggested_middle_code = suggested.get("industry_suggested_middle_code", "")
+                                industry_suggested_middle = suggested.get("industry_suggested_middle", "")
+                                industry_suggested_minor_code = suggested.get("industry_suggested_minor_code", "")
+                                industry_suggested_minor = suggested.get("industry_suggested_minor", "")
+                                industry_suggested_minor_item_code = suggested.get("industry_suggested_minor_item_code", "")
+                                industry_suggested_minor_item = suggested.get("industry_suggested_minor_item", "")
+                                industry_suggested_source = suggested.get("industry_suggested_source", "")
+                                industry_suggested_confidence = float(suggested.get("industry_suggested_confidence") or 0.0)
+                                industry_result = None
+                                industry_class_source = (industry_class_source or "unclassified") + "|review_required"
+                                industry_class_confidence = 0.0
+                                force_review = True
 
                             final_industry_name = ""
                             if industry_result:
@@ -7406,6 +7578,17 @@ async def process():
                             "industry_minor": industry_minor,
                             "industry_class_source": industry_class_source,
                             "industry_class_confidence": industry_class_confidence,
+                            "industry_suggested_major_code": industry_suggested_major_code,
+                            "industry_suggested_major": industry_suggested_major,
+                            "industry_suggested_middle_code": industry_suggested_middle_code,
+                            "industry_suggested_middle": industry_suggested_middle,
+                            "industry_suggested_minor_code": industry_suggested_minor_code,
+                            "industry_suggested_minor": industry_suggested_minor,
+                            "industry_suggested_minor_item_code": industry_suggested_minor_item_code,
+                            "industry_suggested_minor_item": industry_suggested_minor_item,
+                            "industry_suggested_source": industry_suggested_source,
+                            "industry_suggested_confidence": industry_suggested_confidence,
+                            "industry_tag_matches": industry_tag_matches_val,
                             "contact_url": contact_url,
                             "contact_url_source": contact_url_source,
                             "contact_url_score": contact_url_score,
@@ -7725,6 +7908,14 @@ async def process():
                                 dedup_industry_blocks.append(bb)
                             industry_blocks = dedup_industry_blocks[:20]
 
+                            evidence_chars_post = sum(len(b) for b in industry_blocks if isinstance(b, str))
+                            desc_chars_post = len(description_val or "")
+                            low_evidence_post = (
+                                INDUSTRY_EVIDENCE_MIN_CHARS > 0
+                                and evidence_chars_post < INDUSTRY_EVIDENCE_MIN_CHARS
+                                and desc_chars_post < INDUSTRY_EVIDENCE_MIN_DESC_CHARS
+                            )
+
                             # スコア計算も本文→descriptionを優先。タグは industry_blocks 経由で含まれる。
                             score_blocks = list(industry_blocks)
 
@@ -7765,6 +7956,7 @@ async def process():
                             detail_result_post: dict[str, Any] | None = None
                             ai_industry_name = ""
                             ai_attempted = False
+                            skip_tag_hierarchy_fill = False
                             ai_available = (
                                 INDUSTRY_AI_ENABLED
                                 and verifier is not None
@@ -7774,6 +7966,16 @@ async def process():
                             ai_allowed_now = ai_available and (
                                 INDUSTRY_REQUIRE_AI or (not INDUSTRY_AI_UNCERTAIN_ONLY) or needs_ai_escalation
                             )
+                            if low_evidence_post:
+                                allow_non_ai_fallback = False
+                                ai_allowed_now = False
+                                rule_result_post = None
+                                industry_result_post = None
+                                detail_result_post = None
+                                industry_class_source = (industry_class_source or "unclassified") + "|low_evidence"
+                                industry_class_confidence = 0.0
+                                force_review = True
+                                skip_tag_hierarchy_fill = True
                             ai_text = build_industry_ai_text(
                                 description=description_val or "",
                                 tags=parsed_business_tags,
@@ -8495,7 +8697,22 @@ async def process():
                                     force_review = True
 
                             if industry_result_post and bool(industry_result_post.get("review_required")):
+                                suggested = _build_industry_suggested_fields(industry_result_post, detail_result_post)
+                                industry_suggested_major_code = suggested.get("industry_suggested_major_code", "")
+                                industry_suggested_major = suggested.get("industry_suggested_major", "")
+                                industry_suggested_middle_code = suggested.get("industry_suggested_middle_code", "")
+                                industry_suggested_middle = suggested.get("industry_suggested_middle", "")
+                                industry_suggested_minor_code = suggested.get("industry_suggested_minor_code", "")
+                                industry_suggested_minor = suggested.get("industry_suggested_minor", "")
+                                industry_suggested_minor_item_code = suggested.get("industry_suggested_minor_item_code", "")
+                                industry_suggested_minor_item = suggested.get("industry_suggested_minor_item", "")
+                                industry_suggested_source = suggested.get("industry_suggested_source", "")
+                                industry_suggested_confidence = float(suggested.get("industry_suggested_confidence") or 0.0)
+                                industry_result_post = None
+                                industry_class_source = (industry_class_source or "unclassified") + "|review_required"
+                                industry_class_confidence = 0.0
                                 force_review = True
+                                skip_tag_hierarchy_fill = True
 
                             if industry_result_post:
                                 minor_item_code = ""
@@ -8597,27 +8814,38 @@ async def process():
                                             tag_list_for_major = [str(t).strip() for t in maybe if str(t).strip()]
                                 except Exception:
                                     pass
+                            if skip_tag_hierarchy_fill:
+                                tag_list_for_major = []
                             tag_list_for_major = _sanitize_business_tags(tag_list_for_major)
                             tag_major_code = ""
                             tag_major_name = ""
-                            if TAG_HIERARCHY_FILL and tag_list_for_major:
+                            if TAG_HIERARCHY_FILL and (not skip_tag_hierarchy_fill) and tag_list_for_major:
                                 tag_major_code, tag_major_name, tag_major_count, tag_major_margin = _major_from_business_tags(tag_list_for_major)
                             else:
                                 tag_major_code = tag_major_name = ""
                                 tag_major_count = tag_major_margin = 0
 
-                            if tag_major_code and tag_major_name and TAG_HIERARCHY_FILL:
+                            if tag_major_code and tag_major_name and TAG_HIERARCHY_FILL and (not skip_tag_hierarchy_fill):
                                 major_conflict = bool(industry_major_code and industry_major_code != tag_major_code)
                                 weak_conf = float(industry_class_confidence or 0.0) < 0.55
                                 unknown_major = (not industry_major_code) or (industry_major in {"", "不明"})
                                 major_info_signal = _has_info_comm_signal(tag_list_for_major)
-                                if major_info_signal:
-                                    strong_major_signal = (tag_major_count >= 2) and (tag_major_margin >= 1)
+                                if TAG_HIERARCHY_STRICT:
+                                    if major_info_signal:
+                                        strong_major_signal = (tag_major_count >= 3) and (tag_major_margin >= 2)
+                                    else:
+                                        strong_major_signal = (
+                                            (tag_major_count >= 4 and tag_major_margin >= 2)
+                                            or (tag_major_count >= 3 and tag_major_margin >= 3)
+                                        )
                                 else:
-                                    strong_major_signal = (
-                                        (tag_major_count >= 3 and tag_major_margin >= 1)
-                                        or (tag_major_count >= 2 and tag_major_margin >= 2)
-                                    )
+                                    if major_info_signal:
+                                        strong_major_signal = (tag_major_count >= 2) and (tag_major_margin >= 1)
+                                    else:
+                                        strong_major_signal = (
+                                            (tag_major_count >= 3 and tag_major_margin >= 1)
+                                            or (tag_major_count >= 2 and tag_major_margin >= 2)
+                                        )
                                 if (unknown_major or (major_conflict and weak_conf)) and strong_major_signal:
                                     industry_major_code = tag_major_code
                                     industry_major = tag_major_name
@@ -8630,7 +8858,7 @@ async def process():
                                     industry_class_confidence = min(float(industry_class_confidence or 0.6), 0.6)
 
                             # 中/小分類もタグで補完（同一大分類内かつ不明/低信頼なときだけ）
-                            need_middle_minor = TAG_HIERARCHY_FILL and industry_major_code and (
+                            need_middle_minor = (not skip_tag_hierarchy_fill) and TAG_HIERARCHY_FILL and industry_major_code and (
                                 (not industry_middle_code) or (industry_middle in {"", "不明"}) or (not industry_minor_code) or (industry_minor in {"", "不明"})
                             )
                             if need_middle_minor and tag_list_for_major:
@@ -8640,8 +8868,12 @@ async def process():
                                 info_signal = _has_info_comm_signal(tag_list_for_major)
                                 # 通常: 3ヒット以上 & margin>=2
                                 # 情報通信系シグナルあり: 2ヒット以上 & margin>=1
-                                need_count = 2 if info_signal else 3
-                                need_margin = 1 if info_signal else 2
+                                if TAG_HIERARCHY_STRICT:
+                                    need_count = 3 if info_signal else 4
+                                    need_margin = 2 if info_signal else 3
+                                else:
+                                    need_count = 2 if info_signal else 3
+                                    need_margin = 1 if info_signal else 2
                                 if best_h and best_count >= need_count and best_margin >= need_margin:
                                     industry_middle_code = best_h.get("middle_code") or industry_middle_code
                                     industry_middle = best_h.get("middle_name") or industry_middle or "不明"
@@ -8651,10 +8883,13 @@ async def process():
                                     industry_class_confidence = min(float(industry_class_confidence or 0.6), 0.6)
 
                             # --- 強い業種タグによる最終フォールバック & 矛盾ガード ---
-                            if TAG_HIERARCHY_FILL and tag_list_for_major:
+                            if TAG_HIERARCHY_FILL and (not skip_tag_hierarchy_fill) and tag_list_for_major:
                                 # 最低2ヒットかつmargin>=1のときだけ大分類補完を許可する。
                                 strong_major, strong_hits, strong_margin = _pick_strong_major_from_tags(tag_list_for_major)
-                                strong_major_signal = (strong_hits >= 2) and (strong_margin >= 1)
+                                if TAG_HIERARCHY_STRICT:
+                                    strong_major_signal = (strong_hits >= 3) and (strong_margin >= 2)
+                                else:
+                                    strong_major_signal = (strong_hits >= 2) and (strong_margin >= 1)
                                 if strong_major and strong_major_signal:
                                     deny_set = MAJOR_DENY_MAP.get(strong_major, set())
                                     if industry_major and industry_major in deny_set:
@@ -8737,6 +8972,16 @@ async def process():
                                     company["industry_minor_item"] = (industry_val or "分類不能の産業")[:60]
                             company["industry_class_source"] = industry_class_source or "unclassified"
                             company["industry_class_confidence"] = float(industry_class_confidence or 0.0)
+                            company["industry_suggested_major_code"] = industry_suggested_major_code
+                            company["industry_suggested_major"] = industry_suggested_major
+                            company["industry_suggested_middle_code"] = industry_suggested_middle_code
+                            company["industry_suggested_middle"] = industry_suggested_middle
+                            company["industry_suggested_minor_code"] = industry_suggested_minor_code
+                            company["industry_suggested_minor"] = industry_suggested_minor
+                            company["industry_suggested_minor_item_code"] = industry_suggested_minor_item_code
+                            company["industry_suggested_minor_item"] = industry_suggested_minor_item
+                            company["industry_suggested_source"] = industry_suggested_source
+                            company["industry_suggested_confidence"] = float(industry_suggested_confidence or 0.0)
                             company["business_tags"] = business_tags_val
                             # 業種確定後に description へ反映（業種が判明時のみ付与）
                             final_industry_for_desc = str(company.get("industry") or industry_val or "").strip()
@@ -8905,6 +9150,26 @@ async def process():
                                 log.debug("extract debug log skipped", exc_info=True)
 
                         if INDUSTRY_CLASSIFY_ENABLED and INDUSTRY_CLASSIFIER.loaded:
+                            try:
+                                tag_source = _sanitize_business_tags(
+                                    _parse_business_tags_value(company.get("business_tags") or "")
+                                )
+                                matches = INDUSTRY_CLASSIFIER.match_tags_to_taxonomy(
+                                    tag_source,
+                                    min_sim=INDUSTRY_TAG_MATCH_MIN_SIM,
+                                    min_margin=INDUSTRY_TAG_MATCH_MIN_MARGIN,
+                                    max_per_tag=1,
+                                )
+                                matches = _filter_tag_matches_by_major(matches)
+                                if matches:
+                                    industry_tag_matches_val = json.dumps(matches, ensure_ascii=False)
+                                else:
+                                    industry_tag_matches_val = ""
+                                company["industry_tag_matches"] = industry_tag_matches_val
+                            except Exception:
+                                industry_tag_matches_val = ""
+                                company["industry_tag_matches"] = ""
+
                             try:
                                 if name and not str(company.get("company_name") or "").strip():
                                     company["company_name"] = name
