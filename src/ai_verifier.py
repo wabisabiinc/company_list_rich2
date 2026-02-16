@@ -319,6 +319,7 @@ class AIVerifier:
         # 追加の品質ルール（任意）。スキーマを含めない前提で、各プロンプト末尾に添付して使う。
         self.quality_context = self._load_quality_context()
         self.contact_form_prompt = self._load_contact_form_prompt()
+        self.industry_prompt_version = ""
         self.industry_prompt = self._load_industry_prompt()
 
         if model is not None:
@@ -413,6 +414,7 @@ class AIVerifier:
             if not content:
                 return None
             digest = hashlib.sha256(content.encode("utf-8")).hexdigest()[:8]
+            self.industry_prompt_version = f"sha256:{digest}"
             log.info("AIVerifier: loaded industry prompt from %s (sha256[:8]=%s)", path, digest)
             return content
         except Exception as e:
@@ -490,7 +492,7 @@ class AIVerifier:
             "次の要件を満たす description を JSON のみで返してください（説明文やマークダウンは禁止）。\n"
             "- 日本語1文・80〜160文字\n"
             "- 会社名を必ず含める（対象企業の表記をそのまま使用。先頭推奨）\n"
-            "- 業種ヒントがある場合は業種を含める（根拠が弱い場合は業種なしでも可）\n"
+            "- 業種ヒントがある場合は業種を必ず含める（根拠が弱い場合は null）\n"
             "- 事業内容のみ（問い合わせ/採用/アクセス/所在地/電話/URL/メール/代表者情報は除外）\n"
             "- 「当社/弊社」など一人称は使わない\n"
             "ルール: 文章内に必ず次のいずれかの「事業動詞/キーワード」を含める（例: 製造/開発/販売/提供/運営/施工/設計/支援/卸売/小売/仲介/運用/保守/メンテナンス）。根拠が弱い場合は null。\n"
@@ -1424,12 +1426,29 @@ class AIVerifier:
         text: str,
         company_name: str,
         candidates_text: str,
+        *,
+        concept_context: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         if not self.model or not self.industry_prompt:
             return None
         snippet = (text or "").strip()
         if len(snippet) > 3500:
             snippet = snippet[:3500]
+        concept_json = ""
+        topk_ids: list[str] = []
+        if isinstance(concept_context, dict) and concept_context:
+            try:
+                concept_json = json.dumps(concept_context, ensure_ascii=False)
+            except Exception:
+                concept_json = ""
+            topk_raw = concept_context.get("concept_topk_union")
+            if isinstance(topk_raw, list):
+                for val in topk_raw:
+                    cid = str(val or "").strip()
+                    if cid and cid not in topk_ids:
+                        topk_ids.append(cid)
+            if len(concept_json) > 3500:
+                concept_json = concept_json[:3500]
         prompt = (
             f"{self.industry_prompt}\n\n"
             f"企業名: {company_name or '不明'}\n"
@@ -1438,6 +1457,18 @@ class AIVerifier:
             "- ただし最終判断は本文全体の収益源/提供価値との整合で行う。\n"
             "候補一覧:\n"
             f"{candidates_text or '（候補なし）'}\n\n"
+            + (
+                (
+                    "Concept正規化情報（前処理）:\n"
+                    f"{concept_json}\n\n"
+                    "Concept制約:\n"
+                    "- selected_concept_id は concept_topk_union 内のIDを優先して選ぶ。\n"
+                    "- topk外を選ぶ場合は outside_topk_reason と outside_topk_evidence を必須で返す。\n\n"
+                )
+                if concept_json
+                else ""
+            )
+            +
             f"本文抜粋:\n{snippet}\n"
         )
         try:
@@ -1448,6 +1479,39 @@ class AIVerifier:
             data = _extract_first_json(raw)
             if not isinstance(data, dict):
                 return None
+
+            def _needs_concept_retry(result: Dict[str, Any], concept_ids: list[str]) -> bool:
+                if not concept_ids:
+                    return False
+                selected = str(result.get("selected_concept_id") or "").strip()
+                if selected and selected in concept_ids:
+                    return False
+                reason = str(result.get("outside_topk_reason") or "").strip()
+                evidence = str(result.get("outside_topk_evidence") or "").strip()
+                return not (reason and evidence)
+
+            if _needs_concept_retry(data, topk_ids):
+                retry_prompt = (
+                    f"{self.industry_prompt}\n\n"
+                    "再判定指示:\n"
+                    "- 直前の回答は Concept制約を満たしていませんでした。\n"
+                    "- selected_concept_id は必ず concept_topk_union から選ぶこと。\n"
+                    "- それでも選べない場合は industry=null, human_review=true, confidence<=0.49 とする。\n"
+                    "- 出力はJSONのみ。\n\n"
+                    "Concept topk:\n"
+                    f"{', '.join(topk_ids)}\n\n"
+                    "候補一覧:\n"
+                    f"{candidates_text or '（候補なし）'}\n\n"
+                    "本文抜粋:\n"
+                    f"{snippet}\n"
+                )
+                retry_resp = await self._generate_with_timeout([retry_prompt])
+                if retry_resp is not None:
+                    retry_raw = _resp_text(retry_resp)
+                    retry_data = _extract_first_json(retry_raw)
+                    if isinstance(retry_data, dict):
+                        retry_data["concept_retry"] = True
+                        data = retry_data
             return data
         except Exception:
             return None

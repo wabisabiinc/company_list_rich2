@@ -106,11 +106,48 @@ INDUSTRY_FORCE_DEFAULT_MINOR_CODES=392,401
 
 ## 業種分類運用フロー
 
-1. `industry_aliases.csv` を更新（同義語と `target_minor_code` を追加）
-2. alias辞書の整合性を検証（`allowed_major_codes` / 正規化競合 / コード存在）
-3. backfill を実行して既存データへ反映
-4. レポートで分類状態を確認
-5. 未分類から候補語を抽出し、次回辞書更新へ回す
+1. `data/concepts.json` を更新（Concept/anchor_texts/industry_hints を追加）
+2. Concept index を再生成（Embeddingキャッシュ更新）
+3. `main.py` 実行時に、各 `business_tags` を Concept正規化してから業種AIへ渡す
+4. `logs/concept_hold.jsonl` の保留語を確認し、Conceptを育てる
+5. 必要なら `industry_aliases.csv` も補助的に更新（既存互換）
+
+### Concept定義ファイル
+
+`data/concepts.json` は次の最小構造です。
+
+```json
+{
+  "version": "2026-02-16",
+  "concepts": [
+    {
+      "id": "concept_ai_ict",
+      "label": "AI/ICT",
+      "aliases": ["AI", "生成AI"],
+      "anchor_texts": ["生成AIや機械学習モデルを開発して業務システムに導入する"],
+      "industry_hints": ["情報処理・提供サービス業", "ソフトウェア業"]
+    }
+  ]
+}
+```
+
+- `anchor_texts` は概念の代表文。Embedding時はこの集合を平均化して概念ベクトルを作成します。
+- `aliases` は補助的な語彙。単語一致ではなく、Embeddingによる意味近傍判定を前提に使います。
+- `industry_hints` は LLM への説明用ヒントです（DBコード確定には使いません）。
+
+### しきい値調整
+
+- `CONCEPT_SIM_THRESHOLD`（既定 `0.82`）: 上げると誤爆は減るが `hold` が増える
+- `CONCEPT_MARGIN_THRESHOLD`（既定 `0.05`）: 上げると近接概念を保留しやすくなる
+- `CONCEPT_TOPK`（既定 `10`）: AIに渡す Concept候補数
+
+### Concept index 再生成
+
+```bash
+python -m tools.build_concept_index --rebuild
+```
+
+`main.py` は上記キャッシュを自動利用し、`concept_normalization_json` / `concept_version` / `embedding_model_name` / `ai_prompt_version` をDBへ保存します。
 
 `industry_aliases.csv` の推奨カラム:
 - `alias`
@@ -125,8 +162,14 @@ INDUSTRY_FORCE_DEFAULT_MINOR_CODES=392,401
 # 1) aliases更新
 $EDITOR industry_aliases.csv
 
+# 1.5) concepts更新
+$EDITOR data/concepts.json
+
 # 2) 整合性チェック
 python3 scripts/validate_industry_aliases.py --aliases industry_aliases.csv --taxonomy docs/industry_select.csv --fail-on-domain-outlier
+
+# 2.5) concept index 再生成
+python -m tools.build_concept_index --rebuild
 
 # 3) backfill実行（ルールベース）
 python3 scripts/backfill_industry_class.py --db data/companies.db --min-score 1

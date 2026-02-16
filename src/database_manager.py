@@ -439,6 +439,18 @@ class DatabaseManager:
         if "business_tags" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN business_tags TEXT;")
             cols.add("business_tags")
+        if "concept_normalization_json" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN concept_normalization_json TEXT;")
+            cols.add("concept_normalization_json")
+        if "concept_version" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN concept_version TEXT;")
+            cols.add("concept_version")
+        if "embedding_model_name" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN embedding_model_name TEXT;")
+            cols.add("embedding_model_name")
+        if "ai_prompt_version" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN ai_prompt_version TEXT;")
+            cols.add("ai_prompt_version")
         if "license" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN license TEXT;")
             cols.add("license")
@@ -1338,6 +1350,10 @@ class DatabaseManager:
         set_value("contact_url_ai_reason", company.get("contact_url_ai_reason", "") or "")
         set_value("contact_url_status", company.get("contact_url_status", "") or "")
         set_value("business_tags", company.get("business_tags", "") or "")
+        set_value("concept_normalization_json", company.get("concept_normalization_json", "") or "")
+        set_value("concept_version", company.get("concept_version", "") or "")
+        set_value("embedding_model_name", company.get("embedding_model_name", "") or "")
+        set_value("ai_prompt_version", company.get("ai_prompt_version", "") or "")
         set_value("license", company.get("license", "") or "")
         set_value("employees", company.get("employees", "") or "")
         set_value("description_evidence", company.get("description_evidence", "") or "")

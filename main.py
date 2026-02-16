@@ -35,6 +35,7 @@ from src.ai_verifier import (
 )
 from src.homepage_policy import apply_provisional_homepage_policy
 from src.industry_classifier import IndustryClassifier
+from src.concept_index import ConceptIndex
 from src.text_normalizer import norm_text_compact
 from scripts.extract_contact_urls import _pick_contact_url, _build_ai_signals, AI_MIN_CONFIDENCE_DEFAULT
 from src.reference_checker import ReferenceChecker
@@ -256,6 +257,7 @@ def _csv_safe_row(row: dict[str, Any]) -> dict[str, Any]:
 PHASE_METRICS_PATH = os.getenv("PHASE_METRICS_PATH", "logs/phase_metrics.csv")
 NO_OFFICIAL_LOG_PATH = os.getenv("NO_OFFICIAL_LOG_PATH", "logs/no_official.jsonl")
 EXTRACT_DEBUG_JSONL_PATH = os.getenv("EXTRACT_DEBUG_JSONL_PATH", "")
+CONCEPT_HOLD_LOG_PATH = os.getenv("CONCEPT_HOLD_LOG_PATH", "logs/concept_hold.jsonl")
 
 REFERENCE_CHECKER: ReferenceChecker | None = None
 if REFERENCE_CSVS:
@@ -266,6 +268,7 @@ if REFERENCE_CSVS:
         log.exception("Reference data loading failed")
 
 INDUSTRY_CLASSIFIER = IndustryClassifier()
+CONCEPT_INDEX = ConceptIndex()
 
 ZIP_CODE_RE = re.compile(r"(\d{3}-\d{4})")
 JAPANESE_RE = re.compile(r"[ぁ-んァ-ン一-龥]")
@@ -2313,6 +2316,89 @@ def _has_info_comm_signal(tags: list[str]) -> bool:
     return False
 
 
+def _parse_business_tags_value(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple, set)):
+        return [str(v).strip() for v in raw if str(v).strip()]
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        try:
+            maybe = json.loads(text)
+            if isinstance(maybe, list):
+                return [str(v).strip() for v in maybe if str(v).strip()]
+        except Exception:
+            pass
+    return [text]
+
+
+def _build_concept_context_for_industry(
+    *,
+    company_id: Any,
+    company_name: str,
+    description: str,
+    business_tags: Any,
+    evidence_blocks: list[str],
+    stage: str,
+) -> dict[str, Any]:
+    tags = _parse_business_tags_value(business_tags)
+    if not tags:
+        source_texts: list[str] = []
+        if description:
+            source_texts.append(description)
+        source_texts.extend([b for b in evidence_blocks if b])
+        tags = extract_business_keywords(source_texts, max_tags=max(5, CONCEPT_INDEX.topk))
+
+    evidence_text_parts: list[str] = []
+    if description:
+        evidence_text_parts.append(description)
+    evidence_text_parts.extend([str(b) for b in evidence_blocks if str(b).strip()])
+    evidence_text = "\n".join(evidence_text_parts)[:1600]
+
+    try:
+        payload = CONCEPT_INDEX.build_prompt_payload(tags=tags, evidence_text=evidence_text)
+    except Exception:
+        log.debug("concept normalization failed", exc_info=True)
+        payload = {
+            "concept_version": CONCEPT_INDEX.concept_version,
+            "embedding_model_name": CONCEPT_INDEX.embedding_model_name,
+            "sim_threshold": CONCEPT_INDEX.sim_threshold,
+            "margin_threshold": CONCEPT_INDEX.margin_threshold,
+            "topk": CONCEPT_INDEX.topk,
+            "normalized_concepts": [],
+            "auto_concepts": [],
+            "hold_tags": [],
+            "concept_topk_union": [],
+            "concept_cards": [],
+            "evidence_text": evidence_text,
+        }
+
+    payload["stage"] = stage
+    payload["company_id"] = company_id
+    payload["company_name"] = company_name
+    payload["source_tags"] = tags
+
+    hold_tags = payload.get("hold_tags") or []
+    if hold_tags:
+        append_jsonl(
+            CONCEPT_HOLD_LOG_PATH,
+            {
+                "ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+                "id": company_id,
+                "company_name": company_name,
+                "stage": stage,
+                "hold_tags": hold_tags,
+                "auto_concepts": payload.get("auto_concepts") or [],
+                "concept_topk_union": payload.get("concept_topk_union") or [],
+                "concept_version": payload.get("concept_version") or "",
+                "embedding_model_name": payload.get("embedding_model_name") or "",
+            },
+        )
+    return payload
+
+
 # 強い業種タグ（1件でも補完を許可するドメイン）
 STRONG_MAJOR_TAGS: dict[str, set[str]] = {
     "製造業": {"製造", "加工", "工場", "部品", "生産", "組立", "装置", "機械", "鋳造", "金型", "塗装"},
@@ -2763,6 +2849,24 @@ def _now_utc_str() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
 
 
+def _short_sha256_of_file(path: str) -> str:
+    target = str(path or "").strip()
+    if not target:
+        return ""
+    try:
+        data = Path(target).read_bytes()
+    except Exception:
+        return ""
+    return hashlib.sha256(data).hexdigest()[:8]
+
+
+AI_INDUSTRY_PROMPT_VERSION_FALLBACK = ""
+_industry_prompt_path = os.getenv("AI_INDUSTRY_PROMPT_PATH", "docs/ai_industry_prompt.md")
+_industry_prompt_hash = _short_sha256_of_file(_industry_prompt_path)
+if _industry_prompt_hash:
+    AI_INDUSTRY_PROMPT_VERSION_FALLBACK = f"sha256:{_industry_prompt_hash}"
+
+
 def build_update_check_logic_hash(files: list[str], *, root_dir: str | None = None) -> str:
     """
     更新チェックで使うロジック識別子を生成する。
@@ -2899,6 +3003,11 @@ async def process():
     # Playwright起動は get_page_info 内で必要時のみ行う（未導入環境での起動失敗や待ちを避ける）
 
     verifier = AIVerifier() if USE_AI else None
+    industry_prompt_version = (
+        (getattr(verifier, "industry_prompt_version", "") if verifier is not None else "")
+        or AI_INDUSTRY_PROMPT_VERSION_FALLBACK
+        or "unknown"
+    )
     manager = DatabaseManager(db_path=COMPANIES_DB_PATH, worker_id=WORKER_ID)
     if AI_CLEAR_NEGATIVE_FLAGS:
         cleared = manager.clear_ai_negative_url_flags()
@@ -4811,6 +4920,10 @@ async def process():
                     company.setdefault("industry_class_confidence", industry_class_confidence)
                     company.setdefault("industry_minor_item_code", "")
                     company.setdefault("industry_minor_item", "")
+                    company.setdefault("concept_normalization_json", "")
+                    company.setdefault("concept_version", CONCEPT_INDEX.concept_version or "")
+                    company.setdefault("embedding_model_name", CONCEPT_INDEX.embedding_model_name or "")
+                    company.setdefault("ai_prompt_version", industry_prompt_version)
                     company.setdefault("contact_url", contact_url)
                     company.setdefault("contact_url_source", contact_url_source)
                     company.setdefault("contact_url_score", contact_url_score)
@@ -6672,12 +6785,27 @@ async def process():
                                             blocks.append(business_tags_val)
                                     except Exception:
                                         blocks.append(business_tags_val)
-                                license_val = (company.get("license") or "").strip()
-                                if license_val:
-                                    blocks.append(f"許認可: {license_val}"[:400])
                                 desc_ev = (company.get("description_evidence") or "").strip()
                                 if desc_ev:
                                     blocks.append(f"根拠: {desc_ev}"[:400])
+
+                            concept_context_pre = _build_concept_context_for_industry(
+                                company_id=cid,
+                                company_name=name,
+                                description=description_val or "",
+                                business_tags=business_tags_val,
+                                evidence_blocks=blocks,
+                                stage="pre_homepage",
+                            )
+                            try:
+                                company["concept_normalization_json"] = json.dumps(concept_context_pre, ensure_ascii=False)
+                            except Exception:
+                                company["concept_normalization_json"] = ""
+                            company["concept_version"] = concept_context_pre.get("concept_version") or CONCEPT_INDEX.concept_version
+                            company["embedding_model_name"] = (
+                                concept_context_pre.get("embedding_model_name") or CONCEPT_INDEX.embedding_model_name
+                            )
+                            company["ai_prompt_version"] = industry_prompt_version
 
                             scores = INDUSTRY_CLASSIFIER.score_levels(blocks)
                             industry_result_ai = None
@@ -6702,24 +6830,6 @@ async def process():
                                     return False
                                 if str(ai_res.get("human_review") or "").strip().lower() in {"true", "1", "yes"}:
                                     return False
-                                regulated_majors = {
-                                    "医療，福祉",
-                                    "建設業",
-                                    "金融業，保険業",
-                                }
-                                major_name = (final_candidate.get("major_name") or "").strip()
-                                if major_name in regulated_majors:
-                                    facts = ai_res.get("facts")
-                                    license_info = ""
-                                    if isinstance(facts, dict):
-                                        license_info = str(
-                                            facts.get("licenses")
-                                            or facts.get("license")
-                                            or facts.get("license_or_registration")
-                                            or ""
-                                        ).strip()
-                                    if not license_info:
-                                        return False
                                 return True
 
                             def _build_classification_candidates(score_map: dict[str, Any]) -> list[dict[str, str]]:
@@ -6771,13 +6881,13 @@ async def process():
                             class_candidates = _build_classification_candidates(scores)
                             rule_result = None
                             needs_ai_escalation = _needs_industry_ai_escalation(scores)
-                            if INDUSTRY_AI_UNCERTAIN_ONLY and (not needs_ai_escalation):
+                            if (not INDUSTRY_REQUIRE_AI) and INDUSTRY_AI_UNCERTAIN_ONLY and (not needs_ai_escalation):
                                 rule_result = _build_rule_industry_result_from_scores(
                                     scores,
                                     source="rule_clear_pre",
                                 )
                             ai_allowed_now = ai_available and (
-                                (not INDUSTRY_AI_UNCERTAIN_ONLY) or needs_ai_escalation
+                                INDUSTRY_REQUIRE_AI or (not INDUSTRY_AI_UNCERTAIN_ONLY) or needs_ai_escalation
                             )
 
                             if ai_allowed_now and class_candidates and has_time_for_ai() and (not rule_result):
@@ -6788,6 +6898,7 @@ async def process():
                                             text=ai_text,
                                             company_name=name,
                                             candidates_text=INDUSTRY_CLASSIFIER.format_candidates_text(class_candidates),
+                                            concept_context=concept_context_pre,
                                         ),
                                         timeout=min(clamp_timeout(ai_call_timeout), 30.0),
                                     )
@@ -6816,7 +6927,7 @@ async def process():
                             industry_result = industry_result_ai or rule_result
 
                             lookup_name = ai_industry_val or industry_hint_val or industry_val
-                            if (not industry_result) and INDUSTRY_NAME_LOOKUP_ENABLED and lookup_name:
+                            if (not industry_result) and (not INDUSTRY_REQUIRE_AI) and INDUSTRY_NAME_LOOKUP_ENABLED and lookup_name:
                                 try:
                                     exact_candidate = INDUSTRY_CLASSIFIER.resolve_exact_candidate_from_name(lookup_name)
                                 except Exception:
@@ -6833,7 +6944,7 @@ async def process():
                                         "source": "name_exact",
                                     }
 
-                            if not industry_result:
+                            if (not industry_result) and (not INDUSTRY_REQUIRE_AI):
                                 try:
                                     industry_result = INDUSTRY_CLASSIFIER.classify_from_semantic_taxonomy(
                                         description_val or "",
@@ -6842,7 +6953,7 @@ async def process():
                                 except Exception:
                                     industry_result = None
 
-                            if not industry_result:
+                            if (not industry_result) and (not INDUSTRY_REQUIRE_AI):
                                 try:
                                     industry_result = INDUSTRY_CLASSIFIER.classify_from_aliases(
                                         description_val or "",
@@ -7382,9 +7493,6 @@ async def process():
                                     industry_blocks.append(name)
                                 if industry_hint_val:
                                     industry_blocks.append(industry_hint_val)
-                                license_val = (company.get("license") or "").strip()
-                                if license_val:
-                                    industry_blocks.append(f"許認可: {license_val}"[:400])
                                 desc_ev = (company.get("description_evidence") or "").strip()
                                 if desc_ev:
                                     industry_blocks.append(f"根拠: {desc_ev}"[:400])
@@ -7406,11 +7514,29 @@ async def process():
                             # スコア計算も本文→descriptionを優先。タグは industry_blocks 経由で含まれる。
                             score_blocks = list(industry_blocks)
 
+                            concept_context_post = _build_concept_context_for_industry(
+                                company_id=cid,
+                                company_name=name,
+                                description=description_val or "",
+                                business_tags=parsed_business_tags if parsed_business_tags else business_tags_val,
+                                evidence_blocks=score_blocks,
+                                stage="post_homepage",
+                            )
+                            try:
+                                company["concept_normalization_json"] = json.dumps(concept_context_post, ensure_ascii=False)
+                            except Exception:
+                                company["concept_normalization_json"] = ""
+                            company["concept_version"] = concept_context_post.get("concept_version") or CONCEPT_INDEX.concept_version
+                            company["embedding_model_name"] = (
+                                concept_context_post.get("embedding_model_name") or CONCEPT_INDEX.embedding_model_name
+                            )
+                            company["ai_prompt_version"] = industry_prompt_version
+
                             scores = INDUSTRY_CLASSIFIER.score_levels(score_blocks)
                             use_detail = bool(scores.get("use_detail"))
                             needs_ai_escalation = _needs_industry_ai_escalation(scores)
                             rule_result_post = None
-                            if INDUSTRY_AI_UNCERTAIN_ONLY and (not needs_ai_escalation):
+                            if (not INDUSTRY_REQUIRE_AI) and INDUSTRY_AI_UNCERTAIN_ONLY and (not needs_ai_escalation):
                                 rule_result_post = _build_rule_industry_result_from_scores(
                                     scores,
                                     source="rule_clear_post",
@@ -7426,7 +7552,7 @@ async def process():
                                 and getattr(verifier, "industry_prompt", None)
                             )
                             ai_allowed_now = ai_available and (
-                                (not INDUSTRY_AI_UNCERTAIN_ONLY) or needs_ai_escalation
+                                INDUSTRY_REQUIRE_AI or (not INDUSTRY_AI_UNCERTAIN_ONLY) or needs_ai_escalation
                             )
                             if description_val:
                                 ai_text = description_val
@@ -7507,20 +7633,6 @@ async def process():
                                     return False
                                 if str(ai_res.get("human_review") or "").strip().lower() in {"true", "1", "yes"}:
                                     return False
-                                regulated_majors = {"医療，福祉", "建設業", "金融業，保険業"}
-                                major_name = (matched.get("major_name") or "").strip()
-                                if major_name in regulated_majors:
-                                    facts = ai_res.get("facts")
-                                    license_info = ""
-                                    if isinstance(facts, dict):
-                                        license_info = str(
-                                            facts.get("licenses")
-                                            or facts.get("license")
-                                            or facts.get("license_or_registration")
-                                            or ""
-                                        ).strip()
-                                    if not license_info:
-                                        return False
                                 return True
 
                             async def _judge_stage(
@@ -7539,6 +7651,7 @@ async def process():
                                             text=ai_text,
                                             company_name=name,
                                             candidates_text=INDUSTRY_CLASSIFIER.format_candidates_text(candidates),
+                                            concept_context=concept_context_post,
                                         ),
                                         timeout=min(clamp_timeout(ai_call_timeout), 30.0),
                                     )
@@ -7699,7 +7812,7 @@ async def process():
                                             "source": "ai_detail_optional",
                                         }
 
-                            if (not industry_result_post) and INDUSTRY_NAME_LOOKUP_ENABLED:
+                            if (not industry_result_post) and (not INDUSTRY_REQUIRE_AI) and INDUSTRY_NAME_LOOKUP_ENABLED:
                                 lookup_name = ai_industry_name or industry_hint_val or industry_val
                                 try:
                                     exact_candidate = INDUSTRY_CLASSIFIER.resolve_exact_candidate_from_name(lookup_name)
@@ -7717,7 +7830,7 @@ async def process():
                                         "source": "name_exact_post",
                                     }
 
-                            if not industry_result_post:
+                            if (not industry_result_post) and (not INDUSTRY_REQUIRE_AI):
                                 alias_business_tags: Any = parsed_business_tags if parsed_business_tags else (business_tags_val or "")
                                 try:
                                     industry_result_post = INDUSTRY_CLASSIFIER.classify_from_semantic_taxonomy(
@@ -7727,7 +7840,7 @@ async def process():
                                 except Exception:
                                     industry_result_post = None
 
-                            if not industry_result_post:
+                            if (not industry_result_post) and (not INDUSTRY_REQUIRE_AI):
                                 alias_business_tags: Any = parsed_business_tags if parsed_business_tags else (business_tags_val or "")
                                 try:
                                     industry_result_post = INDUSTRY_CLASSIFIER.classify_from_aliases(
@@ -7779,6 +7892,7 @@ async def process():
                                                     text=ai_text,
                                                     company_name=name,
                                                     candidates_text=INDUSTRY_CLASSIFIER.format_candidates_text(tag_candidates),
+                                                    concept_context=concept_context_post,
                                                 ),
                                                 timeout=min(clamp_timeout(ai_call_timeout), 20.0),
                                             )
@@ -7837,6 +7951,7 @@ async def process():
                                                     text=ai_text,
                                                     company_name=name,
                                                     candidates_text=INDUSTRY_CLASSIFIER.format_candidates_text(tag_candidates),
+                                                    concept_context=concept_context_post,
                                                 ),
                                                 timeout=min(clamp_timeout(ai_call_timeout), 20.0),
                                             )
@@ -7857,7 +7972,7 @@ async def process():
                                                 }
                                                 ai_industry_name = str(ai_res_tag.get("industry") or ai_industry_name)
 
-                            if (not industry_result_post) and INDUSTRY_FORCE_CLASSIFY:
+                            if (not industry_result_post) and (not INDUSTRY_REQUIRE_AI) and INDUSTRY_FORCE_CLASSIFY:
                                 taxonomy = INDUSTRY_CLASSIFIER.taxonomy
 
                                 def _candidate_from_code(code_val: str) -> dict[str, Any] | None:
@@ -7944,6 +8059,7 @@ async def process():
                                                     text=ai_text,
                                                     company_name=name,
                                                     candidates_text=INDUSTRY_CLASSIFIER.format_candidates_text(forced_candidates),
+                                                    concept_context=concept_context_post,
                                                 ),
                                                 timeout=min(clamp_timeout(ai_call_timeout), 30.0),
                                             )
@@ -8115,8 +8231,8 @@ async def process():
                                     company["status"] = "review"
 
                             # business_tags を保険として使い、大分類の整合性を補正する
-                            tag_list_for_major = list(parsed_business_tags) if parsed_business_tags else []
-                            if (not tag_list_for_major) and business_tags_val:
+                            tag_list_for_major = [] if INDUSTRY_REQUIRE_AI else (list(parsed_business_tags) if parsed_business_tags else [])
+                            if (not INDUSTRY_REQUIRE_AI) and (not tag_list_for_major) and business_tags_val:
                                 try:
                                     if business_tags_val.strip().startswith("["):
                                         maybe = json.loads(business_tags_val)
@@ -8217,33 +8333,34 @@ async def process():
                             company["industry_minor"] = industry_minor or "不明"
 
                             # 名前ガード: 会社名に強い業種ヒントがあるのに異なる大分類になっている場合の補正/レビュー
-                            try:
-                                name_hint_major = ""
-                                for pat, major_hint in NAME_MAJOR_HINTS:
-                                    if pat.search(name):
-                                        name_hint_major = major_hint
-                                        break
-                                if name_hint_major:
-                                    if company["industry_major"] not in {name_hint_major, "不明"}:
-                                        # 衝突時はレビュー送り or 名前優先で補正（保守的にレビューを選択）
-                                        company["industry"] = "不明"
-                                        company["industry_major_code"] = ""
-                                        company["industry_major"] = "不明"
-                                        company["industry_middle_code"] = ""
-                                        company["industry_middle"] = "不明"
-                                        company["industry_minor_code"] = ""
-                                        company["industry_minor"] = "不明"
-                                        company["industry_class_source"] = (company.get("industry_class_source") or "unclassified") + "|name_conflict"
-                                        company["industry_class_confidence"] = 0.0
-                                        if company.get("status") in (None, "", "pending", "done"):
-                                            company["status"] = "review"
-                                    elif company["industry_major"] == "不明":
-                                        # ヒントだけで補完（confidence控えめ）
-                                        company["industry_major"] = name_hint_major
-                                        company["industry_class_source"] = (company.get("industry_class_source") or "unclassified") + "|name_hint"
-                                        company["industry_class_confidence"] = max(float(company.get("industry_class_confidence") or 0.0), 0.45)
-                            except Exception:
-                                pass
+                            if not INDUSTRY_REQUIRE_AI:
+                                try:
+                                    name_hint_major = ""
+                                    for pat, major_hint in NAME_MAJOR_HINTS:
+                                        if pat.search(name):
+                                            name_hint_major = major_hint
+                                            break
+                                    if name_hint_major:
+                                        if company["industry_major"] not in {name_hint_major, "不明"}:
+                                            # 衝突時はレビュー送り or 名前優先で補正（保守的にレビューを選択）
+                                            company["industry"] = "不明"
+                                            company["industry_major_code"] = ""
+                                            company["industry_major"] = "不明"
+                                            company["industry_middle_code"] = ""
+                                            company["industry_middle"] = "不明"
+                                            company["industry_minor_code"] = ""
+                                            company["industry_minor"] = "不明"
+                                            company["industry_class_source"] = (company.get("industry_class_source") or "unclassified") + "|name_conflict"
+                                            company["industry_class_confidence"] = 0.0
+                                            if company.get("status") in (None, "", "pending", "done"):
+                                                company["status"] = "review"
+                                        elif company["industry_major"] == "不明":
+                                            # ヒントだけで補完（confidence控えめ）
+                                            company["industry_major"] = name_hint_major
+                                            company["industry_class_source"] = (company.get("industry_class_source") or "unclassified") + "|name_hint"
+                                            company["industry_class_confidence"] = max(float(company.get("industry_class_confidence") or 0.0), 0.45)
+                                except Exception:
+                                    pass
 
                             # タグが未生成なら、最終ブロックからローカル推定で埋める（2パス目での判定精度向上用）
                             if (not business_tags_val) and INFER_INDUSTRY_ALWAYS:

@@ -184,6 +184,7 @@ reports/
 # Data directory (ignore everything; optionally keep a placeholder with !data/.keep)
 data/**
 !data/.keep
+!data/concepts.json
 
 # Large data formats anywhere (guardrail for accidental commits)
 *.csv
