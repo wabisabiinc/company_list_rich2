@@ -52,8 +52,12 @@ _GENERIC_TOKENS = {
 _AUTO_LEARN_STOPWORDS = _GENERIC_TOKENS | {
     "当社", "弊社", "会社", "企業", "公式", "情報", "サイト", "ホームページ", "お問い合わせ",
     "コンサル", "コンサルティング", "ソリューション", "プラットフォーム", "システム", "サービス提供",
+    "提供しています", "行っています", "行う", "行います", "実施しています", "実施", "対応しています",
 }
 _AUTO_TERM_RE = re.compile(r"[一-龥ぁ-んァ-ンa-z0-9]{2,32}")
+_AUTO_LEARN_VERB_RE = re.compile(
+    r"(して(い)?ます|します|しました|した|する|いたします|行っています|行います|行った|行う|しております|提供しています)$"
+)
 
 # CSV が読めない場合の最小限fallback
 _ALIAS_TO_MINOR_FALLBACK: dict[str, tuple[str, int, int, str]] = {
@@ -1259,9 +1263,7 @@ class IndustryClassifier:
         best_sim = float(best_meta.get("best_sim") or 0.0)
         best_margin = float(best_meta.get("best_margin") or 0.0)
 
-        if SEMANTIC_TAXONOMY_REQUIRE_BOTH and not both_sources:
-            return None
-
+        require_both = bool(SEMANTIC_TAXONOMY_REQUIRE_BOTH)
         confidence = 0.38 + min(0.30, best_score * 0.20) + min(0.12, score_margin * 0.30)
         if both_sources:
             confidence += 0.06
@@ -1272,6 +1274,12 @@ class IndustryClassifier:
         ambiguous = score_margin < 0.08 or best_margin < (self.semantic_taxonomy_min_margin + 0.02)
         review_required = bool((not both_sources) or ambiguous or confidence <= 0.56)
         if review_required:
+            confidence = min(confidence, 0.56 if both_sources else 0.50)
+        if require_both and not both_sources:
+            confidence = min(confidence, 0.50)
+        # セマンティック単独採用はしない（候補退避用）
+        if not review_required:
+            review_required = True
             confidence = min(confidence, 0.56 if both_sources else 0.50)
 
         source_name = "semantic_taxonomy_desc_tags" if both_sources else "semantic_taxonomy_single"
@@ -1609,6 +1617,12 @@ class IndustryClassifier:
                 if len(term_norm) < self.auto_learn_min_term_len or len(term_norm) > self.auto_learn_max_term_len:
                     continue
                 if term_norm in _AUTO_LEARN_STOPWORDS:
+                    continue
+                if _AUTO_LEARN_VERB_RE.search(term):
+                    continue
+                if re.fullmatch(r"[ぁ-ん]+", term):
+                    continue
+                if not re.search(r"[一-龥ァ-ンA-Za-z]", term):
                     continue
                 if term_norm in known_aliases:
                     continue
@@ -1956,9 +1970,7 @@ class IndustryClassifier:
         both_sources = desc_count > 0 and tag_count > 0
         best_score = int(best_meta.get("score") or 0)
         best_domain_tags = {str(v) for v in (best_meta.get("domain_tags") or set()) if str(v)}
-
-        if semantic_only and not ALIAS_SEMANTIC_ALLOW_STANDALONE:
-            return None
+        # セマンティック単独は採用せず review 寄せ
 
         # aliasヒットが複数ドメインをまたぐ/僅差で競合する場合は誤分類リスクが高い。
         domain_conflict = len(best_domain_tags) >= 2

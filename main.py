@@ -7315,14 +7315,16 @@ async def process():
                                 except Exception:
                                     industry_result = None
 
-                            if (not industry_result) and fallback_allowed:
+                            if fallback_allowed and ((not industry_result) or bool(industry_result.get("review_required"))):
                                 try:
-                                    industry_result = INDUSTRY_CLASSIFIER.classify_from_aliases(
+                                    alias_result = INDUSTRY_CLASSIFIER.classify_from_aliases(
                                         description_val or "",
                                         parsed_business_tags_pre if parsed_business_tags_pre else (business_tags_val or ""),
                                     )
                                 except Exception:
-                                    industry_result = None
+                                    alias_result = None
+                                if alias_result:
+                                    industry_result = alias_result
 
                             if industry_result and str(industry_result.get("source") or "").startswith("alias"):
                                 # alias単独は誤分類抑止のため review 寄せ・confidence上限を維持
@@ -7375,6 +7377,14 @@ async def process():
                                 industry_suggested_minor_item = suggested.get("industry_suggested_minor_item", "")
                                 industry_suggested_source = suggested.get("industry_suggested_source", "")
                                 industry_suggested_confidence = float(suggested.get("industry_suggested_confidence") or 0.0)
+                                industry_major_code = ""
+                                industry_major = "不明"
+                                industry_middle_code = ""
+                                industry_middle = "不明"
+                                industry_minor_code = ""
+                                industry_minor = "不明"
+                                company["industry_minor_item_code"] = ""
+                                company["industry_minor_item"] = "不明"
                                 industry_result = None
                                 industry_class_source = (industry_class_source or "unclassified") + "|review_required"
                                 industry_class_confidence = 0.0
@@ -8394,15 +8404,17 @@ async def process():
                                 except Exception:
                                     industry_result_post = None
 
-                            if (not industry_result_post) and fallback_allowed:
+                            if fallback_allowed and ((not industry_result_post) or bool(industry_result_post.get("review_required"))):
                                 alias_business_tags: Any = parsed_business_tags if parsed_business_tags else (business_tags_val or "")
                                 try:
-                                    industry_result_post = INDUSTRY_CLASSIFIER.classify_from_aliases(
+                                    alias_result_post = INDUSTRY_CLASSIFIER.classify_from_aliases(
                                         description_val or "",
                                         alias_business_tags,
                                     )
                                 except Exception:
-                                    industry_result_post = None
+                                    alias_result_post = None
+                                if alias_result_post:
+                                    industry_result_post = alias_result_post
 
                             # 低信頼なら tags を強いヒントにして再AI判定（精度補強）
                             if (
@@ -8708,6 +8720,15 @@ async def process():
                                 industry_suggested_minor_item = suggested.get("industry_suggested_minor_item", "")
                                 industry_suggested_source = suggested.get("industry_suggested_source", "")
                                 industry_suggested_confidence = float(suggested.get("industry_suggested_confidence") or 0.0)
+                                industry_major_code = ""
+                                industry_major = "不明"
+                                industry_middle_code = ""
+                                industry_middle = "不明"
+                                industry_minor_code = ""
+                                industry_minor = "不明"
+                                industry_val = "不明"
+                                company["industry_minor_item_code"] = ""
+                                company["industry_minor_item"] = "不明"
                                 industry_result_post = None
                                 industry_class_source = (industry_class_source or "unclassified") + "|review_required"
                                 industry_class_confidence = 0.0
