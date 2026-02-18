@@ -38,6 +38,7 @@ class DatabaseManager:
         self.conn.row_factory = sqlite3.Row
         self.cur = self.conn.cursor()
         self.worker_id = worker_id
+        self.minimal_db = os.getenv("MINIMAL_DB", "false").lower() == "true" or os.path.basename(db_path) == "ng_test.db"
 
         # PRAGMA は接続毎に適用
         self._configure_pragmas()
@@ -58,11 +59,13 @@ class DatabaseManager:
         self._ensure_schema_with_retry()
         self._ensure_indexes()
         self._refresh_schema_columns()
+        # claim order depends on available columns
+        self._claim_order_clause = self._build_claim_order_clause(self._schema_columns)
 
         # CSV の重複書き出し防止用キャッシュ
         self._init_csv_state()
 
-    def _build_claim_order_clause(self) -> str:
+    def _build_claim_order_clause(self, cols: Optional[set[str]] = None) -> str:
         """
         取得順序を環境変数CLAIM_ORDERで切り替える。
         - employee_desc_id_asc (default)
@@ -70,13 +73,18 @@ class DatabaseManager:
         - id_desc
         - random
         """
+        if cols is None:
+            cols = self._schema_columns if hasattr(self, "_schema_columns") else set()
         mapping = {
             "employee_desc_id_asc": "ORDER BY COALESCE(employee_count, 0) DESC, id ASC",
             "id_asc": "ORDER BY id ASC",
             "id_desc": "ORDER BY id DESC",
             "random": "ORDER BY RANDOM()",
         }
-        return mapping.get(self.claim_order, mapping["employee_desc_id_asc"])
+        clause = mapping.get(self.claim_order, mapping["employee_desc_id_asc"])
+        if "employee_count" not in cols and "employee_count" in clause:
+            clause = mapping["id_asc"]
+        return clause
 
     def _commit_with_checkpoint(self) -> None:
         self.conn.commit()
@@ -107,6 +115,45 @@ class DatabaseManager:
     def _refresh_schema_columns(self) -> None:
         self._schema_columns = self._get_table_columns()
 
+    def _drop_legacy_industry_columns(self, cols: set[str]) -> None:
+        if os.getenv("DROP_LEGACY_INDUSTRY_COLUMNS", "true").lower() != "true":
+            return
+        legacy_cols = [
+            "industry",
+            "industry_major_code",
+            "industry_major",
+            "industry_middle_code",
+            "industry_middle",
+            "industry_minor_code",
+            "industry_minor",
+            "industry_minor_item_code",
+            "industry_minor_item",
+            "industry_class_source",
+            "industry_class_confidence",
+            "industry_suggested_major_code",
+            "industry_suggested_major",
+            "industry_suggested_middle_code",
+            "industry_suggested_middle",
+            "industry_suggested_minor_code",
+            "industry_suggested_minor",
+            "industry_suggested_minor_item_code",
+            "industry_suggested_minor_item",
+            "industry_suggested_source",
+            "industry_suggested_confidence",
+            "industry_tag_matches",
+        ]
+        for col in legacy_cols:
+            if col not in cols:
+                continue
+            try:
+                self.conn.execute(f"ALTER TABLE companies DROP COLUMN {col};")
+            except sqlite3.OperationalError as exc:
+                log.warning("Drop column failed (%s): %s", col, exc)
+                # Older SQLite might not support DROP COLUMN; bail out gracefully.
+                break
+            else:
+                cols.discard(col)
+
     # ---------- 初期化（ロックに強いリトライ付） ----------
     def _ensure_schema_with_retry(self, max_retry_sec: int = 20) -> None:
         start = time.time()
@@ -122,43 +169,74 @@ class DatabaseManager:
                 raise
 
     def _ensure_schema(self) -> None:
-        self.cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS companies (
-                id INTEGER PRIMARY KEY,
-                company_name   TEXT,
-                address        TEXT,
-                employee_count INTEGER,
-                homepage       TEXT,
-                phone          TEXT,
-                found_address  TEXT,
-                status         TEXT DEFAULT 'pending',
-                locked_by      TEXT,
-                locked_at      TEXT,
-                rep_name       TEXT,
-                description    TEXT,
-                listing        TEXT,
-                revenue        TEXT,
-                profit         TEXT,
-                capital        TEXT,
-                fiscal_month   TEXT,
-                founded_year   TEXT,
-                ai_used        INTEGER DEFAULT 0,
-                ai_model       TEXT,
-                phone_source   TEXT,
-                address_source TEXT,
-                extract_confidence REAL,
-                last_checked_at TEXT,
-                homepage_fingerprint TEXT,
-                homepage_content_length INTEGER,
-                homepage_checked_at TEXT,
-                homepage_check_url TEXT,
-                homepage_check_source TEXT,
-                homepage_check_logic_hash TEXT,
-                error_code     TEXT
+        if self.minimal_db:
+            self.cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS companies (
+                    id INTEGER PRIMARY KEY,
+                    company_name   TEXT,
+                    address        TEXT,
+                    status         TEXT DEFAULT 'pending',
+                    locked_by      TEXT,
+                    locked_at      TEXT,
+                    error_code     TEXT,
+                    homepage       TEXT,
+                    phone          TEXT,
+                    found_address  TEXT,
+                    rep_name       TEXT,
+                    description    TEXT,
+                    listing        TEXT,
+                    revenue        TEXT,
+                    profit         TEXT,
+                    capital        TEXT,
+                    fiscal_month   TEXT,
+                    founded_year   TEXT,
+                    final_homepage TEXT,
+                    contact_url    TEXT,
+                    business_tags  TEXT,
+                    industry_top   TEXT,
+                    industry_sub   TEXT
+                )
+                """
             )
-            """
-        )
+        else:
+            self.cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS companies (
+                    id INTEGER PRIMARY KEY,
+                    company_name   TEXT,
+                    address        TEXT,
+                    employee_count INTEGER,
+                    homepage       TEXT,
+                    phone          TEXT,
+                    found_address  TEXT,
+                    status         TEXT DEFAULT 'pending',
+                    locked_by      TEXT,
+                    locked_at      TEXT,
+                    rep_name       TEXT,
+                    description    TEXT,
+                    listing        TEXT,
+                    revenue        TEXT,
+                    profit         TEXT,
+                    capital        TEXT,
+                    fiscal_month   TEXT,
+                    founded_year   TEXT,
+                    ai_used        INTEGER DEFAULT 0,
+                    ai_model       TEXT,
+                    phone_source   TEXT,
+                    address_source TEXT,
+                    extract_confidence REAL,
+                    last_checked_at TEXT,
+                    homepage_fingerprint TEXT,
+                    homepage_content_length INTEGER,
+                    homepage_checked_at TEXT,
+                    homepage_check_url TEXT,
+                    homepage_check_source TEXT,
+                    homepage_check_logic_hash TEXT,
+                    error_code     TEXT
+                )
+                """
+            )
 
         cols = self._get_table_columns()
         # 既存データベースとの互換を保つため、後から増えた列を順に追加する
@@ -174,6 +252,32 @@ class DatabaseManager:
         if "error_code" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN error_code TEXT;")
             cols.add("error_code")
+        if self.minimal_db:
+            minimal_cols = {
+                "company_name": "TEXT",
+                "address": "TEXT",
+                "homepage": "TEXT",
+                "phone": "TEXT",
+                "found_address": "TEXT",
+                "rep_name": "TEXT",
+                "description": "TEXT",
+                "listing": "TEXT",
+                "revenue": "TEXT",
+                "profit": "TEXT",
+                "capital": "TEXT",
+                "fiscal_month": "TEXT",
+                "founded_year": "TEXT",
+                "final_homepage": "TEXT",
+                "contact_url": "TEXT",
+                "business_tags": "TEXT",
+                "industry_top": "TEXT",
+                "industry_sub": "TEXT",
+            }
+            for col, col_type in minimal_cols.items():
+                if col not in cols:
+                    self.conn.execute(f"ALTER TABLE companies ADD COLUMN {col} {col_type};")
+                    cols.add(col)
+            return
         if "rep_name" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN rep_name TEXT;")
             cols.add("rep_name")
@@ -289,6 +393,13 @@ class DatabaseManager:
         except sqlite3.DatabaseError:
             # 古いSQLiteなどで失敗しても致命ではない
             pass
+        if self.minimal_db:
+            if "status" in cols:
+                try:
+                    self.conn.execute("CREATE INDEX IF NOT EXISTS idx_companies_status ON companies(status);")
+                except sqlite3.DatabaseError:
+                    pass
+            return
         if "homepage_official_flag" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN homepage_official_flag INTEGER;")
             cols.add("homepage_official_flag")
@@ -376,72 +487,13 @@ class DatabaseManager:
         if "city_match" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN city_match INTEGER;")
             cols.add("city_match")
-        if "industry" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN industry TEXT;")
-            cols.add("industry")
-        if "industry_major_code" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_major_code TEXT;")
-            cols.add("industry_major_code")
-        if "industry_major" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_major TEXT;")
-            cols.add("industry_major")
-        if "industry_middle_code" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_middle_code TEXT;")
-            cols.add("industry_middle_code")
-        if "industry_middle" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_middle TEXT;")
-            cols.add("industry_middle")
-        if "industry_minor_code" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_minor_code TEXT;")
-            cols.add("industry_minor_code")
-        if "industry_minor" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_minor TEXT;")
-            cols.add("industry_minor")
-        if "industry_minor_item_code" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_minor_item_code TEXT;")
-            cols.add("industry_minor_item_code")
-        if "industry_minor_item" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_minor_item TEXT;")
-            cols.add("industry_minor_item")
-        if "industry_class_source" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_class_source TEXT;")
-            cols.add("industry_class_source")
-        if "industry_class_confidence" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_class_confidence REAL;")
-            cols.add("industry_class_confidence")
-        if "industry_suggested_major_code" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_suggested_major_code TEXT;")
-            cols.add("industry_suggested_major_code")
-        if "industry_suggested_major" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_suggested_major TEXT;")
-            cols.add("industry_suggested_major")
-        if "industry_suggested_middle_code" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_suggested_middle_code TEXT;")
-            cols.add("industry_suggested_middle_code")
-        if "industry_suggested_middle" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_suggested_middle TEXT;")
-            cols.add("industry_suggested_middle")
-        if "industry_suggested_minor_code" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_suggested_minor_code TEXT;")
-            cols.add("industry_suggested_minor_code")
-        if "industry_suggested_minor" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_suggested_minor TEXT;")
-            cols.add("industry_suggested_minor")
-        if "industry_suggested_minor_item_code" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_suggested_minor_item_code TEXT;")
-            cols.add("industry_suggested_minor_item_code")
-        if "industry_suggested_minor_item" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_suggested_minor_item TEXT;")
-            cols.add("industry_suggested_minor_item")
-        if "industry_suggested_source" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_suggested_source TEXT;")
-            cols.add("industry_suggested_source")
-        if "industry_suggested_confidence" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_suggested_confidence REAL;")
-            cols.add("industry_suggested_confidence")
-        if "industry_tag_matches" not in cols:
-            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_tag_matches TEXT;")
-            cols.add("industry_tag_matches")
+        if "industry_top" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_top TEXT;")
+            cols.add("industry_top")
+        if "industry_sub" not in cols:
+            self.conn.execute("ALTER TABLE companies ADD COLUMN industry_sub TEXT;")
+            cols.add("industry_sub")
+        self._drop_legacy_industry_columns(cols)
         if "contact_url" not in cols:
             self.conn.execute("ALTER TABLE companies ADD COLUMN contact_url TEXT;")
             cols.add("contact_url")
@@ -731,9 +783,7 @@ class DatabaseManager:
                                locked_by=?,
                                locked_at=datetime('now')
                          WHERE id=(SELECT id FROM picked)
-                        RETURNING id, company_name, address, employee_count, homepage, phone, found_address, status, corporate_number, corporate_number_norm,
-                                  final_homepage, homepage_official_flag, homepage_fingerprint, homepage_content_length, homepage_checked_at,
-                                  homepage_check_url, homepage_check_source, homepage_check_logic_hash
+                        RETURNING *
                         """,
                         (st, worker_id),
                     ).fetchone()
@@ -762,9 +812,7 @@ class DatabaseManager:
                     if cur.rowcount > 0:
                         row = cur.execute(
                             """
-                            SELECT id, company_name, address, employee_count, homepage, phone, found_address, status, corporate_number, corporate_number_norm
-                                 , final_homepage, homepage_official_flag, homepage_fingerprint, homepage_content_length, homepage_checked_at
-                                 , homepage_check_url, homepage_check_source, homepage_check_logic_hash
+                            SELECT *
                               FROM companies
                              WHERE locked_by=? AND status='running'
                              ORDER BY locked_at DESC, id DESC
@@ -1362,28 +1410,8 @@ class DatabaseManager:
         set_value("drop_reasons", company.get("drop_reasons", "") or "")
         set_value("pref_match", company.get("pref_match"))
         set_value("city_match", company.get("city_match"))
-        set_value("industry", company.get("industry", "") or "")
-        set_value("industry_major_code", company.get("industry_major_code", "") or "")
-        set_value("industry_major", company.get("industry_major", "") or "")
-        set_value("industry_middle_code", company.get("industry_middle_code", "") or "")
-        set_value("industry_middle", company.get("industry_middle", "") or "")
-        set_value("industry_minor_code", company.get("industry_minor_code", "") or "")
-        set_value("industry_minor", company.get("industry_minor", "") or "")
-        set_value("industry_minor_item_code", company.get("industry_minor_item_code", "") or "")
-        set_value("industry_minor_item", company.get("industry_minor_item", "") or "")
-        set_value("industry_class_source", company.get("industry_class_source", "") or "")
-        set_value("industry_class_confidence", company.get("industry_class_confidence"))
-        set_value("industry_suggested_major_code", company.get("industry_suggested_major_code", "") or "")
-        set_value("industry_suggested_major", company.get("industry_suggested_major", "") or "")
-        set_value("industry_suggested_middle_code", company.get("industry_suggested_middle_code", "") or "")
-        set_value("industry_suggested_middle", company.get("industry_suggested_middle", "") or "")
-        set_value("industry_suggested_minor_code", company.get("industry_suggested_minor_code", "") or "")
-        set_value("industry_suggested_minor", company.get("industry_suggested_minor", "") or "")
-        set_value("industry_suggested_minor_item_code", company.get("industry_suggested_minor_item_code", "") or "")
-        set_value("industry_suggested_minor_item", company.get("industry_suggested_minor_item", "") or "")
-        set_value("industry_suggested_source", company.get("industry_suggested_source", "") or "")
-        set_value("industry_suggested_confidence", company.get("industry_suggested_confidence"))
-        set_value("industry_tag_matches", company.get("industry_tag_matches", "") or "")
+        set_value("industry_top", company.get("industry_top", "") or "")
+        set_value("industry_sub", company.get("industry_sub", "") or "")
         set_value("contact_url", company.get("contact_url", "") or "")
         set_value("contact_url_source", company.get("contact_url_source", "") or "")
         set_value("contact_url_score", company.get("contact_url_score"))

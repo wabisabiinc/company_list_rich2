@@ -6,7 +6,11 @@ import sqlite3
 MIN_COLS = [
     "company_name",
     "address",
-    "final_homepage",
+    "status",
+    "locked_by",
+    "locked_at",
+    "error_code",
+    "homepage",
     "phone",
     "found_address",
     "rep_name",
@@ -17,20 +21,38 @@ MIN_COLS = [
     "capital",
     "fiscal_month",
     "founded_year",
-    "employee_count",
-    "employees",
-    "industry_major",
-    "industry_middle",
-    "industry_minor",
+    "final_homepage",
     "contact_url",
-    "ai_used",
-    "status",
+    "business_tags",
+    "industry_top",
+    "industry_sub",
 ]
 
-SCHEMA = f"""
+SCHEMA = """
 CREATE TABLE IF NOT EXISTS companies (
     id INTEGER PRIMARY KEY,
-    {', '.join([c + ' TEXT' for c in MIN_COLS])}
+    company_name   TEXT,
+    address        TEXT,
+    status         TEXT DEFAULT 'pending',
+    locked_by      TEXT,
+    locked_at      TEXT,
+    error_code     TEXT,
+    homepage       TEXT,
+    phone          TEXT,
+    found_address  TEXT,
+    rep_name       TEXT,
+    description    TEXT,
+    listing        TEXT,
+    revenue        TEXT,
+    profit         TEXT,
+    capital        TEXT,
+    fiscal_month   TEXT,
+    founded_year   TEXT,
+    final_homepage TEXT,
+    contact_url    TEXT,
+    business_tags  TEXT,
+    industry_top   TEXT,
+    industry_sub   TEXT
 );
 """
 

@@ -1517,3 +1517,51 @@ class AIVerifier:
             return data
         except Exception:
             return None
+
+    async def verify_baseconnect_industry(
+        self,
+        *,
+        text: str,
+        company_name: str,
+        rule_top: str,
+        rule_sub: str,
+        candidates_text: str,
+        max_snippet_chars: int = 3500,
+    ) -> Optional[Dict[str, Any]]:
+        if not self.model:
+            return None
+        snippet = _shorten_text(text or "", max_len=max(1000, int(max_snippet_chars or 3500)))
+        prompt = (
+            "あなたは企業の業種分類を検証する専門家です。\n"
+            "与えられた本文根拠から、ルールで選ばれた業種が妥当かを厳格にファクトチェックしてください。\n"
+            "推測は禁止。根拠が弱い場合は必ず否定/不明とすること。\n"
+            "出力はJSONのみ（説明文やマークダウンは禁止）。\n"
+            "判定ルール:\n"
+            "- top_ok は大分類が本文に明確に一致するときのみ true。\n"
+            "- sub_ok は小分類が本文に明確に一致するときのみ true。\n"
+            "- sub_ok は top_ok=false の場合は必ず false。\n"
+            "- 迷ったら top_ok=false, sub_ok=false, confidence<=0.5。\n"
+            "{\n"
+            '  "top_ok": true/false,\n'
+            '  "sub_ok": true/false,\n'
+            '  "confidence": 0.0-1.0,\n'
+            '  "reason": "根拠の短い説明(1文)"\n'
+            "}\n"
+            f"対象企業: {company_name or '不明'}\n"
+            f"ルール判定: top={rule_top or '空'} / sub={rule_sub or '空'}\n"
+            "候補一覧:\n"
+            f"{candidates_text or '（候補なし）'}\n\n"
+            f"本文抜粋:\n{snippet}\n"
+        )
+        prompt = self._with_quality_context(prompt)
+        try:
+            resp = await self._generate_with_timeout([prompt])
+            if resp is None:
+                return None
+            raw = _resp_text(resp)
+            data = _extract_first_json(raw)
+            if not isinstance(data, dict):
+                return None
+            return data
+        except Exception:
+            return None
