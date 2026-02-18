@@ -59,6 +59,14 @@ _AUTO_LEARN_VERB_RE = re.compile(
     r"(して(い)?ます|します|しました|した|する|いたします|行っています|行います|行った|行う|しております|提供しています)$"
 )
 
+_TOKEN_PART_RE = re.compile(r"[a-z0-9]+|[一-龥ぁ-んァ-ン]{2,}")
+_COMPOUND_SUFFIXES = (
+    "販売", "製造", "加工", "企画", "開発", "運営", "運送", "輸送", "配送",
+    "賃貸", "管理", "仲介", "代理", "保守", "メンテナンス", "工事", "施工",
+    "卸売", "小売", "小売業", "卸売業", "サービス", "コンサル", "コンサルティング",
+    "支援", "設計", "修理", "再生", "投資", "買取",
+)
+
 # CSV が読めない場合の最小限fallback
 _ALIAS_TO_MINOR_FALLBACK: dict[str, tuple[str, int, int, str]] = {
     "ai": ("392", 6, 0, "it"),
@@ -609,6 +617,42 @@ class JSICTaxonomy:
     def _normalize(text: str) -> str:
         return norm_text_compact(text)
 
+    def _split_compound_token(self, token: str) -> set[str]:
+        out: set[str] = set()
+        raw = str(token or "").strip()
+        if len(raw) < 2:
+            return out
+        out.add(raw)
+
+        for part in _TOKEN_PART_RE.findall(raw):
+            p = part.strip()
+            if len(p) >= 2:
+                out.add(p)
+
+        for suf in _COMPOUND_SUFFIXES:
+            if raw.endswith(suf) and len(raw) > len(suf) + 1:
+                root = raw[: -len(suf)].strip()
+                if len(root) >= 2:
+                    out.add(root)
+                if len(suf) >= 2:
+                    out.add(suf)
+        return out
+
+    def _extract_text_tokens(self, text: str) -> set[str]:
+        spaced = norm_text(text)
+        if not spaced:
+            return set()
+        tokens: set[str] = set()
+        for chunk in spaced.split(" "):
+            chunk = chunk.strip()
+            if len(chunk) < 2:
+                continue
+            for tok in self._split_compound_token(chunk):
+                if tok in _GENERIC_TOKENS:
+                    continue
+                tokens.add(tok)
+        return tokens
+
     def _build_token_index(self) -> None:
         index: dict[str, set[str]] = {}
         for code, name in self.minor_names.items():
@@ -618,18 +662,7 @@ class JSICTaxonomy:
         self._token_index = index
 
     def _tokenize_name(self, name: str) -> set[str]:
-        spaced = norm_text(name)
-        if not spaced:
-            return set()
-        tokens = set()
-        for p in spaced.split(" "):
-            p = p.strip()
-            if len(p) < 2:
-                continue
-            if p in _GENERIC_TOKENS:
-                continue
-            tokens.add(p)
-        return tokens
+        return self._extract_text_tokens(name)
 
     def _rebuild_reverse_indexes(self) -> None:
         for detail_code, minor_code in list(self.detail_to_minor.items()):
@@ -714,12 +747,7 @@ class JSICTaxonomy:
         if not norm:
             return {}
 
-        text_tokens = set()
-        for m in re.finditer(r"[一-龥ぁ-んァ-ンa-z0-9]{2,}", norm):
-            tok = m.group(0)
-            if tok in _GENERIC_TOKENS:
-                continue
-            text_tokens.add(tok)
+        text_tokens = self._extract_text_tokens(text)
 
         scores: dict[str, int] = {}
         for tok in text_tokens:
@@ -736,12 +764,7 @@ class JSICTaxonomy:
         norm = self._normalize(text)
         if not norm:
             return {}
-        text_tokens = set()
-        for m in re.finditer(r"[一-龥ぁ-んァ-ンa-z0-9]{2,}", norm):
-            tok = m.group(0)
-            if tok in _GENERIC_TOKENS:
-                continue
-            text_tokens.add(tok)
+        text_tokens = self._extract_text_tokens(text)
         scores: dict[str, int] = {}
         for tok in text_tokens:
             for code, name_norm in self._detail_names_norm.items():
@@ -1271,16 +1294,51 @@ class IndustryClassifier:
             confidence += 0.04
         confidence = float(max(0.0, min(0.85, confidence)))
 
+        def _normalize_minor(code_val: str) -> str:
+            code_val = str(code_val or "").strip()
+            if not code_val:
+                return ""
+            if code_val in self.taxonomy.detail_names:
+                return self.taxonomy.detail_to_minor.get(code_val, "")
+            return code_val
+
+        target_minor = _normalize_minor(best_code)
+        context_norm = self.taxonomy._normalize(context_text)
+
+        def _has_alias_support(text: str) -> bool:
+            if not text or not target_minor:
+                return False
+            for hit in self._alias_hits_for_text(text):
+                hit_code = _normalize_minor(hit.target_minor_code)
+                if hit_code and hit_code == target_minor:
+                    return True
+            return False
+
+        lexical_support = False
+        if target_minor:
+            if _has_alias_support(str(description or "")):
+                lexical_support = True
+            if not lexical_support:
+                for tag in tag_values:
+                    if _has_alias_support(tag):
+                        lexical_support = True
+                        break
+            if not lexical_support:
+                minor_name = self.taxonomy.minor_names.get(target_minor, "")
+                minor_norm = self.taxonomy._normalize(minor_name) if minor_name else ""
+                if minor_norm and context_norm and (minor_norm in context_norm):
+                    lexical_support = True
+
         ambiguous = score_margin < 0.08 or best_margin < (self.semantic_taxonomy_min_margin + 0.02)
         review_required = bool((not both_sources) or ambiguous or confidence <= 0.56)
+        if require_both and not both_sources and not lexical_support:
+            review_required = True
+        if lexical_support and (not ambiguous) and confidence >= 0.56:
+            review_required = False
         if review_required:
             confidence = min(confidence, 0.56 if both_sources else 0.50)
-        if require_both and not both_sources:
+        if require_both and not both_sources and not lexical_support:
             confidence = min(confidence, 0.50)
-        # セマンティック単独採用はしない（候補退避用）
-        if not review_required:
-            review_required = True
-            confidence = min(confidence, 0.56 if both_sources else 0.50)
 
         source_name = "semantic_taxonomy_desc_tags" if both_sources else "semantic_taxonomy_single"
         return {
