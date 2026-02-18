@@ -682,6 +682,21 @@ def sanitize_text_block(text: str | None) -> str:
     return t
 
 
+def _sanitize_ai_text_block(text: str | None) -> str:
+    """
+    AI入力向けの軽量サニタイズ。
+    - 基本は sanitize_text_block と同じ
+    - 極端に短い/ノイズのみは捨てる
+    """
+    t = sanitize_text_block(text)
+    if not t:
+        return ""
+    # HTML由来のゴミだけで構成される短文は落とす
+    if len(t) < 2:
+        return ""
+    return t
+
+
 def looks_like_address(text: str | None) -> bool:
     """
     明らかに住所ではない文字列（例: 「企業理念」「企業紹介映像」など）を弾くための軽い判定。
