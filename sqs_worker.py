@@ -9,7 +9,13 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-import boto3
+try:
+    import boto3
+except ImportError as exc:  # pragma: no cover - optional dependency
+    raise ImportError(
+        "boto3 is required to run sqs_worker.py. "
+        "Install it via `pip install -r requirements-aws.txt`."
+    ) from exc
 
 
 ROOT_DIR = Path(__file__).resolve().parent

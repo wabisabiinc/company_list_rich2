@@ -11,4 +11,3 @@ pymongo
 Unidecode
 pykakasi
 pypdf
-boto3

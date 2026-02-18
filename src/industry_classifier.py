@@ -45,6 +45,32 @@ AUTO_LEARN_MAX_TERMS = max(1, int(os.getenv("INDUSTRY_AUTO_LEARN_MAX_TERMS", "6"
 AUTO_LEARN_MIN_TERM_LEN = max(2, int(os.getenv("INDUSTRY_AUTO_LEARN_MIN_TERM_LEN", "2")))
 AUTO_LEARN_MAX_TERM_LEN = max(AUTO_LEARN_MIN_TERM_LEN, int(os.getenv("INDUSTRY_AUTO_LEARN_MAX_TERM_LEN", "20")))
 
+def _getenv_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() == "true"
+
+
+def _getenv_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(str(raw).strip())
+    except Exception:
+        return default
+
+
+def _getenv_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(str(raw).strip())
+    except Exception:
+        return default
+
 _GENERIC_TOKENS = {
     "事業", "業", "サービス", "製品", "商品", "販売", "製造", "提供", "運営", "管理",
     "開発", "加工", "設計", "施工", "保守", "メンテナンス", "関連", "その他", "附随",
@@ -811,30 +837,33 @@ class IndustryClassifier:
         self.learned_alias_entries: list[IndustryAliasEntry] = []
         self.alias_source = "fallback"
         self.memory_csv_path = DEFAULT_INDUSTRY_MEMORY_CSV_PATH
-        self.auto_learn_enabled = bool(AUTO_LEARN_ENABLED)
-        self.auto_learn_min_confidence = float(max(0.0, min(1.0, AUTO_LEARN_MIN_CONFIDENCE)))
-        self.auto_learn_min_count = max(1, int(AUTO_LEARN_MIN_COUNT))
-        self.auto_learn_max_terms = max(1, int(AUTO_LEARN_MAX_TERMS))
-        self.auto_learn_min_term_len = max(2, int(AUTO_LEARN_MIN_TERM_LEN))
-        self.auto_learn_max_term_len = max(self.auto_learn_min_term_len, int(AUTO_LEARN_MAX_TERM_LEN))
+        self.auto_learn_enabled = _getenv_bool("INDUSTRY_AUTO_LEARN_ENABLED", False)
+        self.auto_learn_min_confidence = float(max(0.0, min(1.0, _getenv_float("INDUSTRY_AUTO_LEARN_MIN_CONFIDENCE", 0.78))))
+        self.auto_learn_min_count = max(1, _getenv_int("INDUSTRY_AUTO_LEARN_MIN_COUNT", 2))
+        self.auto_learn_max_terms = max(1, _getenv_int("INDUSTRY_AUTO_LEARN_MAX_TERMS", 6))
+        self.auto_learn_min_term_len = max(2, _getenv_int("INDUSTRY_AUTO_LEARN_MIN_TERM_LEN", 2))
+        self.auto_learn_max_term_len = max(self.auto_learn_min_term_len, _getenv_int("INDUSTRY_AUTO_LEARN_MAX_TERM_LEN", 20))
         self.memory_entries: dict[tuple[str, str], IndustryMemoryEntry] = {}
-        self.semantic_enabled = bool(ALIAS_SEMANTIC_ENABLED)
-        self.semantic_provider = ALIAS_SEMANTIC_PROVIDER
+        self.gemini_api_key = (os.getenv("GEMINI_API_KEY") or DEFAULT_GEMINI_API_KEY).strip()
+        self.alias_embed_model = (os.getenv("INDUSTRY_ALIAS_EMBED_MODEL") or DEFAULT_ALIAS_EMBED_MODEL or "models/text-embedding-004").strip()
+        self.semantic_enabled = _getenv_bool("INDUSTRY_ALIAS_SEMANTIC_ENABLED", True)
+        self.semantic_provider = (os.getenv("INDUSTRY_ALIAS_SEMANTIC_PROVIDER") or "auto").strip().lower()
         self.semantic_embedder = semantic_embedder
-        self.semantic_min_sim = float(max(0.0, min(1.0, ALIAS_SEMANTIC_MIN_SIM)))
-        self.semantic_min_margin = float(max(0.0, min(1.0, ALIAS_SEMANTIC_MIN_MARGIN)))
-        self.semantic_strong_sim = float(max(self.semantic_min_sim, min(1.0, ALIAS_SEMANTIC_STRONG_SIM)))
-        self.semantic_strong_margin = float(max(self.semantic_min_margin, min(1.0, ALIAS_SEMANTIC_STRONG_MARGIN)))
-        self.semantic_min_priority = max(1, int(ALIAS_SEMANTIC_MIN_PRIORITY))
-        self.semantic_max_phrases = max(1, int(ALIAS_SEMANTIC_MAX_PHRASES))
-        self.semantic_max_hits = max(1, int(ALIAS_SEMANTIC_MAX_HITS))
+        self.semantic_min_sim = float(max(0.0, min(1.0, _getenv_float("INDUSTRY_ALIAS_SEMANTIC_MIN_SIM", 0.90))))
+        self.semantic_min_margin = float(max(0.0, min(1.0, _getenv_float("INDUSTRY_ALIAS_SEMANTIC_MIN_MARGIN", 0.05))))
+        self.semantic_strong_sim = float(max(self.semantic_min_sim, min(1.0, _getenv_float("INDUSTRY_ALIAS_SEMANTIC_STRONG_SIM", 0.95))))
+        self.semantic_strong_margin = float(max(self.semantic_min_margin, min(1.0, _getenv_float("INDUSTRY_ALIAS_SEMANTIC_STRONG_MARGIN", 0.08))))
+        self.semantic_min_priority = max(1, _getenv_int("INDUSTRY_ALIAS_SEMANTIC_MIN_PRIORITY", 6))
+        self.semantic_max_phrases = max(1, _getenv_int("INDUSTRY_ALIAS_SEMANTIC_MAX_PHRASES", 10))
+        self.semantic_max_hits = max(1, _getenv_int("INDUSTRY_ALIAS_SEMANTIC_MAX_HITS", 4))
         self._semantic_query_cache: dict[str, list[float] | None] = {}
         self._semantic_alias_entries: list[IndustryAliasEntry] = []
         self._semantic_alias_vectors: list[list[float]] = []
-        self.semantic_taxonomy_enabled = bool(SEMANTIC_TAXONOMY_ENABLED)
-        self.semantic_taxonomy_min_sim = float(max(0.0, min(1.0, SEMANTIC_TAXONOMY_MIN_SIM)))
-        self.semantic_taxonomy_min_margin = float(max(0.0, min(1.0, SEMANTIC_TAXONOMY_MIN_MARGIN)))
-        self.semantic_taxonomy_max_hits = max(1, int(SEMANTIC_TAXONOMY_MAX_HITS))
+        self.semantic_taxonomy_enabled = _getenv_bool("INDUSTRY_SEMANTIC_TAXONOMY_ENABLED", True)
+        self.semantic_taxonomy_min_sim = float(max(0.0, min(1.0, _getenv_float("INDUSTRY_SEMANTIC_TAXONOMY_MIN_SIM", 0.92))))
+        self.semantic_taxonomy_min_margin = float(max(0.0, min(1.0, _getenv_float("INDUSTRY_SEMANTIC_TAXONOMY_MIN_MARGIN", 0.05))))
+        self.semantic_taxonomy_max_hits = max(1, _getenv_int("INDUSTRY_SEMANTIC_TAXONOMY_MAX_HITS", 4))
+        self.semantic_taxonomy_require_both = _getenv_bool("INDUSTRY_SEMANTIC_TAXONOMY_REQUIRE_BOTH", True)
         self._semantic_taxonomy_codes: list[str] = []
         self._semantic_taxonomy_vectors: list[list[float]] = []
         self._semantic_taxonomy_proto: dict[str, str] = {}
@@ -858,9 +887,10 @@ class IndustryClassifier:
         if self.semantic_embedder is None:
             provider = self.semantic_provider
             if provider == "auto":
-                provider = "gemini" if (DEFAULT_GEMINI_API_KEY and _genai is not None) else "off"
+                provider = "gemini" if (self.gemini_api_key and _genai is not None) else "off"
+            self.semantic_provider = provider
             if provider == "gemini":
-                emb = _GeminiSemanticEmbedder(DEFAULT_GEMINI_API_KEY, DEFAULT_ALIAS_EMBED_MODEL)
+                emb = _GeminiSemanticEmbedder(self.gemini_api_key, self.alias_embed_model)
                 if emb.available:
                     self.semantic_embedder = emb
                 else:
@@ -1286,7 +1316,7 @@ class IndustryClassifier:
         best_sim = float(best_meta.get("best_sim") or 0.0)
         best_margin = float(best_meta.get("best_margin") or 0.0)
 
-        require_both = bool(SEMANTIC_TAXONOMY_REQUIRE_BOTH)
+        require_both = bool(self.semantic_taxonomy_require_both)
         confidence = 0.38 + min(0.30, best_score * 0.20) + min(0.12, score_margin * 0.30)
         if both_sources:
             confidence += 0.06

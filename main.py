@@ -16,6 +16,7 @@ from difflib import SequenceMatcher
 from typing import Any, Dict
 from urllib.parse import urlparse, unquote
 from pathlib import Path
+
 try:
     from dotenv import load_dotenv
     DOTENV_AVAILABLE = True
@@ -23,23 +24,14 @@ except ImportError:
     DOTENV_AVAILABLE = False
     def load_dotenv() -> None:  # type: ignore
         return None
-from bs4 import BeautifulSoup
 
-from src.database_manager import DatabaseManager
-from src.company_scraper import CompanyScraper, CITY_RE, NAME_CHUNK_RE, KANA_NAME_RE
-from src.ai_verifier import (
-    AIVerifier,
-    DEFAULT_MODEL as AI_MODEL_NAME,
-    AI_CALL_TIMEOUT_SEC,
-    _normalize_amount as ai_normalize_amount,
-)
-from src.homepage_policy import apply_provisional_homepage_policy
-from src.industry_classifier import IndustryClassifier
-from src.concept_index import ConceptIndex
-from src.text_normalizer import norm_text_compact
-from scripts.extract_contact_urls import _pick_contact_url, _build_ai_signals, AI_MIN_CONFIDENCE_DEFAULT
-from src.reference_checker import ReferenceChecker
-from src.jp_number import normalize_kanji_numbers
+DOTENV_MISSING = False
+if DOTENV_AVAILABLE:
+    load_dotenv()
+else:
+    DOTENV_MISSING = os.path.exists(".env")
+
+from bs4 import BeautifulSoup
 
 class HardTimeout(Exception):
     """Raised when the per-company hard time limit is exceeded."""
@@ -63,11 +55,24 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger(__name__)
-
-# .env 読み込み
-if not DOTENV_AVAILABLE and os.path.exists(".env"):
+if DOTENV_MISSING:
     log.warning("python-dotenv が未導入のため .env を読み込めません（venv有効化 or `pip install -r requirements.txt` を実行してください）")
-load_dotenv()
+
+from src.database_manager import DatabaseManager
+from src.company_scraper import CompanyScraper, CITY_RE, NAME_CHUNK_RE, KANA_NAME_RE
+from src.ai_verifier import (
+    AIVerifier,
+    DEFAULT_MODEL as AI_MODEL_NAME,
+    AI_CALL_TIMEOUT_SEC,
+    _normalize_amount as ai_normalize_amount,
+)
+from src.homepage_policy import apply_provisional_homepage_policy
+from src.industry_classifier import IndustryClassifier
+from src.concept_index import ConceptIndex
+from src.text_normalizer import norm_text_compact
+from scripts.extract_contact_urls import _pick_contact_url, _build_ai_signals, AI_MIN_CONFIDENCE_DEFAULT
+from src.reference_checker import ReferenceChecker
+from src.jp_number import normalize_kanji_numbers
 
 # --------------------------------------------------
 # 実行オプション（.env）
@@ -171,6 +176,8 @@ INDUSTRY_AI_MIN_CONFIDENCE = float(os.getenv("INDUSTRY_AI_MIN_CONFIDENCE", "0.60
 INDUSTRY_AI_SINGLE_PASS = (os.getenv("INDUSTRY_AI_SINGLE_PASS", "true") or "true").strip().lower() == "true"
 # 業種AIの本文スニペット最大長（description + tags + 会社概要ページ）
 INDUSTRY_AI_MAX_SNIPPET_CHARS = max(2000, int(os.getenv("INDUSTRY_AI_MAX_SNIPPET_CHARS", "9000")))
+# 業種セマンティック判定に使う本文の最大長（短いほど誤爆が減り、長いほど拾いが増える）
+INDUSTRY_SEMANTIC_CONTEXT_MAX_CHARS = max(800, int(os.getenv("INDUSTRY_SEMANTIC_CONTEXT_MAX_CHARS", "4000")))
 # true の場合、業種AIは「不明/怪しいケース」に限定して実行する。
 INDUSTRY_AI_UNCERTAIN_ONLY = os.getenv("INDUSTRY_AI_UNCERTAIN_ONLY", "true").lower() == "true"
 INDUSTRY_MAJOR_MIN_CONFIDENCE = float(os.getenv("INDUSTRY_MAJOR_MIN_CONFIDENCE", "0.50"))
@@ -2808,14 +2815,18 @@ def _sanitize_ai_text_block(text: str | None) -> str:
         result = result[:3500]
     return result
 
-def build_ai_text_payload(*blocks: str) -> str:
-    payloads = []
+def build_industry_semantic_text(*blocks: str, max_chars: int | None = None) -> str:
+    limit = max_chars if isinstance(max_chars, int) and max_chars > 0 else INDUSTRY_SEMANTIC_CONTEXT_MAX_CHARS
+    payloads: list[str] = []
     for block in blocks:
         cleaned = _sanitize_ai_text_block(block)
         if cleaned:
             payloads.append(cleaned)
     joined = "\n\n".join(payloads)
-    return joined[:4000]
+    return joined[:limit]
+
+def build_ai_text_payload(*blocks: str) -> str:
+    return build_industry_semantic_text(*blocks, max_chars=4000)
 
 
 def build_industry_ai_text(
@@ -7289,6 +7300,19 @@ async def process():
 
                             lookup_name = ai_industry_val or industry_hint_val or industry_val
                             fallback_allowed = allow_non_ai_fallback
+                            semantic_desc_blocks_pre: list[str] = []
+                            if description_val:
+                                semantic_desc_blocks_pre.append(description_val)
+                            if profile_blocks_pre:
+                                semantic_desc_blocks_pre.extend(profile_blocks_pre)
+                            else:
+                                semantic_desc_blocks_pre.extend(extra_blocks_pre)
+                            if name:
+                                semantic_desc_blocks_pre.append(name)
+                            semantic_desc_pre = build_industry_semantic_text(
+                                *semantic_desc_blocks_pre,
+                                max_chars=INDUSTRY_SEMANTIC_CONTEXT_MAX_CHARS,
+                            )
                             if (not industry_result) and fallback_allowed and INDUSTRY_NAME_LOOKUP_ENABLED and lookup_name:
                                 try:
                                     exact_candidate = INDUSTRY_CLASSIFIER.resolve_exact_candidate_from_name(lookup_name)
@@ -7309,7 +7333,7 @@ async def process():
                             if (not industry_result) and fallback_allowed:
                                 try:
                                     industry_result = INDUSTRY_CLASSIFIER.classify_from_semantic_taxonomy(
-                                        description_val or "",
+                                        semantic_desc_pre or (description_val or ""),
                                         parsed_business_tags_pre if parsed_business_tags_pre else (business_tags_val or ""),
                                     )
                                 except Exception:
@@ -7318,7 +7342,7 @@ async def process():
                             if fallback_allowed and ((not industry_result) or bool(industry_result.get("review_required"))):
                                 try:
                                     alias_result = INDUSTRY_CLASSIFIER.classify_from_aliases(
-                                        description_val or "",
+                                        semantic_desc_pre or (description_val or ""),
                                         parsed_business_tags_pre if parsed_business_tags_pre else (business_tags_val or ""),
                                     )
                                 except Exception:
@@ -8376,6 +8400,21 @@ async def process():
                                         }
 
                             fallback_allowed = allow_non_ai_fallback
+                            semantic_desc_blocks_post: list[str] = []
+                            if description_val:
+                                semantic_desc_blocks_post.append(description_val)
+                            if profile_blocks_all:
+                                semantic_desc_blocks_post.extend(profile_blocks_all)
+                            else:
+                                semantic_desc_blocks_post.extend(extra_blocks_post)
+                            if name:
+                                semantic_desc_blocks_post.append(name)
+                            if industry_hint_val:
+                                semantic_desc_blocks_post.append(industry_hint_val)
+                            semantic_desc_post = build_industry_semantic_text(
+                                *semantic_desc_blocks_post,
+                                max_chars=INDUSTRY_SEMANTIC_CONTEXT_MAX_CHARS,
+                            )
                             if (not industry_result_post) and fallback_allowed and INDUSTRY_NAME_LOOKUP_ENABLED:
                                 lookup_name = ai_industry_name or industry_hint_val or industry_val
                                 try:
@@ -8398,7 +8437,7 @@ async def process():
                                 alias_business_tags: Any = parsed_business_tags if parsed_business_tags else (business_tags_val or "")
                                 try:
                                     industry_result_post = INDUSTRY_CLASSIFIER.classify_from_semantic_taxonomy(
-                                        description_val or "",
+                                        semantic_desc_post or (description_val or ""),
                                         alias_business_tags,
                                     )
                                 except Exception:
@@ -8408,7 +8447,7 @@ async def process():
                                 alias_business_tags: Any = parsed_business_tags if parsed_business_tags else (business_tags_val or "")
                                 try:
                                     alias_result_post = INDUSTRY_CLASSIFIER.classify_from_aliases(
-                                        description_val or "",
+                                        semantic_desc_post or (description_val or ""),
                                         alias_business_tags,
                                     )
                                 except Exception:
